@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# PyInstaller
+build/
+dist/
+*.spec.bak
+
+# App generated folders
+_thumbcache/
+_eliminados/
+_duplicados_eliminados/
+*.exif_backup.json
+_historial_original.txt
+
+# Virtual environment
+venv/
+env/
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# Logs
+*.log
