@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (
 from core.backup_manager import has_backup, append_historial
 from core.exif_handler import read_exif
 from core.file_scanner import count_images, list_subdirs, root_is_available, unique_dest
+from ui.styles import mb_warning
 
 _PLACEHOLDER = "__loading__"
 
@@ -84,7 +85,7 @@ class _DropTree(QTreeWidget):
                 errors.append(f"{src.name}: {e}")
 
         if errors:
-            QMessageBox.warning(
+            mb_warning(
                 self, "Errores al mover",
                 "\n".join(errors[:10]),
             )

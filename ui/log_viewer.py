@@ -7,7 +7,7 @@ from typing import List, Optional
 
 from PyQt6.QtCore import QObject, pyqtSignal, Qt, QStandardPaths
 from PyQt6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
+    QApplication, QDialog, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
     QPushButton, QLabel, QComboBox, QDateEdit, QFileDialog,
     QDialogButtonBox, QHeaderView, QAbstractItemView,
 )
@@ -145,6 +145,7 @@ class LogViewerDialog(QDialog):
 
     def __init__(self, log_manager: LogManager, parent=None):
         super().__init__(parent)
+        self.setWindowIcon(QApplication.instance().windowIcon())
         self._log = log_manager
         self.setWindowTitle("Registro de cambios")
         self.resize(900, 500)

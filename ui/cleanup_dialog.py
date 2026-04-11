@@ -7,7 +7,7 @@ from typing import Dict, List, Optional, Tuple
 from PyQt6.QtCore import Qt, QObject, QThread, pyqtSignal
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout,
+    QApplication, QDialog, QVBoxLayout, QHBoxLayout,
     QLabel, QCheckBox, QPushButton, QGroupBox,
     QTreeWidget, QTreeWidgetItem, QProgressBar,
     QMessageBox, QProgressDialog, QWidget,
@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (
 )
 
 from ui.log_viewer import LogManager
-from ui.styles import apply_button_style
+from ui.styles import apply_button_style, mb_info, mb_question
 
 
 def _fmt_bytes(n: int) -> str:
@@ -204,6 +204,7 @@ class CleanupDialog(QDialog):
         current_folder: Optional[Path] = None,
     ) -> None:
         super().__init__(parent)
+        self.setWindowIcon(QApplication.instance().windowIcon())
         self._root           = root
         self._log            = log_manager
         self._current_folder = current_folder   # folder open in grid (may be None)
@@ -597,7 +598,7 @@ class CleanupDialog(QDialog):
                     to_delete.append((path_str, size))
 
         if not to_delete:
-            QMessageBox.information(
+            mb_info(
                 self, "Sin elementos",
                 "No hay elementos seleccionados para eliminar.\n"
                 "Asegurate de que los tipos que querés limpiar estén marcados."
@@ -606,13 +607,12 @@ class CleanupDialog(QDialog):
 
         n             = len(to_delete)
         bytes_to_free = sum(s for _, s in to_delete)
-        reply = QMessageBox.question(
+        reply = mb_question(
             self,
             "Confirmar eliminación permanente",
             f"¿Eliminar permanentemente {n} elemento{'s' if n != 1 else ''} "
             f"({_fmt_bytes(bytes_to_free)})?\n\n"
             "⚠ Esta acción no se puede deshacer.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if reply != QMessageBox.StandardButton.Yes:
             return

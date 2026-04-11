@@ -11,8 +11,8 @@ from PyQt6.QtWidgets import (
     QLabel, QSpinBox, QCheckBox, QPushButton, QGroupBox,
     QRadioButton, QButtonGroup,
     QTableWidget, QTableWidgetItem, QDialogButtonBox,
-    QProgressDialog, QMessageBox, QAbstractItemView,
-    QHeaderView,
+    QApplication, QProgressDialog, QMessageBox, QAbstractItemView,
+    QHeaderView, QScrollArea, QFrame, QWidget,
 )
 
 from core.exif_handler import (
@@ -22,7 +22,7 @@ from core.exif_handler import (
 from core.file_scanner import scan_folder
 from core.backup_manager import create_backup, rename_backup_entry, append_historial
 from ui.log_viewer import LogManager
-from ui.styles import apply_button_style
+from ui.styles import apply_button_style, apply_primary_button_style, mb_warning, mb_info, mb_question
 
 _FIELD_NAMES = ["DateTimeOriginal", "DateTimeDigitized", "DateTime"]
 
@@ -152,106 +152,171 @@ class _PreviewWorker(QObject):
 
 
 class _ApplyWorker(QObject):
-    progress = pyqtSignal(int, int, str, str)  # step, total_steps, filename, phase_label
-    finished = pyqtSignal(int, int, list)       # ok, failed, errors
+    progress = pyqtSignal(int, int, str, str)   # step, total_steps, filename, phase_label
+    # finished: ok, failed, errors, renames_dict {old_path_str → new_path_str}
+    finished = pyqtSignal(int, int, list, object)
 
     def __init__(
         self,
         paths: List[Path],
-        resolved_dts: Dict[Path, Optional[datetime]],  # precomputed per-file datetimes
+        # Raw date parameters — resolved per-file inside the thread (zero main-thread I/O)
+        keep_mode: bool,
+        chk_year: bool, chk_month: bool, chk_day: bool,
+        year: int, month: int, day: int,
+        use_custom_time: bool,
+        hour: int, minute: int, second: int,
         fields: List[str],
         rename: bool,
-        new_names: Dict[Path, str],     # precomputed path → new filename mapping
+        rename_fmt: int,
         write_exif: bool = True,        # False → rename-only (Conservar mode)
     ):
         super().__init__()
-        self._paths = paths
-        self._resolved_dts = resolved_dts
-        self._fields = fields
-        self._rename = rename
-        self._new_names = new_names
-        self._write_exif = write_exif
-        self._cancelled = False
+        self._paths          = paths
+        self._keep_mode      = keep_mode
+        self._chk_year       = chk_year
+        self._chk_month      = chk_month
+        self._chk_day        = chk_day
+        self._year           = year
+        self._month          = month
+        self._day            = day
+        self._use_custom_time = use_custom_time
+        self._hour           = hour
+        self._minute         = minute
+        self._second         = second
+        self._fields         = fields
+        self._rename         = rename
+        self._rename_fmt     = rename_fmt
+        self._write_exif     = write_exif
+        self._cancelled      = False
 
     def cancel(self) -> None:
         self._cancelled = True
 
+    def _resolve_dt(self, existing_fields: dict) -> Optional[datetime]:
+        """Compute the target datetime using already-read EXIF fields (no extra disk I/O)."""
+        if self._keep_mode:
+            return parse_exif_dt(get_best_date_str(existing_fields))
+
+        need_existing = (
+            not self._chk_year or not self._chk_month or not self._chk_day
+            or not self._use_custom_time
+        )
+        existing = parse_exif_dt(get_best_date_str(existing_fields)) if need_existing else None
+
+        year  = self._year  if self._chk_year  else (existing.year  if existing else datetime.now().year)
+        month = self._month if self._chk_month else (existing.month if existing else datetime.now().month)
+        day   = self._day   if self._chk_day   else (existing.day   if existing else datetime.now().day)
+
+        if self._use_custom_time:
+            h, m, s = self._hour, self._minute, self._second
+        else:
+            h = existing.hour   if existing else 12
+            m = existing.minute if existing else 0
+            s = existing.second if existing else 0
+
+        day = min(day, calendar.monthrange(year, month)[1])
+        try:
+            return datetime(year, month, day, h, m, s)
+        except ValueError:
+            return None
+
     def run(self) -> None:
         ok = 0
         failed = 0
-        errors = []
+        errors: List[str] = []
+        # Maps old_path_str → new_path_str for files successfully renamed
+        renames: Dict[str, str] = {}
         total = len(self._paths)
 
         # Two-phase progress: EXIF write (phase 1) then rename (phase 2).
-        # Single-phase when only one operation is active.
-        has_two_phases = self._write_exif and self._rename and bool(self._new_names)
+        # has_two_phases is deterministic from settings — no per-file EXIF needed.
+        will_rename    = self._rename and self._rename_fmt != _RENAME_KEEP_NAME
+        has_two_phases = self._write_exif and will_rename
         total_steps    = total * 2 if has_two_phases else total
-        step = 0
+        step           = 0
+        used_names: set = set()
 
-        for i, path in enumerate(self._paths):
+        for path in self._paths:
             if self._cancelled:
                 break
 
-            # Capture EXIF BEFORE any changes (historial needs the original state)
-            original_exif    = read_exif(path)["fields"]
-            new_name_for_log = self._new_names.get(path) if self._rename else None
+            # Single EXIF read per file — supplies both date resolution and historial
+            try:
+                original_fields = read_exif(path)["fields"]
+            except Exception as exc:
+                failed += 1
+                errors.append(f"{path.name}: error leyendo EXIF: {exc}")
+                step += 2 if has_two_phases else 1
+                continue
 
+            new_dt           = self._resolve_dt(original_fields)
+            new_name_for_log = None
+
+            # ── Phase 1: write EXIF (or rename-only pseudo-phase) ──────────
             exif_ok = True
             if self._write_exif:
                 step += 1
                 self.progress.emit(step, total_steps, path.name, "Escribiendo EXIF")
-                dt = self._resolved_dts.get(path)
-                if dt is None:
+                if new_dt is None:
                     failed += 1
                     errors.append(f"{path.name}: sin fecha válida para escribir")
                     exif_ok = False
                     if has_two_phases:
-                        step += 1  # consume the rename step slot for this file
+                        step += 1   # consume the rename step slot for this file
                 else:
                     try:
                         write_exif_date(
                             path,
-                            dt.year, dt.month, dt.day,
+                            new_dt.year, new_dt.month, new_dt.day,
                             self._fields,
-                            dt.hour, dt.minute, dt.second,
+                            new_dt.hour, new_dt.minute, new_dt.second,
                         )
                         ok += 1
-                    except Exception as e:
+                    except Exception as exc:
                         failed += 1
-                        errors.append(f"{path.name}: {e}")
+                        errors.append(f"{path.name}: {exc}")
                         exif_ok = False
                         if has_two_phases:
-                            step += 1  # consume the rename step slot for this file
+                            step += 1   # consume the rename step slot for this file
             else:
-                # rename-only mode
+                # rename-only mode (Conservar): no EXIF write
                 step += 1
                 self.progress.emit(step, total_steps, path.name, "Renombrando")
                 ok += 1
 
-            if exif_ok and self._rename and path in self._new_names:
-                new_name = self._new_names[path]
+            # ── Phase 2: rename ─────────────────────────────────────────────
+            if exif_ok and will_rename and new_dt is not None:
+                stem     = path.stem if self._rename_fmt == _RENAME_DATE_PLUS else None
+                new_name = make_dated_filename(
+                    new_dt, path.parent, path.suffix, used_names, original_stem=stem
+                )
+                used_names.add(new_name)
+                new_name_for_log = new_name
                 if has_two_phases:
                     step += 1
                     self.progress.emit(step, total_steps, path.name, "Renombrando")
                 try:
                     path.rename(path.parent / new_name)
-                except Exception as e:
-                    errors.append(f"Renombrar {path.name}: {e}")
+                    renames[str(path)] = str(path.parent / new_name)
+                except Exception as exc:
+                    errors.append(f"Renombrar {path.name}: {exc}")
 
-            # Append historial record (best-effort — never abort the main loop)
+            # ── Historial ───────────────────────────────────────────────────
             operation = "fecha_editada" if self._write_exif else "renombrado"
             try:
                 append_historial(
-                    path.parent, path.name, new_name_for_log, original_exif, operation
+                    path.parent, path.name, new_name_for_log, original_fields, operation
                 )
             except Exception:
                 pass
 
-        self.finished.emit(ok, failed, errors)
+        self.finished.emit(ok, failed, errors, renames)
 
 
 class DateEditorDialog(QDialog):
     """Edit EXIF date for a single file, a whole folder, or an explicit selection."""
+
+    changes_applied = pyqtSignal()   # emitted just before accept(); main window can connect for reload
 
     def __init__(
         self,
@@ -263,6 +328,7 @@ class DateEditorDialog(QDialog):
         prefill_from_filename: bool = False,    # auto-read date from filename on open
     ):
         super().__init__(parent)
+        self.setWindowIcon(QApplication.instance().windowIcon())
         self._mode = mode
         self._target = target
         self._log = log_manager
@@ -278,12 +344,11 @@ class DateEditorDialog(QDialog):
         self._progress_dlg: Optional[QProgressDialog] = None
         self._preview_progress_dlg: Optional[QProgressDialog] = None
         self._preview_populated: bool = False
-        # Context captured from _on_apply so proper slot methods can access it
+        # Context captured from _on_apply so slot methods can access it without closures
         self._apply_keep_mode: bool = False
         self._apply_paths: List[Path] = []
         self._apply_rename: bool = False
         self._apply_rename_fmt: int = _RENAME_DATE_ONLY
-        self._apply_new_names: Dict[Path, str] = {}
         self._apply_log_date_str: str = ""
         self._apply_total_steps: int = 0
         # Populated after apply: old_path → new_path for any renamed files
@@ -298,6 +363,8 @@ class DateEditorDialog(QDialog):
 
         self.setMinimumWidth(700)
         self._build_ui()
+        screen = QApplication.primaryScreen().availableGeometry()
+        self.setMaximumHeight(int(screen.height() * 0.85))
         self._prefill_date()
         if prefill_from_filename:
             self._try_apply_filename_date(show_warning=False)
@@ -305,8 +372,20 @@ class DateEditorDialog(QDialog):
     # ── UI ─────────────────────────────────────────────────────────────────
 
     def _build_ui(self) -> None:
-        layout = QVBoxLayout(self)
+        # Outer layout: scrollable content area + pinned button row at bottom
+        outer = QVBoxLayout(self)
+        outer.setSpacing(0)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        _scroll = QScrollArea()
+        _scroll.setWidgetResizable(True)
+        _scroll.setFrameShape(QFrame.Shape.NoFrame)
+        _content = QWidget()
+        layout = QVBoxLayout(_content)
         layout.setSpacing(8)
+        layout.setContentsMargins(12, 12, 12, 8)
+        _scroll.setWidget(_content)
+        outer.addWidget(_scroll, 1)
 
         # ── Outer mode: Conservar vs Cambiar ───────────────────────────────
         exif_mode_grp = QGroupBox("Acción sobre la fecha EXIF")
@@ -334,13 +413,11 @@ class DateEditorDialog(QDialog):
         exif_mode_row.addStretch()
         layout.addWidget(exif_mode_grp)
 
-        # ── Date fields ────────────────────────────────────────────────────
+        # ── Date fields (single horizontal row) ────────────────────────────
         self._date_grp = QGroupBox("Fecha  (☑ = modificar este componente)")
-        date_layout = QVBoxLayout(self._date_grp)
-        date_layout.setSpacing(4)
+        date_row = QHBoxLayout(self._date_grp)
+        date_row.setSpacing(12)
 
-        # Year row
-        year_row = QHBoxLayout()
         self._chk_year = QCheckBox("Año:")
         self._chk_year.setChecked(True)
         self._chk_year.setToolTip(
@@ -354,13 +431,9 @@ class DateEditorDialog(QDialog):
         self._spin_year.setToolTip("Nuevo año (1900–2099).")
         self._chk_year.toggled.connect(self._spin_year.setEnabled)
         self._chk_year.toggled.connect(self._on_date_component_toggled)
-        year_row.addWidget(self._chk_year)
-        year_row.addWidget(self._spin_year)
-        year_row.addStretch()
-        date_layout.addLayout(year_row)
+        date_row.addWidget(self._chk_year)
+        date_row.addWidget(self._spin_year)
 
-        # Month row
-        month_row = QHBoxLayout()
         self._chk_month = QCheckBox("Mes:")
         self._chk_month.setChecked(True)
         self._chk_month.setToolTip(
@@ -374,13 +447,9 @@ class DateEditorDialog(QDialog):
         self._spin_month.setToolTip("Nuevo mes (1–12).")
         self._chk_month.toggled.connect(self._spin_month.setEnabled)
         self._chk_month.toggled.connect(self._on_date_component_toggled)
-        month_row.addWidget(self._chk_month)
-        month_row.addWidget(self._spin_month)
-        month_row.addStretch()
-        date_layout.addLayout(month_row)
+        date_row.addWidget(self._chk_month)
+        date_row.addWidget(self._spin_month)
 
-        # Day row
-        day_row = QHBoxLayout()
         self._chk_day = QCheckBox("Día:")
         self._chk_day.setChecked(True)
         self._chk_day.setToolTip(
@@ -395,10 +464,9 @@ class DateEditorDialog(QDialog):
         self._spin_day.setToolTip("Nuevo día (1–31). Se recorta al último día válido del mes si es necesario.")
         self._chk_day.toggled.connect(self._spin_day.setEnabled)
         self._chk_day.toggled.connect(self._on_date_component_toggled)
-        day_row.addWidget(self._chk_day)
-        day_row.addWidget(self._spin_day)
-        day_row.addStretch()
-        date_layout.addLayout(day_row)
+        date_row.addWidget(self._chk_day)
+        date_row.addWidget(self._spin_day)
+        date_row.addStretch()
 
         layout.addWidget(self._date_grp)
 
@@ -598,6 +666,7 @@ class DateEditorDialog(QDialog):
         self._table.setColumnHidden(_COL_NEW,    True)   # hidden in Conservar mode (default)
         self._table.setColumnHidden(_COL_RENAME, True)
         self._table.setMinimumHeight(150)
+        self._table.setMaximumHeight(200)
         self._table.setVisible(False)
         layout.addWidget(self._table)
 
@@ -610,14 +679,15 @@ class DateEditorDialog(QDialog):
             "Se crea un backup automático antes de modificar (modo carpeta)."
         )
         self._btn_apply.clicked.connect(self._on_apply)
-        apply_button_style(self._btn_apply)
+        apply_primary_button_style(self._btn_apply)
         self._btn_cancel = QPushButton("Cancelar")
         self._btn_cancel.setToolTip("Cierra el diálogo sin realizar ningún cambio.")
         self._btn_cancel.clicked.connect(self.reject)
         apply_button_style(self._btn_cancel)
         self._btn_box.addButton(self._btn_apply, QDialogButtonBox.ButtonRole.AcceptRole)
         self._btn_box.addButton(self._btn_cancel, QDialogButtonBox.ButtonRole.RejectRole)
-        layout.addWidget(self._btn_box)
+        # Pinned outside the scroll area so Apply/Cancel are always visible
+        outer.addWidget(self._btn_box)
 
         # Connect mode-change signal now that all widgets exist, then apply initial state
         self._exif_mode_group.idToggled.connect(self._on_exif_mode_changed)
@@ -666,7 +736,7 @@ class DateEditorDialog(QDialog):
         dt = parse_date_from_filename(first_path.stem)
         if dt is None:
             if show_warning:
-                QMessageBox.warning(
+                mb_warning(
                     self, "Sin fecha en el nombre",
                     f"No se encontró una fecha reconocible en:\n{first_path.name}\n\n"
                     "Patrones soportados: 2011-12-24-15h40m46s, 20111224_154046,\n"
@@ -831,7 +901,7 @@ class DateEditorDialog(QDialog):
 
         paths = self._get_target_paths()
         if not paths:
-            QMessageBox.warning(self, "Sin archivos", "No hay imágenes para procesar.")
+            mb_warning(self, "Sin archivos", "No hay imágenes para procesar.")
             return
 
         show_rename = self._chk_rename.isChecked()
@@ -884,6 +954,8 @@ class DateEditorDialog(QDialog):
             self._preview_progress_dlg.setMinimumDuration(0)
             self._preview_progress_dlg.setCancelButton(None)
             self._preview_progress_dlg.show()
+            self.setEnabled(False)
+            QApplication.processEvents()   # force paint before thread starts
 
             use_custom = self._radio_custom.isChecked()
             self._preview_worker = _PreviewWorker(
@@ -933,6 +1005,7 @@ class DateEditorDialog(QDialog):
         if self._preview_progress_dlg:
             self._preview_progress_dlg.close()
             self._preview_progress_dlg = None
+        self.setEnabled(True)
         self._populate_preview_table(rows)
 
     def _cleanup_preview_thread(self) -> None:
@@ -959,7 +1032,7 @@ class DateEditorDialog(QDialog):
         if not keep_mode:
             fields = [f for f, chk in self._field_checks.items() if chk.isChecked()]
             if not fields:
-                QMessageBox.warning(self, "Sin campos", "Selecciona al menos un campo EXIF.")
+                mb_warning(self, "Sin campos", "Selecciona al menos un campo EXIF.")
                 return
 
         # Backup before writing (folder/selection mode; single-file undo by main_window)
@@ -968,48 +1041,26 @@ class DateEditorDialog(QDialog):
                 create_backup(self._target)
                 self._log.log(str(self._target), "", "create_backup", "", "")
             except Exception as e:
-                reply = QMessageBox.question(
+                reply = mb_question(
                     self, "Error en backup",
                     f"No se pudo crear backup:\n{e}\n\n¿Continuar de todas formas?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 )
                 if reply != QMessageBox.StandardButton.Yes:
                     return
 
-        # Precompute per-file resolved datetimes (single pass — used for both
-        # EXIF writing and rename mapping so we only read each file's EXIF once).
-        resolved_dts: Dict[Path, Optional[datetime]] = {
-            p: self._resolve_new_dt(p) for p in paths
-        }
-
-        # Precompute rename mapping — KEEP_NAME means no entries at all
+        # ── Capture apply context (zero disk I/O — only UI values read here) ──
         rename = self._chk_rename.isChecked()
-        new_names: Dict[Path, str] = {}
-        if rename and rename_fmt != _RENAME_KEEP_NAME:
-            used: set = set()
-            for path in paths:
-                new_dt = resolved_dts.get(path)
-                if new_dt is not None:
-                    stem = path.stem if rename_fmt == _RENAME_DATE_PLUS else None
-                    name = make_dated_filename(
-                        new_dt, path.parent, path.suffix, used,
-                        original_stem=stem
-                    )
-                    used.add(name)
-                    new_names[path] = name
 
-        # Build a human-readable summary of what date components are being changed
-        # (used in the log; * = preserved from each file's own EXIF)
+        # Build a human-readable log summary from UI spinboxes (no EXIF reads needed)
         if not keep_mode:
-            y_str = str(self._spin_year.value())         if self._chk_year.isChecked()  else "*"
-            m_str = f"{self._spin_month.value():02d}"    if self._chk_month.isChecked() else "*"
-            d_str = f"{self._spin_day.value():02d}"      if self._chk_day.isChecked()   else "*"
+            y_str = str(self._spin_year.value())        if self._chk_year.isChecked()  else "*"
+            m_str = f"{self._spin_month.value():02d}"   if self._chk_month.isChecked() else "*"
+            d_str = f"{self._spin_day.value():02d}"     if self._chk_day.isChecked()   else "*"
             log_date_str = f"{y_str}:{m_str}:{d_str}"
         else:
             log_date_str = ""
 
-        # Capture apply context so slot methods can access it without closures
-        # (closures over locals are fragile when threads outlive the stack frame).
+        # Total steps computable from settings alone — no per-file EXIF reads needed
         will_rename    = rename and rename_fmt != _RENAME_KEEP_NAME
         has_two_phases = not keep_mode and will_rename
 
@@ -1017,39 +1068,53 @@ class DateEditorDialog(QDialog):
         self._apply_paths        = paths
         self._apply_rename       = rename
         self._apply_rename_fmt   = rename_fmt
-        self._apply_new_names    = new_names
         self._apply_log_date_str = log_date_str
         self._apply_total_steps  = len(paths) * 2 if has_two_phases else len(paths)
 
-        # Progress dialog — stored on self so it is never GC'd while thread runs.
-        # No cancel button: half-applied edits are unrecoverable.
+        # ── Show progress dialog BEFORE thread starts ──────────────────────
+        # No cancel button: half-applied EXIF edits are unrecoverable.
         self._progress_dlg = QProgressDialog(self)
         self._progress_dlg.setWindowTitle("Aplicando cambios…")
-        self._progress_dlg.setLabelText("Procesando…")
+        self._progress_dlg.setLabelText("Iniciando…")
         self._progress_dlg.setRange(0, self._apply_total_steps)
         self._progress_dlg.setValue(0)
         self._progress_dlg.setWindowModality(Qt.WindowModality.WindowModal)
-        self._progress_dlg.setMinimumDuration(300)
+        self._progress_dlg.setMinimumDuration(0)   # always show immediately
+        self._progress_dlg.setMinimumWidth(400)
         self._progress_dlg.setAutoReset(False)
         self._progress_dlg.setAutoClose(False)
         self._progress_dlg.setCancelButton(None)
+        self._progress_dlg.show()
+        QApplication.processEvents()   # force paint before thread starts
 
-        # Disable button so the user cannot fire a second apply while running
+        # Disable dialog so the user cannot fire a second apply while running
+        self.setEnabled(False)
         self._btn_apply.setEnabled(False)
 
+        # ── Start worker thread — ALL EXIF reads happen here, not above ────
+        # _ApplyWorker computes datetime and new filenames on the fly, reading
+        # each file's EXIF exactly once inside the thread.
+        use_custom = self._radio_custom.isChecked()
         self._apply_worker = _ApplyWorker(
-            paths, resolved_dts, fields,
-            rename, new_names,
+            paths,
+            keep_mode,
+            self._chk_year.isChecked(), self._chk_month.isChecked(), self._chk_day.isChecked(),
+            self._spin_year.value(), self._spin_month.value(), self._spin_day.value(),
+            use_custom,
+            self._spin_hour.value(), self._spin_minute.value(), self._spin_second.value(),
+            fields,
+            rename,
+            rename_fmt,
             write_exif=not keep_mode,
         )
         self._apply_thread = QThread()
         self._apply_worker.moveToThread(self._apply_thread)
 
-        # Wire signals — order matters: finished handling first, then quit, then cleanup
+        # Thread lifetime pattern (CLAUDE.md): do NOT also connect finished→thread.quit
+        # here; _on_apply_finished calls quit()+wait() directly to avoid double-quit.
         self._apply_thread.started.connect(self._apply_worker.run)
         self._apply_worker.progress.connect(self._on_apply_progress)
         self._apply_worker.finished.connect(self._on_apply_finished)
-        self._apply_worker.finished.connect(self._apply_thread.quit)
         self._apply_thread.finished.connect(self._cleanup_apply_thread)
 
         self._apply_thread.start()
@@ -1064,13 +1129,19 @@ class DateEditorDialog(QDialog):
                 f"{phase}: {fname}\n{step} de {steps} pasos"
             )
 
-    def _on_apply_finished(self, ok: int, failed: int, errors: list) -> None:
+    def _on_apply_finished(self, ok: int, failed: int, errors: list, renames_dict: object) -> None:
         """Handle apply completion: close progress, log, show result, accept dialog.
+
+        ``renames_dict`` is a plain dict {old_path_str → new_path_str} emitted by
+        the worker for files that were actually renamed successfully.
 
         Calls quit() + wait() on the thread BEFORE accepting the dialog so the
         QThread object is not destroyed while the OS thread is still running —
         that was the cause of the 'QThread: Destroyed while still running' crash.
         """
+        # Re-enable the dialog first so message boxes are interactive
+        self.setEnabled(True)
+
         if self._progress_dlg:
             self._progress_dlg.setValue(self._apply_total_steps)
             self._progress_dlg.close()
@@ -1082,29 +1153,31 @@ class DateEditorDialog(QDialog):
             self._apply_thread.quit()
             self._apply_thread.wait()
 
-        # Log changes
+        # Log EXIF writes
         if not self._apply_keep_mode:
             for p in self._apply_paths:
                 self._log.log(str(p.parent), p.name, "write_exif", "",
                               self._apply_log_date_str)
 
-        if self._apply_rename and self._apply_rename_fmt != _RENAME_KEEP_NAME:
-            for p, new_name in self._apply_new_names.items():
-                new_path = p.parent / new_name
-                if new_path.exists():
-                    self.applied_renames[p] = new_path
-                    self._log.log(str(p.parent), p.name, "rename", p.name, new_name)
-                    # Keep backup JSON in sync with the new filename so that
-                    # restore_backup() can locate the file after a rename.
-                    rename_backup_entry(p.parent, p.name, new_name)
+        # Log renames using the worker-reported dict (only includes successful renames)
+        for old_str, new_str in (renames_dict or {}).items():
+            old_path = Path(old_str)
+            new_path = Path(new_str)
+            self.applied_renames[old_path] = new_path
+            self._log.log(str(old_path.parent), old_path.name, "rename",
+                          old_path.name, new_path.name)
+            # Keep backup JSON in sync with the new filename so that
+            # restore_backup() can locate the file after a rename.
+            rename_backup_entry(old_path.parent, old_path.name, new_path.name)
 
         if errors:
-            QMessageBox.warning(
+            mb_warning(
                 self, "Aplicado con errores",
                 f"Correctos: {ok}\nErrores: {failed}\n\n" + "\n".join(errors[:10])
             )
         else:
-            QMessageBox.information(self, "Completado", f"Se procesaron {ok} archivos.")
+            mb_info(self, "Completado", f"Se procesaron {ok} archivos.")
+        self.changes_applied.emit()
         self.accept()
 
     def _cleanup_apply_thread(self) -> None:
@@ -1185,7 +1258,7 @@ class DateEditorDialog(QDialog):
             datetime(y, m, d)
             return True
         except ValueError as e:
-            QMessageBox.warning(self, "Fecha inválida", str(e))
+            mb_warning(self, "Fecha inválida", str(e))
             return False
 
     def _get_target_paths(self) -> List[Path]:

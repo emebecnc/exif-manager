@@ -4,7 +4,7 @@ import traceback
 from pathlib import Path
 
 from PyQt6.QtWidgets import QApplication, QMessageBox
-from PyQt6.QtGui import QPalette, QColor
+from PyQt6.QtGui import QIcon, QPalette, QColor
 from PyQt6.QtCore import Qt
 
 
@@ -127,6 +127,10 @@ def main():
     app.setApplicationName("ExifManager")
     app.setApplicationVersion("1.0.0")
     apply_dark_theme(app)
+
+    _ico = Path(__file__).parent / "icon.ico"
+    if _ico.exists():
+        app.setWindowIcon(QIcon(str(_ico)))
     sys.excepthook = _global_exception_hook
 
     # Import after QApplication is created (Qt requires it)

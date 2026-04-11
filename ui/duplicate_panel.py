@@ -17,11 +17,12 @@ from core.duplicate_finder import DuplicateScanWorker
 from core.exif_handler import read_exif
 from core.file_scanner import unique_dest
 from ui.log_viewer import LogManager
+from ui.styles import apply_button_style, apply_primary_button_style, mb_warning, mb_info, mb_question
 
 _TRASH_DIRNAME   = "_duplicados_eliminados"
 _THUMB_SIZE      = 200   # photo card thumbnail (px)
 _LIST_THUMB_SIZE = 60    # group list thumbnail (px)
-_CARD_WIDTH      = 230   # fixed width of each photo card (px)
+_CARD_WIDTH      = 280   # fixed width of each photo card (px)
 
 # ── Button stylesheets with hover/pressed states ──────────────────────────────
 
@@ -290,13 +291,16 @@ class _PhotoCard(QFrame):
             self._thumb.setText("Sin vista previa")
 
     def _apply_badge_style(self) -> None:
-        if self._is_best:
+        """Style and text of badge are driven by the current action, not is_best."""
+        if self._action == "keep":
+            self._badge.setText("★ CONSERVAR")
             self._badge.setStyleSheet(
                 "background-color: #1e4d1e; color: #70ff70;"
                 " font-weight: bold; font-size: 10px; padding: 2px 6px;"
                 " border-radius: 3px; border: none;"
             )
         else:
+            self._badge.setText("DUPLICADO")
             self._badge.setStyleSheet(
                 "background-color: #4d2a00; color: #ffa050;"
                 " font-weight: bold; font-size: 10px; padding: 2px 6px;"
@@ -324,7 +328,7 @@ class _PhotoCard(QFrame):
             self._btn_keep.setStyleSheet(_BTN_KEEP_OFF)
             self._btn_delete.setStyleSheet(_BTN_DEL_ON)
 
-        # Re-apply badge style after the frame stylesheet resets all QLabel borders
+        # Re-apply badge (text + style) after frame stylesheet resets all QLabel borders
         self._apply_badge_style()
 
     def _on_keep(self) -> None:
@@ -435,7 +439,7 @@ class DuplicatePanel(QWidget):
         self._btn_scan_folder.setToolTip(
             "Escanea solo la carpeta actualmente abierta en el visor de fotos."
         )
-        self._btn_scan_folder.setStyleSheet(_BTN_NEUTRAL)
+        apply_button_style(self._btn_scan_folder)
         self._btn_scan_folder.clicked.connect(self._on_scan_folder_clicked)
         left_layout.addWidget(self._btn_scan_folder)
 
@@ -444,7 +448,7 @@ class DuplicatePanel(QWidget):
             "Escanea toda la colección desde la carpeta raíz.\n"
             "Puede tardar varios minutos en colecciones grandes."
         )
-        self._btn_scan_root.setStyleSheet(_BTN_NEUTRAL)
+        apply_button_style(self._btn_scan_root)
         self._btn_scan_root.clicked.connect(self._on_scan_root_clicked)
         left_layout.addWidget(self._btn_scan_root)
 
@@ -453,7 +457,7 @@ class DuplicatePanel(QWidget):
             "Mueve automáticamente todos los duplicados a _duplicados_eliminados,\n"
             "conservando la foto de mayor calidad en cada grupo."
         )
-        self._btn_dedup_all.setStyleSheet(_BTN_NEUTRAL)
+        apply_primary_button_style(self._btn_dedup_all)
         self._btn_dedup_all.setEnabled(False)
         self._btn_dedup_all.clicked.connect(self._on_dedup_all)
         left_layout.addWidget(self._btn_dedup_all)
@@ -475,6 +479,9 @@ class DuplicatePanel(QWidget):
         self._comparison_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self._comparison_scroll.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self._comparison_scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
         self._right_stack.addWidget(self._comparison_scroll)   # index 1
 
@@ -652,14 +659,21 @@ class DuplicatePanel(QWidget):
     # ── Card signal handlers ───────────────────────────────────────────────
 
     def _on_card_keep(self, path_obj: object, group_idx: int) -> None:
-        """User clicked 'Conservar' on a card — update selection, re-colour card."""
+        """User clicked 'Conservar' on a card — exclusive keep: this card green,
+        all others in the group become delete (red)."""
         path = path_obj if isinstance(path_obj, Path) else Path(path_obj)
         if group_idx >= len(self._groups):
             return
-        if group_idx in self._selections:
-            self._selections[group_idx][path] = "keep"
-        if path in self._current_cards:
-            self._current_cards[path].set_action("keep")
+        sels = self._selections.get(group_idx)
+        if sels is None:
+            return
+        # Exclusive keep: clicked path → keep, every other path → delete
+        for p in self._groups[group_idx]:
+            sels[p] = "keep" if p == path else "delete"
+        # Sync visual state for all visible cards
+        for p, card in self._current_cards.items():
+            if p in sels:
+                card.set_action(sels[p])
 
     def _on_card_delete_now(self, path_obj: object, group_idx: int) -> None:
         """User clicked '🗑 Eliminar' — guard, then move the file immediately."""
@@ -676,7 +690,7 @@ class DuplicatePanel(QWidget):
         sels        = self._selections.get(group_idx, {})
         other_keeps = sum(1 for p in group if p != path and sels.get(p) == "keep")
         if other_keeps < 1:
-            QMessageBox.warning(
+            mb_warning(
                 self, "No se puede eliminar",
                 "Debe conservar al menos una foto del grupo.\n"
                 "Hacé clic en '✓ Conservar' en otra foto primero."
@@ -685,7 +699,7 @@ class DuplicatePanel(QWidget):
 
         # File-existence check before attempting the move
         if not path.exists():
-            QMessageBox.warning(
+            mb_warning(
                 self, "Archivo no encontrado",
                 f"El archivo ya no existe en el disco:\n{path}\n\n"
                 "Se eliminará del grupo."
@@ -700,7 +714,7 @@ class DuplicatePanel(QWidget):
             dest = unique_dest(path, trash_dir)
             shutil.move(str(path), str(dest))
         except Exception as exc:
-            QMessageBox.warning(self, "Error al eliminar", str(exc))
+            mb_warning(self, "Error al eliminar", str(exc))
             return
 
         self._log.log(
@@ -811,7 +825,7 @@ class DuplicatePanel(QWidget):
                     n_keep += 1
 
         if not to_delete:
-            QMessageBox.information(
+            mb_info(
                 self, "Sin elementos",
                 "No hay archivos marcados para eliminar."
             )
@@ -820,14 +834,13 @@ class DuplicatePanel(QWidget):
         n_del    = len(to_delete)
         del_size = sum(s for _, s in to_delete)
 
-        reply = QMessageBox.question(
+        reply = mb_question(
             self, "Confirmar deduplicación",
             f"Se moverán {n_del} archivo{'s' if n_del != 1 else ''}"
             f" a _duplicados_eliminados  ({_fmt_bytes(del_size)})\n"
             f"Se conservarán {n_keep} archivo{'s' if n_keep != 1 else ''}"
             f" (los de mayor calidad)\n\n"
             "¿Continuar?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
@@ -850,6 +863,8 @@ class DuplicatePanel(QWidget):
         self._dedup_progress_dlg.setCancelButton(None)
         self._dedup_progress_dlg.setMinimumDuration(0)
         self._dedup_progress_dlg.show()
+        self.setEnabled(False)
+        QApplication.processEvents()   # force paint before thread starts
 
         # Spin up worker thread
         # Thread lifetime pattern: do NOT connect finished→thread.quit here;
@@ -884,6 +899,7 @@ class DuplicatePanel(QWidget):
             self._dedup_progress_dlg.setValue(self._dedup_total)
             self._dedup_progress_dlg.close()
             self._dedup_progress_dlg = None
+        self.setEnabled(True)
 
         # Log each moved file individually
         error_names = {e.split(":")[0] for e in errors}

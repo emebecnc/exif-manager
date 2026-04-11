@@ -7,12 +7,12 @@ from PyQt6.QtCore import Qt, QSettings, QStandardPaths
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QSplitter, QVBoxLayout,
     QMenuBar, QStatusBar, QMessageBox, QProgressDialog,
-    QApplication,
+    QApplication, QLabel, QTabWidget,
 )
 from PyQt6.QtGui import QKeySequence, QAction
 
-from PyQt6.QtWidgets import QTabWidget
 from ui.log_viewer import LogManager, LogViewerDialog
+from ui.styles import TAB_STYLE, mb_warning, mb_info, mb_question
 from ui.folder_tree import FolderTreePanel
 from ui.thumbnail_grid import ThumbnailGrid
 from ui.photo_detail import PhotoDetailPanel
@@ -67,6 +67,7 @@ class MainWindow(QMainWindow):
         # Tab widget: thumbnail grid + duplicate panel
         self._center_tabs = QTabWidget()
         self._center_tabs.setDocumentMode(True)
+        self._center_tabs.setStyleSheet(TAB_STYLE)
 
         self._thumbnail_grid = ThumbnailGrid(self._log, self)
         self._duplicate_panel = DuplicatePanel(self._log, self)
@@ -105,6 +106,9 @@ class MainWindow(QMainWindow):
         self._status_bar = QStatusBar()
         self.setStatusBar(self._status_bar)
         self._status_bar.showMessage("Listo")
+        self._lbl_photo_count = QLabel("")
+        self._lbl_photo_count.setStyleSheet("color: #aaaaaa; padding-right: 8px;")
+        self._status_bar.addPermanentWidget(self._lbl_photo_count)
 
     def _build_menus(self) -> None:
         menubar = self.menuBar()
@@ -207,6 +211,13 @@ class MainWindow(QMainWindow):
 
         # Multi-selection in grid → update detail panel with summary
         self._thumbnail_grid.multi_selection.connect(self._on_multi_selection)
+
+        # Photo count in status bar (emitted by thumbnail grid after each scan)
+        self._thumbnail_grid.folder_loaded.connect(
+            lambda n: self._lbl_photo_count.setText(
+                f"{n} foto{'s' if n != 1 else ''}"
+            )
+        )
 
         # Switch to duplicates tab when a scan starts
         self._duplicate_panel.scan_started.connect(
@@ -364,21 +375,20 @@ class MainWindow(QMainWindow):
         if self._current_folder:
             self._restore_backup_for(self._current_folder)
         else:
-            QMessageBox.information(self, "Info", "No hay carpeta seleccionada.")
+            mb_info(self, "Info", "No hay carpeta seleccionada.")
 
     def _restore_backup_for(self, folder_path: Path) -> None:
         from core.backup_manager import has_backup, restore_backup
         if not has_backup(folder_path):
-            QMessageBox.information(
+            mb_info(
                 self, "Sin backup",
                 f"No existe archivo de backup en:\n{folder_path}"
             )
             return
 
-        reply = QMessageBox.question(
+        reply = mb_question(
             self, "Restaurar backup",
             f"¿Restaurar EXIF original de todas las fotos en:\n{folder_path.name}?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
@@ -388,13 +398,13 @@ class MainWindow(QMainWindow):
                       "", f"ok={result['ok']} errores={result['failed']}")
 
         if result["errors"]:
-            QMessageBox.warning(
+            mb_warning(
                 self, "Restauración con errores",
                 f"Restaurados: {result['ok']}\nErrores: {result['failed']}\n\n" +
                 "\n".join(result["errors"][:10])
             )
         else:
-            QMessageBox.information(
+            mb_info(
                 self, "Backup restaurado",
                 f"Se restauraron {result['ok']} archivos."
             )
@@ -409,7 +419,7 @@ class MainWindow(QMainWindow):
 
     def _show_duplicate_folder(self) -> None:
         if not self._current_folder:
-            QMessageBox.information(
+            mb_info(
                 self, "Sin carpeta",
                 "Abrí una carpeta primero para buscar duplicados en ella."
             )
@@ -418,7 +428,7 @@ class MainWindow(QMainWindow):
 
     def _show_duplicate_root(self) -> None:
         if not self._current_root:
-            QMessageBox.information(
+            mb_info(
                 self, "Sin carpeta raíz",
                 "Abrí una carpeta raíz antes de buscar duplicados."
             )
@@ -427,7 +437,7 @@ class MainWindow(QMainWindow):
 
     def _show_cleanup_dialog(self) -> None:
         if not self._current_root:
-            QMessageBox.information(
+            mb_info(
                 self, "Sin carpeta raíz",
                 "Abre una carpeta raíz antes de limpiar carpetas temporales."
             )
@@ -474,7 +484,7 @@ class MainWindow(QMainWindow):
             self._thumbnail_grid.refresh_item(path)
             self._status_bar.showMessage(f"Deshecho: {path.name}")
         except Exception as e:
-            QMessageBox.warning(self, "Error al deshacer", str(e))
+            mb_warning(self, "Error al deshacer", str(e))
 
     # ── Settings ───────────────────────────────────────────────────────────
 

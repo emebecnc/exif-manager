@@ -6,7 +6,7 @@ from typing import Dict, List, Optional
 from PyQt6.QtCore import Qt, QThread, QSize, pyqtSignal
 from PyQt6.QtGui import QPixmap, QColor, QBrush
 from PyQt6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QSplitter,
+    QApplication, QDialog, QVBoxLayout, QHBoxLayout, QSplitter,
     QLabel, QPushButton, QProgressBar, QListWidget, QListWidgetItem,
     QScrollArea, QWidget, QFrame, QGroupBox, QFormLayout,
     QMessageBox, QAbstractItemView,
@@ -16,7 +16,7 @@ from core.duplicate_finder import DuplicateScanWorker
 from core.exif_handler import read_exif, load_thumbnail
 from core.file_scanner import compute_md5, unique_dest
 from ui.log_viewer import LogManager
-from ui.styles import apply_button_style
+from ui.styles import apply_button_style, mb_warning, mb_info
 
 _TRASH_DIRNAME = "_duplicados_eliminados"
 _THUMB_SIZE    = 200
@@ -156,7 +156,7 @@ class _DuplicateItemWidget(QWidget):
             self._status_label.setStyleSheet("color: #e05050; border: none;")
             self.delete_requested.emit(self.path)
         except Exception as e:
-            QMessageBox.warning(self, "Error", str(e))
+            mb_warning(self, "Error", str(e))
 
     def mark_kept(self) -> None:
         self._status_label.setText("Conservado")
@@ -166,6 +166,7 @@ class _DuplicateItemWidget(QWidget):
 class DuplicateViewerDialog(QDialog):
     def __init__(self, root_path: Path, log_manager: LogManager, parent=None):
         super().__init__(parent)
+        self.setWindowIcon(QApplication.instance().windowIcon())
         self._root = root_path
         self._log  = log_manager
         self._groups: List[List[Path]] = []
@@ -432,7 +433,7 @@ class DuplicateViewerDialog(QDialog):
         msg = f"Se eliminaron {total_deleted} archivos duplicados."
         if errors:
             msg += f"\n\nErrores ({len(errors)}):\n" + "\n".join(errors[:10])
-        QMessageBox.information(self, "Completado", msg)
+        mb_info(self, "Completado", msg)
 
         # All groups are now resolved — clear everything
         self._groups.clear()

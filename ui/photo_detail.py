@@ -6,7 +6,7 @@ from typing import Optional
 from PyQt6.QtCore import Qt, pyqtSignal, QObject, QThread, QSize
 from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QApplication, QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QScrollArea, QGroupBox, QFormLayout, QSizePolicy,
     QFrame, QMessageBox, QWidget,
     QRadioButton, QButtonGroup, QDialogButtonBox,
@@ -16,7 +16,7 @@ from core.exif_handler import (
     get_all_metadata, load_preview, read_exif, parse_exif_dt, make_dated_filename,
 )
 from ui.log_viewer import LogManager
-from ui.styles import apply_button_style
+from ui.styles import apply_button_style, mb_warning
 
 # Rename format IDs — mirrors date_editor constants (kept local to avoid circular imports)
 _RENAME_DATE_ONLY = 0   # Solo fecha         → 2011-12-24-15h40m46s.jpg
@@ -29,6 +29,7 @@ class _RenameFormatDialog(QDialog):
 
     def __init__(self, path: Path, dt: datetime, parent=None):
         super().__init__(parent)
+        self.setWindowIcon(QApplication.instance().windowIcon())
         self.setWindowTitle("Renombrar con fecha EXIF")
         self._path = path
         self._dt   = dt
@@ -423,7 +424,7 @@ class PhotoDetailPanel(QWidget):
         )
         dt = parse_exif_dt(dt_str) if dt_str else None
         if not dt:
-            QMessageBox.warning(
+            mb_warning(
                 self, "Sin fecha EXIF",
                 "La foto no tiene una fecha EXIF válida para generar el nombre."
             )
@@ -448,7 +449,7 @@ class PhotoDetailPanel(QWidget):
         try:
             path.rename(new_path)
         except OSError as e:
-            QMessageBox.warning(self, "Error al renombrar", str(e))
+            mb_warning(self, "Error al renombrar", str(e))
             return
 
         self._log.log(str(path.parent), path.name, "rename", path.name, new_name)

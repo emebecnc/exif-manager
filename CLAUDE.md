@@ -13,16 +13,16 @@
 ### ui/ files
 | File | Purpose |
 |------|---------|
-| `cleanup_dialog.py` | Modal dialog to scan and delete temp/trash folders under a root |
-| `date_editor.py` | Date editing dialog: folder-mode, single-photo, or explicit-selection; reference thread pattern |
-| `duplicate_panel.py` | Permanent tab for duplicate scanning and resolution (side-by-side cards) |
-| `duplicate_viewer.py` | Legacy duplicate dialog (scan → compare → move to trash) |
+| `cleanup_dialog.py` | Modal dialog (Herramientas menu) to scan and delete temp/trash folders under a root |
+| `date_editor.py` | Date editing dialog: folder-mode, single-photo, or explicit-selection; **reference thread pattern** |
+| `duplicate_panel.py` | Permanent "Duplicados" tab: scan, side-by-side card comparison, batch dedup |
+| `duplicate_viewer.py` | Legacy duplicate dialog — superseded by `duplicate_panel.py`, kept for reference |
 | `folder_tree.py` | Left panel: lazy-loading folder tree with backup indicators |
 | `log_viewer.py` | `LogManager` (shared singleton) + `LogViewerDialog` |
-| `main_window.py` | App shell: layout, menu bar, tab management, signal wiring, undo stack |
+| `main_window.py` | App shell: `QTabWidget` with **Fotos** + **Duplicados** tabs, menu bar, signal wiring, undo stack |
 | `photo_detail.py` | Right panel: full EXIF metadata table + image preview + edit button |
 | `styles.py` | Dark-theme QSS constants shared across all widgets |
-| `thumbnail_grid.py` | Center panel: two-phase background thumbnail loader with disk cache |
+| `thumbnail_grid.py` | Center panel: two-phase background thumbnail loader with disk cache, sort controls, two-row button bar, progress bar for large folders |
 
 ### Key patterns
 
@@ -55,7 +55,7 @@ Do NOT also connect `worker.finished → thread.quit` — causes double `quit()`
 - `_clean_exif_for_dump` strips `MakerNote` (tag `0x927C` / 37500) and all `_EXIF_UNDEFINED_TAGS` that arrived as `int` instead of `bytes` (would crash dump).
 - `_EXIF_UNDEFINED_TAGS` is defined at top of `exif_handler.py`; add any new crash-causing tags there.
 
-### Current known bugs (duplicate_panel.py)
-- **Bug 7:** `_begin_scan` connects `_scan_worker.finished → _scan_thread.quit` AND `_on_scan_finished` also calls `quit()+wait()` — harmless double-quit, should be removed.
-- **Bug 8:** Same double-quit pattern in `_on_dedup_all` / `_on_dedup_finished` for the dedup worker thread.
-- Both need the signal-connection line removed so only the in-handler `quit()+wait()` remains.
+### Current known bugs
+None open. Last fixed:
+- **duplicate_panel.py** — lambda capture bug in `_show_group` loop (used bare closure; fixed with `gi=group_idx` default-arg pattern).
+- **duplicate_panel.py** — double `quit()` in scan and dedup workers: `finished → thread.quit` signal connection removed; only the in-handler `quit()+wait()` remains.

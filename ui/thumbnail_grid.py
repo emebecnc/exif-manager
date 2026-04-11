@@ -21,7 +21,7 @@ from core.backup_manager import has_backup, append_historial
 from core.exif_handler import load_thumbnail, read_exif, is_invalid_date, get_best_date_str
 from core.file_scanner import scan_folder, unique_dest, read_exif_dates_batch
 from ui.log_viewer import LogManager
-from ui.styles import apply_button_style
+from ui.styles import apply_button_style, mb_warning
 
 # UserRole slots
 _ROLE_PATH    = Qt.ItemDataRole.UserRole
@@ -185,6 +185,7 @@ class ThumbnailGrid(QWidget):
     photos_deleted = pyqtSignal(list)            # list[Path] — original paths of moved files
     folder_created = pyqtSignal(Path)            # new subfolder path
     read_filename_date_requested = pyqtSignal(Path)  # single photo — open editor pre-filled from filename
+    folder_loaded = pyqtSignal(int)              # emitted with photo count after each folder scan
 
     def __init__(self, log_manager: LogManager, parent=None):
         super().__init__(parent)
@@ -475,6 +476,7 @@ class ThumbnailGrid(QWidget):
         count  = len(images)
 
         self._lbl_count.setText(f"{count} fotos")
+        self.folder_loaded.emit(count)
         self._btn_new_folder.setEnabled(True)
         self._btn_edit.setEnabled(count > 0)
         self._btn_restore.setVisible(has_backup(folder_path))
@@ -782,7 +784,7 @@ class ThumbnailGrid(QWidget):
         self._btn_edit.setEnabled(remaining > 0)
 
         if errors:
-            QMessageBox.warning(
+            mb_warning(
                 self, "Errores al mover",
                 "\n".join(errors[:10]),
             )
@@ -802,10 +804,10 @@ class ThumbnailGrid(QWidget):
             return
         name = name.strip()
         if not name:
-            QMessageBox.warning(self, "Nombre vacío", "El nombre no puede estar vacío.")
+            mb_warning(self, "Nombre vacío", "El nombre no puede estar vacío.")
             return
         if any(c in _ILLEGAL_NAME_CHARS for c in name):
-            QMessageBox.warning(
+            mb_warning(
                 self, "Nombre inválido",
                 'El nombre contiene caracteres no permitidos:\n\\ / : * ? " < > |',
             )
@@ -814,12 +816,12 @@ class ThumbnailGrid(QWidget):
         try:
             new_path.mkdir(exist_ok=False)
         except FileExistsError:
-            QMessageBox.warning(
+            mb_warning(
                 self, "Ya existe", f"Ya existe una carpeta con el nombre '{name}'."
             )
             return
         except OSError as e:
-            QMessageBox.warning(self, "Error al crear carpeta", str(e))
+            mb_warning(self, "Error al crear carpeta", str(e))
             return
         self.folder_created.emit(new_path)
 
