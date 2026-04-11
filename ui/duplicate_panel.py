@@ -69,12 +69,20 @@ _BTN_CANCEL = (
 )
 
 
-# ── Helper functions ───────────────────────────────────────────────────────────
+# ── Module-level helpers ───────────────────────────────────────────────────────
 
 def _fmt_bytes(n: int) -> str:
     if n < 1_024:      return f"{n} B"
     if n < 1_048_576:  return f"{n / 1_024:.1f} KB"
     return f"{n / 1_048_576:.1f} MB"
+
+
+def _safe_size(path: Path) -> int:
+    """Return file size in bytes, 0 if the file cannot be stat'd."""
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
 
 
 def _load_pixmap(path: Path, size: int) -> Optional[QPixmap]:
@@ -128,8 +136,8 @@ def _best_in_group(group: List[Path]) -> Path:
 class _DeduplicateWorker(QObject):
     """Move a list of duplicate files to _duplicados_eliminados in a background thread."""
 
-    progress = pyqtSignal(int, int, str)        # current (0-based), total, filename
-    finished = pyqtSignal(int, int, list)        # deleted_count, bytes_freed, errors
+    progress = pyqtSignal(int, int, str)   # current (1-based), total, filename
+    finished = pyqtSignal(int, int, list)  # deleted_count, bytes_freed, errors
 
     def __init__(self, items: List[Tuple[str, int]]) -> None:
         """``items`` is a list of (absolute_path_str, file_size_bytes)."""
@@ -144,7 +152,7 @@ class _DeduplicateWorker(QObject):
 
         for i, (path_str, file_size) in enumerate(self._items):
             path = Path(path_str)
-            self.progress.emit(i, total, path.name)
+            self.progress.emit(i + 1, total, path.name)   # 1-based for display
 
             if not path.exists():
                 continue   # already gone — silently skip
@@ -188,7 +196,7 @@ class _PhotoCard(QFrame):
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(4)
 
-        # 1. Thumbnail (loaded by PIL in _load_thumb)
+        # 1. Thumbnail — loaded via PIL + EXIF transpose so every photo renders
         self._thumb = QLabel()
         self._thumb.setFixedSize(_THUMB_SIZE, _THUMB_SIZE)
         self._thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -202,18 +210,7 @@ class _PhotoCard(QFrame):
         # 2. Quality badge
         self._badge = QLabel("★ MEJOR" if is_best else "DUPLICADO")
         self._badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        if is_best:
-            self._badge.setStyleSheet(
-                "background-color: #1e4d1e; color: #70ff70;"
-                " font-weight: bold; font-size: 10px; padding: 2px 6px;"
-                " border-radius: 3px; border: none;"
-            )
-        else:
-            self._badge.setStyleSheet(
-                "background-color: #4d2a00; color: #ffa050;"
-                " font-weight: bold; font-size: 10px; padding: 2px 6px;"
-                " border-radius: 3px; border: none;"
-            )
+        self._apply_badge_style()
         layout.addWidget(self._badge)
 
         # 3. Info rows
@@ -256,9 +253,7 @@ class _PhotoCard(QFrame):
 
         # 4. Selectable full path
         path_lbl = QLabel(str(path))
-        path_lbl.setStyleSheet(
-            "color: #666666; font-size: 8px; border: none;"
-        )
+        path_lbl.setStyleSheet("color: #666666; font-size: 8px; border: none;")
         path_lbl.setWordWrap(True)
         path_lbl.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
@@ -267,7 +262,7 @@ class _PhotoCard(QFrame):
 
         layout.addStretch()
 
-        # 5. Action buttons
+        # 5. Action buttons — connected to instance methods, no loop-closure risk
         btn_row = QHBoxLayout()
         btn_row.setSpacing(4)
         self._btn_keep   = QPushButton("✓ Conservar")
@@ -278,7 +273,6 @@ class _PhotoCard(QFrame):
         btn_row.addWidget(self._btn_delete)
         layout.addLayout(btn_row)
 
-        # Connect — no loop-closure issue here since these are instance methods
         self._btn_keep.clicked.connect(self._on_keep)
         self._btn_delete.clicked.connect(self._on_delete)
 
@@ -294,6 +288,20 @@ class _PhotoCard(QFrame):
             self._thumb.setText("")
         else:
             self._thumb.setText("Sin vista previa")
+
+    def _apply_badge_style(self) -> None:
+        if self._is_best:
+            self._badge.setStyleSheet(
+                "background-color: #1e4d1e; color: #70ff70;"
+                " font-weight: bold; font-size: 10px; padding: 2px 6px;"
+                " border-radius: 3px; border: none;"
+            )
+        else:
+            self._badge.setStyleSheet(
+                "background-color: #4d2a00; color: #ffa050;"
+                " font-weight: bold; font-size: 10px; padding: 2px 6px;"
+                " border-radius: 3px; border: none;"
+            )
 
     def _apply_visual(self) -> None:
         """Update card border/background and button highlight to reflect current action."""
@@ -316,21 +324,8 @@ class _PhotoCard(QFrame):
             self._btn_keep.setStyleSheet(_BTN_KEEP_OFF)
             self._btn_delete.setStyleSheet(_BTN_DEL_ON)
 
-        # Re-apply badge stylesheet after frame stylesheet change
-        # (Qt's QLabel selector in the frame stylesheet resets `border` on all labels;
-        #  we need to re-assert the badge's own border-radius and background)
-        if self._is_best:
-            self._badge.setStyleSheet(
-                "background-color: #1e4d1e; color: #70ff70;"
-                " font-weight: bold; font-size: 10px; padding: 2px 6px;"
-                " border-radius: 3px; border: none;"
-            )
-        else:
-            self._badge.setStyleSheet(
-                "background-color: #4d2a00; color: #ffa050;"
-                " font-weight: bold; font-size: 10px; padding: 2px 6px;"
-                " border-radius: 3px; border: none;"
-            )
+        # Re-apply badge style after the frame stylesheet resets all QLabel borders
+        self._apply_badge_style()
 
     def _on_keep(self) -> None:
         self._action = "keep"
@@ -375,6 +370,7 @@ class DuplicatePanel(QWidget):
         self._dedup_thread:       Optional[QThread]            = None
         self._dedup_progress_dlg: Optional[QProgressDialog]   = None
         self._dedup_total:        int = 0
+        self._dedup_items:        List[Tuple[str, int]]        = []
         self._deduplicating:      bool = False
 
         # Results
@@ -532,11 +528,12 @@ class DuplicatePanel(QWidget):
         self._scan_thread = QThread(self)
         self._scan_worker.moveToThread(self._scan_thread)
 
+        # Thread lifetime pattern (see CLAUDE.md): do NOT connect finished→thread.quit
+        # here — _on_scan_finished calls quit()+wait() directly to avoid double-quit.
         self._scan_thread.started.connect(self._scan_worker.run)
         self._scan_worker.progress.connect(self._on_scan_progress)
         self._scan_worker.finished.connect(self._on_scan_finished)
         self._scan_worker.error.connect(self._on_scan_error)
-        self._scan_worker.finished.connect(self._scan_thread.quit)
         self._scan_thread.finished.connect(self._cleanup_scan_thread)
 
         self._scan_thread.start()
@@ -549,7 +546,7 @@ class DuplicatePanel(QWidget):
         self._lbl_header.setText(f"Escaneando… {current}/{total}\n{fname}")
 
     def _on_scan_finished(self, groups: list) -> None:
-        # Stop thread synchronously before touching UI (prevents GC crash)
+        # Quit+wait before any UI changes to prevent 'QThread destroyed while running'
         if self._scan_thread and self._scan_thread.isRunning():
             self._scan_thread.quit()
             self._scan_thread.wait()
@@ -558,8 +555,9 @@ class DuplicatePanel(QWidget):
         self._btn_cancel.setVisible(False)
         self._update_button_states()
 
+        # Normalise to Path objects — worker may emit str or Path depending on version
         self._groups = [
-            [Path(p) if not isinstance(p, Path) else p for p in g]
+            [p if isinstance(p, Path) else Path(p) for p in g]
             for g in groups
         ]
 
@@ -580,9 +578,7 @@ class DuplicatePanel(QWidget):
         # Populate group list with thumbnails
         for i, group in enumerate(self._groups):
             best       = _best_in_group(group)
-            group_size = sum(
-                _safe_size(p) for p in group
-            )
+            group_size = sum(_safe_size(p) for p in group)
             item = QListWidgetItem(
                 f"Grupo {i + 1} — {len(group)} archivos · {_fmt_bytes(group_size)}\n"
                 f"{best.name}"
@@ -637,8 +633,8 @@ class DuplicatePanel(QWidget):
             action = sels.get(p, "keep" if p == best else "delete")
             card   = _PhotoCard(p, is_best=(p == best), action=action)
 
-            # Use default-argument capture pattern to bind the correct path and
-            # group index at the time of connection (not at call time).
+            # Default-argument capture avoids the classic loop-closure bug:
+            # each lambda captures the value of gi and emitted at definition time.
             card.keep_clicked.connect(
                 lambda emitted, gi=group_idx: self._on_card_keep(emitted, gi)
             )
@@ -657,7 +653,7 @@ class DuplicatePanel(QWidget):
 
     def _on_card_keep(self, path_obj: object, group_idx: int) -> None:
         """User clicked 'Conservar' on a card — update selection, re-colour card."""
-        path = Path(path_obj) if not isinstance(path_obj, Path) else path_obj
+        path = path_obj if isinstance(path_obj, Path) else Path(path_obj)
         if group_idx >= len(self._groups):
             return
         if group_idx in self._selections:
@@ -667,7 +663,7 @@ class DuplicatePanel(QWidget):
 
     def _on_card_delete_now(self, path_obj: object, group_idx: int) -> None:
         """User clicked '🗑 Eliminar' — guard, then move the file immediately."""
-        path = Path(path_obj) if not isinstance(path_obj, Path) else path_obj
+        path = path_obj if isinstance(path_obj, Path) else Path(path_obj)
 
         # Stale index guard (can happen if groups were removed while cards were open)
         if group_idx >= len(self._groups):
@@ -676,10 +672,9 @@ class DuplicatePanel(QWidget):
         if path not in group:
             return
 
+        # At least one other photo must be marked keep before deletion
         sels        = self._selections.get(group_idx, {})
-        other_keeps = sum(
-            1 for p in group if p != path and sels.get(p) == "keep"
-        )
+        other_keeps = sum(1 for p in group if p != path and sels.get(p) == "keep")
         if other_keeps < 1:
             QMessageBox.warning(
                 self, "No se puede eliminar",
@@ -695,17 +690,7 @@ class DuplicatePanel(QWidget):
                 f"El archivo ya no existe en el disco:\n{path}\n\n"
                 "Se eliminará del grupo."
             )
-            group.remove(path)
-            if group_idx in self._selections:
-                self._selections[group_idx].pop(path, None)
-            card = self._current_cards.pop(path, None)
-            if card:
-                card.setVisible(False)
-                card.deleteLater()
-            if len(group) <= 1:
-                self._remove_group(group_idx)
-            else:
-                self._refresh_list_item(group_idx)
+            self._remove_path_from_group(group_idx, path)
             return
 
         # Move the file to _duplicados_eliminados
@@ -723,12 +708,15 @@ class DuplicatePanel(QWidget):
             "delete_duplicate", path.name, ""
         )
 
-        # Remove from group and selections
+        self._remove_path_from_group(group_idx, path)
+
+    def _remove_path_from_group(self, group_idx: int, path: Path) -> None:
+        """Remove ``path`` from group and selections, update cards and list."""
+        group = self._groups[group_idx]
         group.remove(path)
         if group_idx in self._selections:
             self._selections[group_idx].pop(path, None)
 
-        # Remove card from right panel
         card = self._current_cards.pop(path, None)
         if card:
             card.setVisible(False)
@@ -844,11 +832,14 @@ class DuplicatePanel(QWidget):
         if reply != QMessageBox.StandardButton.Yes:
             return
 
+        # Store item list so _on_dedup_finished can log each file
+        self._dedup_items = to_delete
+
         # Disable all action buttons for the duration
         self._deduplicating = True
         self._update_button_states()
 
-        # Progress dialog (no cancel button — same pattern as cleanup_dialog)
+        # Progress dialog (no cancel button — operation is not interruptible)
         self._dedup_total = n_del
         self._dedup_progress_dlg = QProgressDialog(self)
         self._dedup_progress_dlg.setWindowTitle("Deduplicando…")
@@ -861,6 +852,8 @@ class DuplicatePanel(QWidget):
         self._dedup_progress_dlg.show()
 
         # Spin up worker thread
+        # Thread lifetime pattern: do NOT connect finished→thread.quit here;
+        # _on_dedup_finished calls quit()+wait() directly.
         self._dedup_worker = _DeduplicateWorker(to_delete)
         self._dedup_thread = QThread(self)
         self._dedup_worker.moveToThread(self._dedup_thread)
@@ -868,7 +861,6 @@ class DuplicatePanel(QWidget):
         self._dedup_thread.started.connect(self._dedup_worker.run)
         self._dedup_worker.progress.connect(self._on_dedup_progress)
         self._dedup_worker.finished.connect(self._on_dedup_finished)
-        self._dedup_worker.finished.connect(self._dedup_thread.quit)
         self._dedup_thread.finished.connect(self._cleanup_dedup_thread)
 
         self._dedup_thread.start()
@@ -877,13 +869,13 @@ class DuplicatePanel(QWidget):
         if self._dedup_progress_dlg:
             self._dedup_progress_dlg.setValue(current)
             self._dedup_progress_dlg.setLabelText(
-                f"Moviendo: {filename}\n{current + 1} de {total}"
+                f"Moviendo: {filename}\n{current} de {total}"
             )
 
     def _on_dedup_finished(
         self, deleted_count: int, bytes_freed: int, errors: List[str]
     ) -> None:
-        """Called when _DeduplicateWorker finishes. Must quit+wait before UI changes."""
+        """Called when _DeduplicateWorker finishes. Quit+wait before UI changes."""
         if self._dedup_thread and self._dedup_thread.isRunning():
             self._dedup_thread.quit()
             self._dedup_thread.wait()
@@ -893,11 +885,16 @@ class DuplicatePanel(QWidget):
             self._dedup_progress_dlg.close()
             self._dedup_progress_dlg = None
 
-        # Log the batch operation
-        self._log.log(
-            "", "", "delete_duplicate", "",
-            f"Deduplicar todo: {deleted_count} archivos, {_fmt_bytes(bytes_freed)} liberados"
-        )
+        # Log each moved file individually
+        error_names = {e.split(":")[0] for e in errors}
+        for path_str, _ in self._dedup_items:
+            p = Path(path_str)
+            if p.name not in error_names:
+                self._log.log(
+                    str(p.parent), p.name,
+                    "delete_duplicate", p.name, "deduplicar_todo"
+                )
+        self._dedup_items = []
 
         # Clear all group state
         self._deduplicating = False
@@ -930,13 +927,3 @@ class DuplicatePanel(QWidget):
         if self._dedup_thread:
             self._dedup_thread.deleteLater()
             self._dedup_thread = None
-
-
-# ── Module-level helpers ───────────────────────────────────────────────────────
-
-def _safe_size(path: Path) -> int:
-    """Return file size in bytes, 0 if the file cannot be stat'd."""
-    try:
-        return path.stat().st_size
-    except OSError:
-        return 0
