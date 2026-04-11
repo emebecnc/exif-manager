@@ -32,7 +32,9 @@ class DuplicateScanWorker(QObject):
 
             for i, path in enumerate(all_files):
                 if self._cancelled:
-                    self.finished.emit([])
+                    partial = [paths for paths in md5_map.values() if len(paths) > 1]
+                    partial.sort(key=lambda g: (-len(g), str(g[0])))
+                    self.finished.emit(partial)
                     return
                 self.progress.emit(i + 1, total, path.name)
                 digest = compute_md5(path)

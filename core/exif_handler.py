@@ -41,6 +41,45 @@ _ORIENTATION_LABELS = {
 # Years considered "invalid/reset" camera date when month=1 day=1
 _INVALID_YEARS = {2000, 2005}
 
+# Exif IFD tags whose EXIF type is UNDEFINED (must be bytes).
+# piexif sometimes loads them as int on malformed files; dump() then crashes.
+# Using raw integers because not all of these exist as named attributes on
+# piexif.ExifIFD across all installed versions.
+_EXIF_UNDEFINED_TAGS = frozenset({
+    36864,  # ExifVersion          0x9000  b"0230" etc.
+    40960,  # FlashPixVersion      0xA000  b"0100"
+    37121,  # ComponentsConfiguration 0x9101
+    41729,  # SceneType            0xA301
+    41728,  # FileSource           0xA300
+    37500,  # MakerNote            0x927C
+})
+
+# Exif IFD tags whose EXIF type is legitimately SHORT (int).
+# Any int-valued tag NOT in this set is treated as a misloaded UNDEFINED /
+# RATIONAL tag and removed before calling piexif.dump().
+# Raw integers used for the same portability reason as above.
+_EXIF_INT_OK_TAGS = frozenset({
+    34850,  # ExposureProgram      0x8822
+    34855,  # ISOSpeedRatings      0x8827
+    37383,  # MeteringMode         0x9207
+    37384,  # LightSource          0x9208
+    37385,  # Flash                0x9209
+    37399,  # SensingMethod        0x9217
+    40961,  # ColorSpace           0xA001
+    40962,  # PixelXDimension      0xA002
+    40963,  # PixelYDimension      0xA003
+    41985,  # CustomRendered       0xA401
+    41986,  # ExposureMode         0xA402
+    41987,  # WhiteBalance         0xA403
+    41989,  # FocalLengthIn35mmFilm 0xA405
+    41990,  # SceneCaptureType     0xA406
+    41991,  # GainControl          0xA407
+    41992,  # Contrast             0xA408
+    41993,  # Saturation           0xA409
+    41994,  # Sharpness            0xA40A
+    41996,  # SubjectDistanceRange 0xA40C
+})
+
 
 def _load_exif_bytes(path: Path) -> Optional[dict]:
     try:
@@ -183,6 +222,39 @@ def write_exif_date(
     write_exif_timestamps(path, new_fields)
 
 
+def _clean_exif_for_dump(exif_dict: dict) -> dict:
+    """Remove or fix any Exif IFD tag that would cause piexif.dump() to fail.
+
+    piexif loads UNDEFINED-type tags (bytes in the EXIF spec) as plain int on
+    some files.  When dump() encounters them it raises TypeError.  The safest
+    fix is outright deletion — these are metadata conveniences and their absence
+    never prevents the image from being opened or dated correctly.
+
+    Two passes over the Exif IFD:
+      1. Tags explicitly known to be UNDEFINED type → remove if int.
+      2. Any remaining int value whose tag is NOT in the known-SHORT allowlist
+         → remove (almost certainly a misloaded UNDEFINED or RATIONAL tag).
+    """
+    exif_ifd = exif_dict.get("Exif")
+    if not isinstance(exif_ifd, dict):
+        return exif_dict
+
+    # Pass 1 — strip known UNDEFINED tags that arrived as int (incl. MakerNote)
+    for tag in _EXIF_UNDEFINED_TAGS:
+        if isinstance(exif_ifd.get(tag), int):
+            exif_ifd.pop(tag, None)
+
+    # Pass 2 — catch-all: remove any remaining int not in the SHORT allowlist
+    bad = [
+        k for k, v in exif_ifd.items()
+        if isinstance(v, int) and k not in _EXIF_INT_OK_TAGS
+    ]
+    for k in bad:
+        del exif_ifd[k]
+
+    return exif_dict
+
+
 def write_exif_timestamps(path: Path, fields: dict) -> None:
     """Low-level: write EXIF timestamp dict to a JPEG/TIFF file.
 
@@ -197,8 +269,8 @@ def write_exif_timestamps(path: Path, fields: dict) -> None:
     except Exception:
         exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}}
 
-    # Remove MakerNote to avoid serialisation errors on Sony/Canon files
-    exif_dict.get("Exif", {}).pop(piexif.ExifIFD.MakerNote, None)
+    # Sanitise the dict: remove any tag that would make piexif.dump() raise
+    _clean_exif_for_dump(exif_dict)
 
     for name, val in fields.items():
         if name not in _TIMESTAMP_TAGS:

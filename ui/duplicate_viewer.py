@@ -16,6 +16,7 @@ from core.duplicate_finder import DuplicateScanWorker
 from core.exif_handler import read_exif, load_thumbnail
 from core.file_scanner import compute_md5, unique_dest
 from ui.log_viewer import LogManager
+from ui.styles import apply_button_style
 
 _TRASH_DIRNAME = "_duplicados_eliminados"
 _THUMB_SIZE    = 200
@@ -235,6 +236,7 @@ class DuplicateViewerDialog(QDialog):
             "Los archivos no se borran permanentemente."
         )
         self._btn_keep_first.clicked.connect(self._keep_first_all)
+        apply_button_style(self._btn_keep_first)
         left_layout.addWidget(self._btn_keep_first)   # pinned at bottom
 
         splitter.addWidget(left_widget)
@@ -257,6 +259,7 @@ class DuplicateViewerDialog(QDialog):
         btn_close = QPushButton("Cerrar")
         btn_close.setToolTip("Cierra el visor de duplicados.")
         btn_close.clicked.connect(self.accept)
+        apply_button_style(btn_close)
         bottom_bar.addWidget(btn_close)
         results_layout.addLayout(bottom_bar)
 

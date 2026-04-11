@@ -32,6 +32,7 @@ ACTION_LABELS = {
     "undo":               "Deshacer",
     "create_backup":      "Crear backup",
     "rename":             "Renombrar",
+    "cleanup":            "Limpieza",
 }
 
 _ALL_ACTIONS = "Todas"

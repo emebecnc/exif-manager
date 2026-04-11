@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QComboBox,
     QListWidget, QListWidgetItem, QAbstractItemView, QStyledItemDelegate,
     QStyleOptionViewItem, QApplication, QMenu, QMessageBox, QInputDialog,
-    QProgressBar,
+    QProgressBar, QLayout,
 )
 from PyQt6.QtCore import QModelIndex
 
@@ -21,6 +21,7 @@ from core.backup_manager import has_backup, append_historial
 from core.exif_handler import load_thumbnail, read_exif, is_invalid_date, get_best_date_str
 from core.file_scanner import scan_folder, unique_dest, read_exif_dates_batch
 from ui.log_viewer import LogManager
+from ui.styles import apply_button_style
 
 # UserRole slots
 _ROLE_PATH    = Qt.ItemDataRole.UserRole
@@ -177,6 +178,9 @@ class ThumbnailGrid(QWidget):
     photo_selected = pyqtSignal(Path)
     edit_folder_date = pyqtSignal(Path)
     edit_selection_date = pyqtSignal(list)       # list[Path] — selected photos to edit
+    # Emitted whenever 2+ items are selected: list of (Path, date_str) tuples
+    # where date_str is the cached EXIF date already held in item data.
+    multi_selection = pyqtSignal(list)
     restore_backup_requested = pyqtSignal(Path)
     photos_deleted = pyqtSignal(list)            # list[Path] — original paths of moved files
     folder_created = pyqtSignal(Path)            # new subfolder path
@@ -222,12 +226,16 @@ class ThumbnailGrid(QWidget):
         self._list.itemActivated.connect(self._on_item_clicked)
         self._list.itemSelectionChanged.connect(self._on_selection_changed)
         self._list.customContextMenuRequested.connect(self._on_context_menu)
+        self._list.itemDoubleClicked.connect(self._on_double_click)
         self._list.installEventFilter(self)
         layout.addWidget(self._list)
 
-        # Bottom bar
-        bar = QHBoxLayout()
+        # ── Bottom bar — two rows ──────────────────────────────────────────
+        bottom = QVBoxLayout()
+        bottom.setSpacing(2)
+        bottom.setContentsMargins(0, 0, 0, 0)
 
+        # Row 1: sort controls + legend + count + loading progress bar
         self._lbl_count = QLabel("0 fotos")
 
         # Compact progress bar (visible only during loading of large folders)
@@ -249,15 +257,36 @@ class ThumbnailGrid(QWidget):
             "Mostrando del más antiguo al más reciente. Clic para invertir."
         )
         self._btn_sort_dir.clicked.connect(self._on_sort_dir_toggled)
+        apply_button_style(self._btn_sort_dir)
 
+        # Red-border legend
+        self._lbl_invalid_legend = QLabel("🔴 = fecha inválida")
+        self._lbl_invalid_legend.setStyleSheet("font-size: 10px; color: #aaaaaa; padding: 0 4px;")
+        self._lbl_invalid_legend.setToolTip(
+            "Las fotos con borde rojo tienen fecha EXIF ausente o incorrecta\n"
+            "(ej: 01/01/2000 o 01/01/2005). Estas fotos aparecerán en el lugar\n"
+            "equivocado en Immich y Google Photos."
+        )
+
+        row1 = QHBoxLayout()
+        row1.setContentsMargins(0, 0, 0, 0)
+        row1.addWidget(self._sort_combo)
+        row1.addWidget(self._btn_sort_dir)
+        row1.addStretch()
+        row1.addWidget(self._lbl_invalid_legend)
+        row1.addWidget(self._progress_bar)
+        row1.addWidget(self._lbl_count)
+
+        # Row 2: action buttons (never clipped — use SetMinimumSize constraint)
         # Selection-edit button — only visible when 2+ items are selected
-        self._btn_edit_selection = QPushButton("Editar fecha de seleccionadas")
+        self._btn_edit_selection = QPushButton("Editar selección")
         self._btn_edit_selection.setVisible(False)
         self._btn_edit_selection.setToolTip(
             "Abre el editor de fecha para las fotos seleccionadas.\n"
             "Podés cambiar la fecha EXIF o solo renombrar con la fecha actual."
         )
         self._btn_edit_selection.clicked.connect(self._on_edit_selection)
+        apply_button_style(self._btn_edit_selection)
 
         self._btn_new_folder = QPushButton("📁 Nueva carpeta")
         self._btn_new_folder.setEnabled(False)
@@ -266,8 +295,9 @@ class ThumbnailGrid(QWidget):
             "También se guarda un registro legible en _historial_original.txt dentro de cada carpeta."
         )
         self._btn_new_folder.clicked.connect(self._on_new_folder)
+        apply_button_style(self._btn_new_folder)
 
-        self._btn_edit = QPushButton("Editar fecha de carpeta")
+        self._btn_edit = QPushButton("Editar carpeta")
         self._btn_edit.setEnabled(False)
         self._btn_edit.setToolTip(
             "Cambia la fecha EXIF de todas las fotos de esta carpeta.\n"
@@ -275,8 +305,9 @@ class ThumbnailGrid(QWidget):
             "También se guarda un registro legible en _historial_original.txt dentro de cada carpeta."
         )
         self._btn_edit.clicked.connect(self._on_edit_folder)
+        apply_button_style(self._btn_edit)
 
-        self._btn_restore = QPushButton("Restaurar EXIF original")
+        self._btn_restore = QPushButton("Restaurar EXIF")
         self._btn_restore.setVisible(False)
         self._btn_restore.setToolTip(
             "Revierte todos los cambios de fecha realizados en esta carpeta\n"
@@ -284,17 +315,20 @@ class ThumbnailGrid(QWidget):
             "También se guarda un registro legible en _historial_original.txt dentro de cada carpeta."
         )
         self._btn_restore.clicked.connect(self._on_restore_backup)
+        apply_button_style(self._btn_restore)
 
-        bar.addWidget(self._lbl_count)
-        bar.addWidget(self._progress_bar)
-        bar.addWidget(self._sort_combo)
-        bar.addWidget(self._btn_sort_dir)
-        bar.addWidget(self._btn_edit_selection)
-        bar.addStretch()
-        bar.addWidget(self._btn_new_folder)
-        bar.addWidget(self._btn_restore)
-        bar.addWidget(self._btn_edit)
-        layout.addLayout(bar)
+        row2 = QHBoxLayout()
+        row2.setContentsMargins(0, 0, 0, 0)
+        row2.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+        row2.addWidget(self._btn_new_folder)
+        row2.addWidget(self._btn_restore)
+        row2.addWidget(self._btn_edit)
+        row2.addWidget(self._btn_edit_selection)
+        row2.addStretch()
+
+        bottom.addLayout(row1)
+        bottom.addLayout(row2)
+        layout.addLayout(bottom)
 
     # ── Public API ─────────────────────────────────────────────────────────
 
@@ -577,14 +611,32 @@ class ThumbnailGrid(QWidget):
         if path_str:
             self.photo_selected.emit(Path(path_str))
 
+    def _on_double_click(self, item: QListWidgetItem) -> None:
+        """Open photo in the system's default viewer on double-click."""
+        import os
+        path_str = item.data(_ROLE_PATH)
+        if path_str:
+            path = Path(path_str)
+            if path.exists():
+                os.startfile(str(path))
+
     def _on_selection_changed(self) -> None:
-        """Show/hide and relabel the selection-edit button based on selection count."""
-        count = len(self._list.selectedItems())
+        """Show/hide the selection-edit button and notify the detail panel."""
+        selected = self._list.selectedItems()
+        count = len(selected)
         self._btn_edit_selection.setVisible(count >= 2)
         if count >= 2:
             self._btn_edit_selection.setText(
-                f"Editar fecha de seleccionadas ({count} fotos)"
+                f"Editar selección ({count})"
             )
+            # Build (Path, date_str) pairs from cached item data — no disk access
+            pairs = []
+            for item in selected:
+                path_str = item.data(_ROLE_PATH) or ""
+                date_str = item.data(_ROLE_DATE) or ""
+                if path_str:
+                    pairs.append((Path(path_str), date_str))
+            self.multi_selection.emit(pairs)
 
     def _on_edit_selection(self) -> None:
         """Emit edit_selection_date with the current multi-selection."""

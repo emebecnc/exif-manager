@@ -11,10 +11,12 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtGui import QKeySequence, QAction
 
+from PyQt6.QtWidgets import QTabWidget
 from ui.log_viewer import LogManager, LogViewerDialog
 from ui.folder_tree import FolderTreePanel
 from ui.thumbnail_grid import ThumbnailGrid
 from ui.photo_detail import PhotoDetailPanel
+from ui.duplicate_panel import DuplicatePanel
 
 
 class MainWindow(QMainWindow):
@@ -40,6 +42,7 @@ class MainWindow(QMainWindow):
         self._build_menus()
         self._wire_signals()
         self._restore_settings()
+        self.showMaximized()
 
     # ── UI construction ────────────────────────────────────────────────────
 
@@ -59,15 +62,42 @@ class MainWindow(QMainWindow):
         # Right side: another horizontal splitter [thumbnails | detail]
         self._content_splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        self._thumbnail_grid = ThumbnailGrid(self._log, self)
         self._photo_detail = PhotoDetailPanel(self._log, self)
 
-        self._content_splitter.addWidget(self._thumbnail_grid)
+        # Tab widget: thumbnail grid + duplicate panel
+        self._center_tabs = QTabWidget()
+        self._center_tabs.setDocumentMode(True)
+
+        self._thumbnail_grid = ThumbnailGrid(self._log, self)
+        self._duplicate_panel = DuplicatePanel(self._log, self)
+
+        self._center_tabs.addTab(self._thumbnail_grid, "📷  Fotos")
+        self._center_tabs.addTab(self._duplicate_panel, "🔍  Duplicados")
+
+        self._content_splitter.addWidget(self._center_tabs)
         self._content_splitter.addWidget(self._photo_detail)
-        self._content_splitter.setSizes([620, 360])
+        # Center tabs stretch; detail panel keeps its width when window resizes
+        self._content_splitter.setStretchFactor(0, 1)
+        self._content_splitter.setStretchFactor(1, 0)
+        self._content_splitter.setHandleWidth(6)
+        self._content_splitter.setChildrenCollapsible(False)
 
         self._main_splitter.addWidget(self._content_splitter)
-        self._main_splitter.setSizes([220, 1000])
+        self._main_splitter.setHandleWidth(6)
+        self._main_splitter.setChildrenCollapsible(False)
+
+        # Minimum widths to prevent panels from being squeezed out
+        self._folder_tree.setMinimumWidth(180)
+        self._center_tabs.setMinimumWidth(400)
+        self._photo_detail.setMinimumWidth(280)
+
+        # Screen-proportional initial sizes
+        screen = QApplication.primaryScreen().availableGeometry()
+        total_w = screen.width()
+        tree_w, detail_w = 220, 350
+        grid_w = max(400, total_w - tree_w - detail_w)
+        self._main_splitter.setSizes([tree_w, grid_w + detail_w])
+        self._content_splitter.setSizes([grid_w, detail_w])
 
         root_layout.addWidget(self._main_splitter)
 
@@ -105,13 +135,20 @@ class MainWindow(QMainWindow):
 
         # Tools menu
         tools_menu = menubar.addMenu("Herramientas")
-        action_dupes = QAction("Buscar duplicados…", self)
-        action_dupes.setToolTip(
-            "Escanea toda la colección cargada en busca de fotos idénticas\n"
-            "usando hash MD5. Permite eliminar duplicados de forma segura."
+        action_dupes_folder = QAction("Buscar duplicados en carpeta actual…", self)
+        action_dupes_folder.setToolTip(
+            "Escanea la carpeta actualmente abierta en busca de fotos idénticas."
         )
-        action_dupes.triggered.connect(self._show_duplicate_viewer)
-        tools_menu.addAction(action_dupes)
+        action_dupes_folder.triggered.connect(self._show_duplicate_folder)
+        tools_menu.addAction(action_dupes_folder)
+
+        action_dupes_root = QAction("Buscar duplicados en carpeta raíz…", self)
+        action_dupes_root.setToolTip(
+            "Escanea toda la colección cargada en busca de fotos idénticas (MD5). "
+            "Puede tardar varios minutos."
+        )
+        action_dupes_root.triggered.connect(self._show_duplicate_root)
+        tools_menu.addAction(action_dupes_root)
 
         action_restore = QAction("Restaurar EXIF de carpeta actual…", self)
         action_restore.setToolTip(
@@ -120,6 +157,17 @@ class MainWindow(QMainWindow):
         )
         action_restore.triggered.connect(self._restore_current_folder_backup)
         tools_menu.addAction(action_restore)
+
+        tools_menu.addSeparator()
+
+        action_cleanup = QAction("Limpiar carpetas temporales…", self)
+        action_cleanup.setToolTip(
+            "Escanea toda la colección y elimina carpetas y archivos temporales:\n"
+            "_thumbcache, _eliminados, _duplicados_eliminados,\n"
+            "_historial_original.txt, .exif_backup.json"
+        )
+        action_cleanup.triggered.connect(self._show_cleanup_dialog)
+        tools_menu.addAction(action_cleanup)
 
     def _wire_signals(self) -> None:
         # Folder selection → load thumbnails
@@ -157,16 +205,30 @@ class MainWindow(QMainWindow):
         # Files moved via drag & drop from grid → folder tree
         self._folder_tree.files_moved.connect(self._on_files_moved)
 
+        # Multi-selection in grid → update detail panel with summary
+        self._thumbnail_grid.multi_selection.connect(self._on_multi_selection)
+
+        # Switch to duplicates tab when a scan starts
+        self._duplicate_panel.scan_started.connect(
+            lambda: self._center_tabs.setCurrentIndex(1)
+        )
+
     # ── Slots ──────────────────────────────────────────────────────────────
 
     def _on_folder_selected(self, path: Path) -> None:
         self._current_folder = path
         self._thumbnail_grid.load_folder(path)
         self._status_bar.showMessage(str(path))
+        self._duplicate_panel.set_current_folder(path)
 
     def _on_photo_selected(self, path: Path) -> None:
         self._current_photo = path
         self._photo_detail.load_photo(path)
+
+    def _on_multi_selection(self, pairs: list) -> None:
+        """Show multi-selection summary in the detail panel."""
+        self._current_photo = None
+        self._photo_detail.show_selection(pairs)
 
     def _open_date_editor_folder(self, folder_path: Path) -> None:
         from ui.date_editor import DateEditorDialog
@@ -345,16 +407,46 @@ class MainWindow(QMainWindow):
         dlg = LogViewerDialog(self._log, self)
         dlg.exec()
 
-    def _show_duplicate_viewer(self) -> None:
+    def _show_duplicate_folder(self) -> None:
+        if not self._current_folder:
+            QMessageBox.information(
+                self, "Sin carpeta",
+                "Abrí una carpeta primero para buscar duplicados en ella."
+            )
+            return
+        self._duplicate_panel.start_scan(self._current_folder)
+
+    def _show_duplicate_root(self) -> None:
         if not self._current_root:
             QMessageBox.information(
                 self, "Sin carpeta raíz",
-                "Abre una carpeta raíz antes de buscar duplicados."
+                "Abrí una carpeta raíz antes de buscar duplicados."
             )
             return
-        from ui.duplicate_viewer import DuplicateViewerDialog
-        dlg = DuplicateViewerDialog(self._current_root, self._log, self)
+        self._duplicate_panel.start_scan(self._current_root)
+
+    def _show_cleanup_dialog(self) -> None:
+        if not self._current_root:
+            QMessageBox.information(
+                self, "Sin carpeta raíz",
+                "Abre una carpeta raíz antes de limpiar carpetas temporales."
+            )
+            return
+        from ui.cleanup_dialog import CleanupDialog
+        dlg = CleanupDialog(
+            self._current_root, self._log, self,
+            current_folder=self._current_folder,
+        )
         dlg.exec()
+        if dlg.cleaned:
+            # Deleted folders may have been visible in the tree — reload it
+            self._folder_tree.load_root(self._current_root)
+            # If the current folder was inside a deleted subtree, clear the grid
+            if self._current_folder and not self._current_folder.exists():
+                self._current_folder = None
+                self._thumbnail_grid.load_folder(self._current_root)
+                self._photo_detail.clear()
+            self._status_bar.showMessage("Limpieza completada — árbol de carpetas actualizado")
 
     # ── Keyboard shortcuts ─────────────────────────────────────────────────
 
@@ -401,6 +493,7 @@ class MainWindow(QMainWindow):
         if last_root and Path(last_root).exists():
             self._current_root = Path(last_root)
             self._folder_tree.load_root(self._current_root)
+            self._duplicate_panel.set_root(self._current_root)
 
     def closeEvent(self, event) -> None:
         s = QSettings()
@@ -416,3 +509,4 @@ class MainWindow(QMainWindow):
     def set_root(self, path: Path) -> None:
         self._current_root = path
         QSettings().setValue("last_root", str(path))
+        self._duplicate_panel.set_root(path)

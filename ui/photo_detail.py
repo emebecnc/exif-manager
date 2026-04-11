@@ -16,6 +16,7 @@ from core.exif_handler import (
     get_all_metadata, load_preview, read_exif, parse_exif_dt, make_dated_filename,
 )
 from ui.log_viewer import LogManager
+from ui.styles import apply_button_style
 
 # Rename format IDs — mirrors date_editor constants (kept local to avoid circular imports)
 _RENAME_DATE_ONLY = 0   # Solo fecha         → 2011-12-24-15h40m46s.jpg
@@ -127,6 +128,7 @@ class PhotoDetailPanel(QWidget):
         self._build_ui()
 
     def _build_ui(self) -> None:
+        self.setMinimumWidth(320)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(6)
@@ -176,6 +178,7 @@ class PhotoDetailPanel(QWidget):
             "El estado anterior se guarda para poder deshacer con Ctrl+Z."
         )
         self._btn_edit.clicked.connect(self._on_edit)
+        apply_button_style(self._btn_edit)
         btn_row.addWidget(self._btn_edit)
 
         self._btn_rename = QPushButton("Renombrar con fecha EXIF")
@@ -186,6 +189,7 @@ class PhotoDetailPanel(QWidget):
             "agrega _1, _2, etc. para evitar colisiones."
         )
         self._btn_rename.clicked.connect(self._on_rename)
+        apply_button_style(self._btn_rename)
         btn_row.addWidget(self._btn_rename)
 
         layout.addLayout(btn_row)
@@ -205,15 +209,82 @@ class PhotoDetailPanel(QWidget):
         self._current_path = None
         self._original_pixmap = None
         self._preview.setText("Sin imagen")
+        self._grp_exif.setTitle("EXIF")
+        self._grp_file.setTitle("Archivo")
         self._clear_form(self._form_exif)
         self._clear_form(self._form_file)
         self._btn_edit.setEnabled(False)
         self._btn_rename.setEnabled(False)
 
+    def show_selection(self, pairs: list) -> None:
+        """Display a summary for multiple selected photos.
+
+        ``pairs`` is a list of ``(Path, date_str)`` tuples where ``date_str``
+        is the cached EXIF date (already read by the thumbnail worker — no
+        additional disk access required here).
+        """
+        self._stop_preview_worker()
+        self._current_path = None
+        self._original_pixmap = None
+        self._btn_edit.setEnabled(False)
+        self._btn_rename.setEnabled(False)
+
+        n = len(pairs)
+        self._preview.clear()
+        self._preview.setText(f"{n} fotos\nseleccionadas")
+
+        self._grp_exif.setTitle(f"Selección  ({n} fotos)")
+        self._grp_file.setTitle("Archivos")
+        self._clear_form(self._form_exif)
+        self._clear_form(self._form_file)
+
+        if not pairs:
+            return
+
+        # ── Total size (stat only — fast) ──────────────────────────────────
+        total_bytes = 0
+        for path, _ in pairs:
+            try:
+                total_bytes += path.stat().st_size
+            except OSError:
+                pass
+        if total_bytes >= 1_048_576:
+            size_str = f"{total_bytes / 1_048_576:.1f} MB"
+        elif total_bytes > 0:
+            size_str = f"{total_bytes / 1024:.0f} KB"
+        else:
+            size_str = "N/D"
+
+        # ── Date range from cached item dates (no disk reads) ──────────────
+        dates = sorted(d for _, d in pairs if d)
+        if dates:
+            lo = dates[0][:10].replace(":", "/")
+            hi = dates[-1][:10].replace(":", "/")
+            date_str = lo if lo == hi else f"{lo}  →  {hi}"
+        else:
+            date_str = "Sin fecha EXIF"
+
+        self._add_row(self._form_exif, "Rango de fechas", date_str)
+        self._add_row(self._form_exif, "Tamaño total", size_str)
+
+        # ── File list (capped to keep the panel from growing huge) ─────────
+        MAX_SHOWN = 40
+        for path, _ in pairs[:MAX_SHOWN]:
+            name_lbl = QLabel(path.name)
+            name_lbl.setWordWrap(True)
+            name_lbl.setStyleSheet("font-size: 9pt;")
+            self._form_file.addRow(name_lbl)
+        if n > MAX_SHOWN:
+            self._add_row(self._form_file, "", f"… y {n - MAX_SHOWN} más")
+
     # ── Internal ───────────────────────────────────────────────────────────
 
     def _load_metadata(self, path: Path) -> None:
         meta = get_all_metadata(path)
+
+        # Reset group titles (may have been changed by show_selection)
+        self._grp_exif.setTitle("EXIF")
+        self._grp_file.setTitle("Archivo")
 
         # Clear forms
         self._clear_form(self._form_exif)
