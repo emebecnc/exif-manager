@@ -362,9 +362,10 @@ class DateEditorDialog(QDialog):
             self.setWindowTitle("Editar fecha — " + target.name)
 
         self.setMinimumWidth(700)
+        self.setMinimumHeight(600)
         self._build_ui()
         screen = QApplication.primaryScreen().availableGeometry()
-        self.setMaximumHeight(int(screen.height() * 0.85))
+        self.setMaximumHeight(int(screen.height() * 0.90))
         self._prefill_date()
         if prefill_from_filename:
             self._try_apply_filename_date(show_warning=False)
@@ -665,8 +666,8 @@ class DateEditorDialog(QDialog):
         hh.setSectionResizeMode(_COL_RENAME,  QHeaderView.ResizeMode.ResizeToContents)
         self._table.setColumnHidden(_COL_NEW,    True)   # hidden in Conservar mode (default)
         self._table.setColumnHidden(_COL_RENAME, True)
-        self._table.setMinimumHeight(150)
-        self._table.setMaximumHeight(200)
+        self._table.setMinimumHeight(250)
+        self._table.setMaximumHeight(400)
         self._table.setVisible(False)
         layout.addWidget(self._table)
 
@@ -783,7 +784,20 @@ class DateEditorDialog(QDialog):
         """Enable/disable groups and columns to match current Conservar/Cambiar mode."""
         keep = self._radio_mode_keep.isChecked()
         self._date_grp.setEnabled(not keep)
-        if not keep:
+        if keep:
+            # Conservar mode: uncheck all date-component checkboxes so the user
+            # sees clearly that no date fields will be modified.
+            self._chk_year.setChecked(False)
+            self._chk_month.setChecked(False)
+            self._chk_day.setChecked(False)
+        else:
+            # Cambiar mode: ensure at least year is checked so there's a visible
+            # target date to edit.  Only auto-check if all three are off (i.e. the
+            # user just switched from Conservar) to avoid clobbering deliberate unchecks.
+            if not (self._chk_year.isChecked() or self._chk_month.isChecked() or self._chk_day.isChecked()):
+                self._chk_year.setChecked(True)
+                self._chk_month.setChecked(True)
+                self._chk_day.setChecked(True)
             # Re-apply per-checkbox enabled state (setEnabled(True) on the group
             # re-enables ALL children indiscriminately).
             self._sync_date_spinbox_state()

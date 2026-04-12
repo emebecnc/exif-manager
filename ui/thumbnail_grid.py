@@ -309,10 +309,10 @@ class ThumbnailGrid(QWidget):
         self._btn_sort_dir.clicked.connect(self._on_sort_dir_toggled)
         apply_button_style(self._btn_sort_dir)
 
-        # "Solo sin fecha" filter checkbox — default ON so the user immediately
-        # sees only the photos that need attention.
+        # "Solo sin fecha" filter checkbox — default OFF so all photos are visible.
+        # User can enable to focus on photos that need date correction.
         self._chk_sin_fecha = QCheckBox("Solo sin fecha")
-        self._chk_sin_fecha.setChecked(True)
+        self._chk_sin_fecha.setChecked(False)
         self._chk_sin_fecha.setToolTip(
             "Cuando está marcado, muestra solo las fotos sin fecha EXIF válida\n"
             "(fecha ausente o con valor incorrecto como 01/01/2000).\n"
@@ -512,11 +512,16 @@ class ThumbnailGrid(QWidget):
 
         pairs.sort(key=lambda x: x[0], reverse=not self._sort_ascending)
 
-        # Rebuild list without deleting items (takeItem keeps the item alive)
-        while self._list.count():
-            self._list.takeItem(0)
+        # Rebuild list: remove from the END (O(1) each) to avoid O(n²) shifting,
+        # then re-add in sorted order under setUpdatesEnabled(False) for one repaint.
+        self._list.setUpdatesEnabled(False)
+        count = self._list.count()
+        for i in range(count - 1, -1, -1):
+            self._list.takeItem(i)
         for _, item in pairs:
             self._list.addItem(item)
+        self._list.setUpdatesEnabled(True)
+        self._list.update()
 
         if current_item is not None:
             self._list.setCurrentItem(current_item)

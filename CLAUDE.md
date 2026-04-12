@@ -1,6 +1,6 @@
 # EXIF Manager — CLAUDE.md
 
-**Last updated:** 2026-04-13 (session 3)
+**Last updated:** 2026-04-13 (session 4)
 **Repo:** github.com/emebecnc/exif-manager
 **Local:** D:\homelab\exif_manager\
 
@@ -148,3 +148,53 @@ Config: main.py, build.spec, requirements.txt, run_exif_manager.bat
   - Connected `_center_tabs.currentChanged` to new `_on_center_tab_changed()` slot
   - Photos tab → `duplicate_panel.set_media_type("photo")`
   - Videos tab → `duplicate_panel.set_media_type("video")` + `photo_detail.clear()` (fixes stuck image)
+
+## Session changes: Full audit — 9 critical fixes (session 4)
+
+### Batch 1 — thumbnail_grid.py, date_editor.py, video_date_editor.py
+
+- `ui/thumbnail_grid.py`:
+  - **Issue 8 (photos disappear)**: `_chk_sin_fecha` default changed CHECKED → UNCHECKED.
+    Root cause: filter was hiding valid-date photos immediately as they loaded.
+  - **Issue 2 (freeze on large folders)**: Fixed O(n²) `_apply_sort()` by removing items from
+    the END of the list (O(1) each) instead of from index 0 (O(n) each).
+    Added `setUpdatesEnabled(False/True)` + `update()` around the rebuild loop.
+
+- `ui/date_editor.py`:
+  - **Issue 3**: Added `setMinimumHeight(600)`; raised `setMaximumHeight` to 0.90 × screen;
+    table `setMinimumHeight` 150 → 250, `setMaximumHeight` 200 → 400.
+  - **Issue 4**: Already correct — `_on_rename_toggled` shows/hides `_COL_RENAME` when
+    rename checkbox is toggled. No change needed.
+  - **Issue 5**: `_apply_exif_mode_state()` now unchecks all date checkboxes when switching
+    to Conservar mode; auto-checks all three when switching to Cambiar if all were off.
+  - **Issue 6**: Already correct — `_PreviewWorker` emits all 5 data fields.
+
+- `ui/video_date_editor.py`:
+  - **Issue 3**: Added `setMinimumWidth(700)`, `setMinimumHeight(600)`, raised
+    `setMaximumHeight` to 0.90 × screen; table `setMinimumHeight` added at 250, `setMaximumHeight` 200 → 400.
+
+### Batch 2 — duplicate_panel.py, video_duplicate_finder.py
+
+- `core/video_duplicate_finder.py`:
+  - **Issue 7**: Already correct — `compute_md5` reads entire file in 64 KB chunks
+    via `iter(lambda: f.read(chunk_size), b"")`. No change needed.
+
+- `ui/duplicate_panel.py`:
+  - **Issue 9**: Full implementation of [📷 Fotos] / [🎬 Videos] toggle + separate result sets:
+    - Added `from core.video_duplicate_finder import VideoDuplicateScanWorker`
+    - Added `_photo_groups`, `_photo_selections`, `_video_groups`, `_video_selections` caches
+    - `_build_ui()`: added toggle button row at top of left panel
+    - `set_media_type()`: saves current results → switches type → restores cached results
+    - `_update_toggle_style()`: new helper — applies ON/OFF stylesheet to toggle buttons
+    - `_restore_groups_display()`: new helper — repopulates groups list from cache
+    - `_begin_scan()`: uses `VideoDuplicateScanWorker` when `_media_type == "video"`,
+      `DuplicateScanWorker` when `"photo"`
+    - `_on_scan_finished()`: caches completed results into the appropriate photo/video store
+    - `_PhotoCard` handles video files gracefully (PIL failures → "Sin vista previa" / "N/D")
+
+### Issues verified already-correct (no code change needed)
+- **Issue 1** (green marker): `folder_tree._apply_backup_indicator()` delegates to
+  `has_backup()` which already checks both `.exif_backup.json` and `.video_backup.json`
+- **Issue 4** (`_COL_RENAME` show/hide): `_on_rename_toggled` already correct
+- **Issue 6** (preview worker data): `_PreviewWorker` already emits all 5 fields
+- **Issue 7** (MD5 full file): `compute_md5` already reads entire file in chunks

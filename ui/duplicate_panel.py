@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import (
 from core.duplicate_finder import DuplicateScanWorker
 from core.exif_handler import read_exif
 from core.file_scanner import unique_dest
+from core.video_duplicate_finder import VideoDuplicateScanWorker
 from ui.log_viewer import LogManager
 from ui.styles import apply_button_style, apply_primary_button_style, mb_warning, mb_info, mb_question
 
@@ -367,9 +368,9 @@ class DuplicatePanel(QWidget):
         # "photo" or "video" — controls button labels; default to photo
         self._media_type: str = "photo"
 
-        # Scan worker / thread
-        self._scan_worker: Optional[DuplicateScanWorker] = None
-        self._scan_thread: Optional[QThread]             = None
+        # Scan worker / thread (type is DuplicateScanWorker or VideoDuplicateScanWorker)
+        self._scan_worker = None
+        self._scan_thread: Optional[QThread] = None
         self._scanning:    bool = False
 
         # Dedup worker / thread
@@ -380,7 +381,12 @@ class DuplicatePanel(QWidget):
         self._dedup_items:        List[Tuple[str, int]]        = []
         self._deduplicating:      bool = False
 
-        # Results
+        # Results — separate caches so switching tabs preserves each type's scan
+        self._photo_groups:      List[List[Path]]            = []
+        self._photo_selections:  Dict[int, Dict[Path, str]]  = {}
+        self._video_groups:      List[List[Path]]            = []
+        self._video_selections:  Dict[int, Dict[Path, str]]  = {}
+        # Active display (always points to the current type's cache)
         self._groups:            List[List[Path]]            = []
         self._selections:        Dict[int, Dict[Path, str]]  = {}
         self._current_group_idx: int                         = -1
@@ -410,11 +416,20 @@ class DuplicatePanel(QWidget):
     def set_media_type(self, media_type: str) -> None:
         """Switch between 'photo' and 'video' duplicate search mode.
 
-        Updates button labels to reflect the active media type and clears
-        stale results from the previous media type so the user isn't confused.
+        Saves the current type's results, restores the new type's cached
+        results (if any), and updates button labels and toggle buttons.
         """
         if media_type == self._media_type:
             return
+
+        # Save current active results to the current type's cache
+        if self._media_type == "photo":
+            self._photo_groups     = list(self._groups)
+            self._photo_selections = {k: dict(v) for k, v in self._selections.items()}
+        else:
+            self._video_groups     = list(self._groups)
+            self._video_selections = {k: dict(v) for k, v in self._selections.items()}
+
         self._media_type = media_type
 
         # Update scan button labels
@@ -422,16 +437,63 @@ class DuplicatePanel(QWidget):
         self._btn_scan_folder.setText(f"🔍 Buscar duplicados de {kind}")
         self._btn_scan_root.setText(f"🔍 Buscar duplicados de {kind} (raíz)")
 
-        # Clear results that belonged to the previous media type
-        if self._groups:
-            self._groups.clear()
-            self._selections.clear()
-            self._groups_list.clear()
-            self._current_group_idx = -1
-            self._current_cards.clear()
-            self._right_stack.setCurrentIndex(0)
-            self._btn_dedup_all.setEnabled(False)
+        # Update toggle button visual state
+        self._update_toggle_style()
+
+        # Restore the new type's cached results (or clear if none)
+        if media_type == "photo":
+            self._restore_groups_display(self._photo_groups, self._photo_selections)
+        else:
+            self._restore_groups_display(self._video_groups, self._video_selections)
+
+    def _update_toggle_style(self) -> None:
+        """Apply checked/unchecked stylesheet to the media-type toggle buttons."""
+        _ON  = ("QPushButton { background-color: #2a4a6a; border: 1px solid #4a7ab0;"
+                " border-radius: 3px; color: white; padding: 4px 8px; }"
+                "QPushButton:hover { background-color: #3a5a7a; }")
+        _OFF = ("QPushButton { background-color: #2a2a2a; border: 1px solid #444444;"
+                " border-radius: 3px; color: #888888; padding: 4px 8px; }"
+                "QPushButton:hover { background-color: #3a3a3a; }")
+        is_photo = (self._media_type == "photo")
+        self._btn_toggle_photo.setStyleSheet(_ON if is_photo else _OFF)
+        self._btn_toggle_video.setStyleSheet(_OFF if is_photo else _ON)
+        self._btn_toggle_photo.setChecked(is_photo)
+        self._btn_toggle_video.setChecked(not is_photo)
+
+    def _restore_groups_display(
+        self,
+        groups: List[List[Path]],
+        selections: Dict[int, Dict[Path, str]],
+    ) -> None:
+        """Repopulate the groups list and right panel from cached result data."""
+        self._groups     = list(groups)
+        self._selections = {k: dict(v) for k, v in selections.items()}
+        self._current_group_idx = -1
+        self._current_cards.clear()
+        self._groups_list.clear()
+        self._right_stack.setCurrentIndex(0)
+
+        if not self._groups:
             self._lbl_header.setText("No hay duplicados escaneados aún.")
+            self._btn_dedup_all.setEnabled(False)
+            return
+
+        for i, group in enumerate(self._groups):
+            best       = _best_in_group(group)
+            group_size = sum(_safe_size(p) for p in group)
+            item = QListWidgetItem(
+                f"Grupo {i + 1} — {len(group)} archivos · {_fmt_bytes(group_size)}\n"
+                f"{best.name}"
+            )
+            item.setSizeHint(QSize(250, _LIST_THUMB_SIZE + 14))
+            pix = _load_pixmap(best, _LIST_THUMB_SIZE)
+            if pix is not None:
+                item.setIcon(QIcon(pix))
+            self._groups_list.addItem(item)
+
+        self._groups_list.setCurrentRow(0)
+        self._btn_dedup_all.setEnabled(True)
+        self._update_header_label()
 
     def start_scan(self, path: Path) -> None:
         """Begin a duplicate scan of ``path``. Emits ``scan_started`` first."""
@@ -455,6 +517,23 @@ class DuplicatePanel(QWidget):
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(6, 6, 6, 6)
         left_layout.setSpacing(4)
+
+        # ── Media type toggle ─────────────────────────────────────────────
+        toggle_row = QHBoxLayout()
+        toggle_row.setSpacing(2)
+        self._btn_toggle_photo = QPushButton("📷 Fotos")
+        self._btn_toggle_photo.setCheckable(True)
+        self._btn_toggle_photo.setChecked(True)
+        self._btn_toggle_video = QPushButton("🎬 Videos")
+        self._btn_toggle_video.setCheckable(True)
+        self._btn_toggle_photo.setToolTip("Buscar duplicados de fotos")
+        self._btn_toggle_video.setToolTip("Buscar duplicados de videos")
+        self._btn_toggle_photo.clicked.connect(lambda: self.set_media_type("photo"))
+        self._btn_toggle_video.clicked.connect(lambda: self.set_media_type("video"))
+        self._update_toggle_style()
+        toggle_row.addWidget(self._btn_toggle_photo)
+        toggle_row.addWidget(self._btn_toggle_video)
+        left_layout.addLayout(toggle_row)
 
         self._lbl_header = QLabel("No hay duplicados escaneados aún.")
         self._lbl_header.setStyleSheet("font-size: 10px; color: #aaaaaa;")
@@ -569,7 +648,11 @@ class DuplicatePanel(QWidget):
         self._btn_scan_folder.setEnabled(False)
         self._btn_scan_root.setEnabled(False)
 
-        self._scan_worker = DuplicateScanWorker(path)
+        # Use the appropriate worker based on the active media type
+        if self._media_type == "video":
+            self._scan_worker = VideoDuplicateScanWorker(path)
+        else:
+            self._scan_worker = DuplicateScanWorker(path)
         self._scan_thread = QThread(self)
         self._scan_worker.moveToThread(self._scan_thread)
 
@@ -608,6 +691,13 @@ class DuplicatePanel(QWidget):
 
         if not self._groups:
             self._lbl_header.setText("✓ No se encontraron duplicados.")
+            # Persist empty result to cache for this media type
+            if self._media_type == "photo":
+                self._photo_groups = []
+                self._photo_selections = {}
+            else:
+                self._video_groups = []
+                self._video_selections = {}
             return
 
         # Initialise per-group selections: best → keep, rest → delete
@@ -637,6 +727,14 @@ class DuplicatePanel(QWidget):
             self._groups_list.addItem(item)
 
         self._groups_list.setCurrentRow(0)
+
+        # Cache scan results so switching tabs doesn't lose them
+        if self._media_type == "photo":
+            self._photo_groups     = list(self._groups)
+            self._photo_selections = {k: dict(v) for k, v in self._selections.items()}
+        else:
+            self._video_groups     = list(self._groups)
+            self._video_selections = {k: dict(v) for k, v in self._selections.items()}
 
     def _on_scan_error(self, msg: str) -> None:
         self._scanning = False

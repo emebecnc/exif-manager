@@ -216,8 +216,10 @@ class VideoDateEditorDialog(QDialog):
         else:
             self._paths = list(paths or [])
 
+        self.setMinimumWidth(700)
+        self.setMinimumHeight(600)
         screen = QApplication.primaryScreen().availableGeometry()
-        self.setMaximumHeight(int(screen.height() * 0.85))
+        self.setMaximumHeight(int(screen.height() * 0.90))
 
         self._build_ui(prefill_from_filename)
         self._populate_table()
@@ -350,7 +352,8 @@ class VideoDateEditorDialog(QDialog):
         self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._table.setAlternatingRowColors(True)
-        self._table.setMaximumHeight(200)
+        self._table.setMinimumHeight(250)
+        self._table.setMaximumHeight(400)
         hh = self._table.horizontalHeader()
         hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         for col in (1, 2, 3):
