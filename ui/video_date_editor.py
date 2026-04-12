@@ -21,6 +21,7 @@ from core.video_handler import (
     backup_video_metadata, format_duration, is_invalid_date,
 )
 from core.exif_handler import parse_date_from_filename
+from core.backup_manager import append_historial
 from ui.log_viewer import LogManager
 from ui.styles import apply_button_style, apply_primary_button_style, mb_warning, mb_info
 
@@ -141,18 +142,29 @@ class _ApplyWorker(QObject):
                     )
 
                 # Optional rename
+                applied_new_name: Optional[str] = None
                 if self._rename and self._rename_fmt != _RENAME_KEEP_NAME:
                     stem = path.stem if self._rename_fmt == _RENAME_DATE_PLUS else None
-                    new_name = make_dated_filename(
+                    applied_new_name = make_dated_filename(
                         new_dt, path.parent, path.suffix, used, original_stem=stem
                     )
-                    used.add(new_name)
-                    new_path = path.parent / new_name
+                    used.add(applied_new_name)
+                    new_path = path.parent / applied_new_name
                     path.rename(new_path)
                     self._log.log(
-                        str(path.parent), path.name, "rename", path.name, new_name
+                        str(path.parent), path.name, "rename", path.name, applied_new_name
                     )
                     self.applied_renames[path] = new_path
+
+                # Historial entry — mirrors date_editor.py pattern
+                try:
+                    video_fields = {"DateTimeOriginal": old_str}
+                    append_historial(
+                        path.parent, path.name, applied_new_name,
+                        video_fields, "fecha_editada",
+                    )
+                except Exception:
+                    pass
 
                 ok += 1
             except Exception as e:

@@ -66,6 +66,12 @@ _TYPES: List[Tuple] = [
         "Backups de EXIF (recomendado conservar)",
         False, False, None, None,
     ),
+    (
+        ".video_backup.json",
+        ".video_backup.json",
+        "Backups de metadata de video (recomendado conservar)",
+        False, False, None, None,
+    ),
 ]
 
 # Derived quick-lookup tables
@@ -668,7 +674,8 @@ class CleanupDialog(QDialog):
         self._delete_thread.started.connect(self._delete_worker.run)
         self._delete_worker.progress.connect(self._on_delete_progress)
         self._delete_worker.finished.connect(self._on_delete_finished)
-        self._delete_worker.finished.connect(self._delete_thread.quit)
+        # Do NOT also connect finished→thread.quit here: _on_delete_finished calls
+        # quit()+wait() directly to avoid the double-quit race (CLAUDE.md pattern).
         self._delete_thread.finished.connect(self._cleanup_delete_thread)
 
         self._delete_thread.start()
