@@ -50,6 +50,15 @@ class MainWindow(QMainWindow):
         self._restore_settings()
         self.showMaximized()
 
+        # Show ffmpeg availability in the status bar at startup
+        if self._ffmpeg_available:
+            self._status_bar.showMessage("✓ ffmpeg detectado — todas las funciones de video disponibles", 6000)
+        else:
+            self._status_bar.showMessage(
+                "⚠ ffmpeg no encontrado — miniaturas y edición de video deshabilitadas"
+                "  |  Instalá ffmpeg desde https://ffmpeg.org"
+            )
+
     # ── UI construction ────────────────────────────────────────────────────
 
     def _build_ui(self) -> None:

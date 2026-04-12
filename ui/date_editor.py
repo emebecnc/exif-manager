@@ -123,8 +123,8 @@ class _PreviewWorker(QObject):
             new_dt = self._resolve_dt(path)
             if new_dt is None:
                 new_str     = "Sin fecha EXIF" if self._keep_mode else "Fecha inválida"
-                rename_text = ""
-                rename_gray = False
+                rename_text = "— (conservar nombre)"
+                rename_gray = True
             else:
                 new_str = new_dt.strftime("%Y:%m:%d %H:%M:%S")
                 if self._rename:
@@ -145,8 +145,9 @@ class _PreviewWorker(QObject):
                         used.add(rename_text)
                         rename_gray = False
                 else:
-                    rename_text = ""
-                    rename_gray = False
+                    # No rename — show placeholder so the column is never blank
+                    rename_text = "— (conservar nombre)"
+                    rename_gray = True
             rows.append((path.name, current, new_str, rename_text, rename_gray))
         self.result.emit(rows)
 
@@ -471,16 +472,17 @@ class DateEditorDialog(QDialog):
 
         layout.addWidget(self._date_grp)
 
-        # ── Time mode ──────────────────────────────────────────────────────
+        # ── Time mode — compact single-row layout ─────────────────────────
         self._time_grp = QGroupBox("Hora")
-        time_outer = QVBoxLayout(self._time_grp)
+        time_row = QHBoxLayout(self._time_grp)
+        time_row.setSpacing(6)
 
-        self._radio_preserve = QRadioButton("Conservar hora original de cada foto")
+        self._radio_preserve = QRadioButton("Conservar original")
         self._radio_preserve.setToolTip(
             "Mantiene la hora, minutos y segundos originales de cada foto.\n"
             "Solo cambia el día, mes y año."
         )
-        self._radio_custom = QRadioButton("Usar hora personalizada")
+        self._radio_custom = QRadioButton("Personalizada:")
         self._radio_custom.setToolTip(
             "Aplica la misma hora a todas las fotos del lote.\n"
             "Útil cuando las fotos no tienen hora EXIF o querés unificarla."
@@ -492,40 +494,34 @@ class DateEditorDialog(QDialog):
         self._time_btn_group.addButton(self._radio_custom,   _OPT_CUSTOM)
         self._time_btn_group.idToggled.connect(self._on_time_option_changed)
 
-        time_outer.addWidget(self._radio_preserve)
-        time_outer.addWidget(self._radio_custom)
-
-        # Custom time spinboxes (shown only when _OPT_CUSTOM is selected)
-        self._custom_time_widget = QGroupBox()
-        self._custom_time_widget.setFlat(True)
-        self._custom_time_widget.setStyleSheet("QGroupBox { border: none; margin: 0; padding: 0; }")
-        custom_row = QHBoxLayout(self._custom_time_widget)
-        custom_row.setContentsMargins(20, 0, 0, 0)
-
-        custom_row.addWidget(QLabel("Hora:"))
         self._spin_hour = QSpinBox()
         self._spin_hour.setRange(0, 23)
-        self._spin_hour.setFixedWidth(55)
+        self._spin_hour.setFixedWidth(50)
         self._spin_hour.setToolTip("Hora del día en formato 24 h (0–23).")
-        custom_row.addWidget(self._spin_hour)
+        self._spin_hour.setEnabled(False)   # enabled only when Personalizada is selected
 
-        custom_row.addWidget(QLabel("Minuto:"))
         self._spin_minute = QSpinBox()
         self._spin_minute.setRange(0, 59)
-        self._spin_minute.setFixedWidth(55)
+        self._spin_minute.setFixedWidth(50)
         self._spin_minute.setToolTip("Minutos (0–59).")
-        custom_row.addWidget(self._spin_minute)
+        self._spin_minute.setEnabled(False)
 
-        custom_row.addWidget(QLabel("Segundo:"))
         self._spin_second = QSpinBox()
         self._spin_second.setRange(0, 59)
-        self._spin_second.setFixedWidth(55)
+        self._spin_second.setFixedWidth(50)
         self._spin_second.setToolTip("Segundos (0–59).")
-        custom_row.addWidget(self._spin_second)
-        custom_row.addStretch()
+        self._spin_second.setEnabled(False)
 
-        self._custom_time_widget.setVisible(False)
-        time_outer.addWidget(self._custom_time_widget)
+        time_row.addWidget(self._radio_preserve)
+        time_row.addWidget(self._radio_custom)
+        time_row.addWidget(self._spin_hour)
+        time_row.addWidget(QLabel("h"))
+        time_row.addWidget(self._spin_minute)
+        time_row.addWidget(QLabel("m"))
+        time_row.addWidget(self._spin_second)
+        time_row.addWidget(QLabel("s"))
+        time_row.addStretch()
+
         layout.addWidget(self._time_grp)
 
         # ── Rename checkbox ────────────────────────────────────────────────
@@ -665,7 +661,7 @@ class DateEditorDialog(QDialog):
         hh.setSectionResizeMode(_COL_NEW,     QHeaderView.ResizeMode.ResizeToContents)
         hh.setSectionResizeMode(_COL_RENAME,  QHeaderView.ResizeMode.ResizeToContents)
         self._table.setColumnHidden(_COL_NEW,    True)   # hidden in Conservar mode (default)
-        self._table.setColumnHidden(_COL_RENAME, True)
+        # _COL_RENAME is always visible — shows calculated name or "conservar nombre"
         self._table.setMinimumHeight(250)
         self._table.setMaximumHeight(400)
         self._table.setVisible(False)
@@ -755,8 +751,7 @@ class DateEditorDialog(QDialog):
 
         # Fill time if the pattern included one; otherwise leave at 00:00:00
         if dt.hour or dt.minute or dt.second:
-            self._radio_custom.setChecked(True)
-            self._custom_time_widget.setVisible(True)
+            self._radio_custom.setChecked(True)   # triggers _on_time_option_changed → enables spinboxes
             self._spin_hour.setValue(dt.hour)
             self._spin_minute.setValue(dt.minute)
             self._spin_second.setValue(dt.second)
@@ -802,6 +797,12 @@ class DateEditorDialog(QDialog):
             # re-enables ALL children indiscriminately).
             self._sync_date_spinbox_state()
         self._time_grp.setEnabled(not keep)
+        if not keep:
+            # Re-apply time spinbox enabled state after the group is re-enabled.
+            is_custom = self._radio_custom.isChecked()
+            self._spin_hour.setEnabled(is_custom)
+            self._spin_minute.setEnabled(is_custom)
+            self._spin_second.setEnabled(is_custom)
         self._fields_grp.setEnabled(not keep)
         # _COL_NEW is only meaningful in Cambiar mode
         self._table.setColumnHidden(_COL_NEW, keep)
@@ -822,12 +823,14 @@ class DateEditorDialog(QDialog):
 
     def _on_time_option_changed(self, btn_id: int, checked: bool) -> None:
         if btn_id == _OPT_CUSTOM:
-            self._custom_time_widget.setVisible(checked)
-            self.adjustSize()
+            custom = checked
+            self._spin_hour.setEnabled(custom)
+            self._spin_minute.setEnabled(custom)
+            self._spin_second.setEnabled(custom)
 
     def _on_rename_toggled(self, checked: bool) -> None:
         self._rename_format_widget.setVisible(checked)
-        self._table.setColumnHidden(_COL_RENAME, not checked)
+        # _COL_RENAME stays visible; content changes on next preview run.
         self._update_apply_state()
         # Re-run preview if it was already visible
         if self._table.isVisible():
@@ -930,8 +933,8 @@ class DateEditorDialog(QDialog):
                 new_dt  = self._resolve_new_dt(path)
                 if new_dt is None:
                     new_str     = "Sin fecha EXIF" if keep_mode else "Fecha inválida"
-                    rename_text = ""
-                    rename_gray = False
+                    rename_text = "— (conservar nombre)"
+                    rename_gray = True
                 else:
                     new_str = new_dt.strftime("%Y:%m:%d %H:%M:%S")
                     if show_rename:
@@ -952,8 +955,8 @@ class DateEditorDialog(QDialog):
                             used.add(rename_text)
                             rename_gray = False
                     else:
-                        rename_text = ""
-                        rename_gray = False
+                        rename_text = "— (conservar nombre)"
+                        rename_gray = True
                 rows.append((path.name, current, new_str, rename_text, rename_gray))
             self._populate_preview_table(rows)
         else:

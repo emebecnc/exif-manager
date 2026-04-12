@@ -1,6 +1,6 @@
 # EXIF Manager — CLAUDE.md
 
-**Last updated:** 2026-04-13 (session 4)
+**Last updated:** 2026-04-12 (session 6)
 **Repo:** github.com/emebecnc/exif-manager
 **Local:** D:\homelab\exif_manager\
 
@@ -198,3 +198,78 @@ Config: main.py, build.spec, requirements.txt, run_exif_manager.bat
 - **Issue 4** (`_COL_RENAME` show/hide): `_on_rename_toggled` already correct
 - **Issue 6** (preview worker data): `_PreviewWorker` already emits all 5 fields
 - **Issue 7** (MD5 full file): `compute_md5` already reads entire file in chunks
+
+## Session changes: Issues 16–18 — ffmpeg detection, duplicate UX (session 6)
+
+### Files modified
+
+- **`core/video_handler.py`** — Issue 16 (ffmpeg graceful fallback):
+  - Added `FFMPEG_AVAILABLE: bool | None = None` module-level flag
+  - Added `set_ffmpeg_available(ok: bool)` setter — called once by `main.py`
+  - `get_video_thumbnail()`: returns `None` immediately when `FFMPEG_AVAILABLE is False`
+    (skips subprocess call entirely — avoids `FileNotFoundError` noise in logs)
+  - `_read_ffprobe()`: returns `False` immediately when `FFMPEG_AVAILABLE is False`,
+    sets `result["error"]` to a human-readable explanation + install URL
+
+- **`main.py`** — Issue 16 (ffmpeg check):
+  - After `_check_ffmpeg()`, calls `set_ffmpeg_available(ffmpeg_ok)` so the module
+    flag is set before any UI code can trigger video operations
+  - Warning dialog shown only when ffmpeg is missing (unchanged)
+
+- **`ui/main_window.py`** — Issue 16 (status bar feedback):
+  - After `showMaximized()`, shows ffmpeg status in status bar:
+    - Found: `"✓ ffmpeg detectado — todas las funciones de video disponibles"` (6 s timeout)
+    - Missing: `"⚠ ffmpeg no encontrado — miniaturas y edición de video deshabilitadas | Instalá ffmpeg desde https://ffmpeg.org"` (permanent until next action)
+
+- **`ui/duplicate_panel.py`** — Issues 17, 18:
+  - Added `QTimer` to PyQt6 imports
+  - **Issue 17 (Conservar toast + auto-advance)**:
+    - `_on_card_keep()` now shows an immediate toast in `_lbl_header`:
+      `"✓ Marcado para CONSERVAR  —  Grupo N / M  →  avanzando al siguiente…"`
+    - After 600 ms, calls `_groups_list.setCurrentRow(next_idx)` to advance
+    - After 800 ms, restores the summary header via `_update_header_label()`
+    - On last group: shows `"(último grupo)"` suffix and restores header after 2.5 s
+  - **Issue 18 (Detailed dedup confirmation dialog)**:
+    - `_on_dedup_all()` imports `VIDEO_EXTENSIONS` to classify each file
+    - Counts `del_photos`, `del_videos`, `keep_photos`, `keep_videos` and their sizes
+    - Confirmation dialog now reads:
+      ```
+      Se moverán N archivos a _duplicados_eliminados (X MB):
+
+      Se eliminará:
+        • X fotos  (Y MB)
+        • Z videos  (W MB)
+
+      Se conservará:
+        • A fotos
+        • B videos
+
+      ¿Continuar?
+      ```
+    - Sections are omitted when count is zero (pure-photo or pure-video session)
+    - Fixed `n_del` → `total_del` variable rename in progress dialog setup
+  - **Issue 18 (result message)**:
+    - `_on_dedup_finished()` header reads:
+      `"✓ N archivos movidos a _duplicados_eliminados/\nX MB liberados"`
+
+## Session changes: Issues 10–15 (session 5)
+
+### Files modified
+
+- **`ui/duplicate_panel.py`** — Issues 10, 11, 12:
+  - Added `from core.video_handler import get_video_metadata, get_video_thumbnail`
+  - Added `_best_video_in_group()` module-level function (uses `video_quality_score`)
+  - Added `_get_best(group)` instance method — dispatches to photo or video scorer
+  - **Issue 10 (Conservar logic)**: `_PhotoCard._on_keep()` now ONLY emits signal; state is set exclusively by `DuplicatePanel._on_card_keep()` via `set_action()`. Fixed `_on_card_keep` to use `str()` comparison for all path equality checks (avoids Path object identity issues). Same fix in `_on_card_delete_now`.
+  - **Issue 11 (Video metadata/thumbnails)**: Added `_VideoCard` class — calls `get_video_metadata()` for resolution, duration, FPS, codec, bitrate, date; calls `get_video_thumbnail()` for first-frame preview via ffmpeg; same Conservar/Eliminar buttons as `_PhotoCard`.
+  - **Issue 12 (Best always on left)**: `_show_group()` now sorts `sorted_group = [best] + [others...]` so the highest-quality card is always leftmost. Uses `_VideoCard` for video mode, `_PhotoCard` for photo mode.
+  - All callers of `_best_in_group(group)` in instance methods updated to `self._get_best(group)`: `_on_scan_finished`, `_restore_groups_display`, `_remove_group`, `_refresh_list_item`.
+  - Initial selection uses `str(p) == str(best)` for robustness.
+
+- **`ui/video_date_editor.py`** — Issues 13, 14:
+  - **Issue 13 (Año checkbox)**: `_update_state()` now: in Conservar mode → disables `_grp_date` group AND unchecks all date checkboxes; in Cambiar mode → auto-checks all three if all were off. Added `self._grp_date` instance variable (was local `grp_date`).
+  - **Issue 14 (Hora layout)**: Replaced 3-row `QVBoxLayout` + `time_row` with a single compact `QHBoxLayout`: `[◯ Conservar original] [◯ Personalizada:] [HH] h [MM] m [SS] s`. Saves ~2 rows of vertical space.
+
+- **`ui/date_editor.py`** — Issues 14, 15:
+  - **Issue 14 (Hora layout)**: Replaced `_time_grp` VBox + `_custom_time_widget` show/hide pattern with a single compact HBox row. Spinboxes start disabled; `_on_time_option_changed` enables/disables them (no widget show/hide). `_apply_exif_mode_state` re-syncs spinbox enabled state when switching Conservar/Cambiar. Removed `_custom_time_widget` reference from `_try_apply_filename_date`.
+  - **Issue 15 (Nombre nuevo column)**: `_COL_RENAME` is now always visible (removed `setColumnHidden(_COL_RENAME, True)` from init and `setColumnHidden` from `_on_rename_toggled`). When rename is OFF, preview shows `"— (conservar nombre)"` in grey. Fixed in both `_PreviewWorker.run()` and the sync path in `_on_preview()`.

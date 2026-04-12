@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from PIL import Image, ImageOps
-from PyQt6.QtCore import Qt, QObject, QSize, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QObject, QSize, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QIcon, QPixmap
 from PyQt6.QtWidgets import (
     QApplication, QFrame, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
@@ -17,6 +17,7 @@ from core.duplicate_finder import DuplicateScanWorker
 from core.exif_handler import read_exif
 from core.file_scanner import unique_dest
 from core.video_duplicate_finder import VideoDuplicateScanWorker
+from core.video_handler import get_video_metadata, get_video_thumbnail
 from ui.log_viewer import LogManager
 from ui.styles import apply_button_style, apply_primary_button_style, mb_warning, mb_info, mb_question
 
@@ -125,11 +126,22 @@ def _quality_score(path: Path) -> float:
 
 
 def _best_in_group(group: List[Path]) -> Path:
-    """Return highest-quality path. Tiebreak: earlier ctime wins."""
+    """Return highest-quality photo path. Tiebreak: earlier ctime wins."""
     def _key(p: Path):
         try:   ctime = p.stat().st_ctime
         except OSError: ctime = float("inf")
         return (-_quality_score(p), ctime)
+    return min(group, key=_key)
+
+
+def _best_video_in_group(group: List[Path]) -> Path:
+    """Return highest-quality video path using resolution/bitrate/duration.
+    Tiebreak: earlier ctime wins."""
+    from core.video_duplicate_finder import video_quality_score
+    def _key(p: Path):
+        try:   ctime = p.stat().st_ctime
+        except OSError: ctime = float("inf")
+        return (-video_quality_score(p), ctime)
     return min(group, key=_key)
 
 
@@ -333,8 +345,183 @@ class _PhotoCard(QFrame):
         self._apply_badge_style()
 
     def _on_keep(self) -> None:
-        self._action = "keep"
+        # Emit only — DuplicatePanel._on_card_keep() is the single source of truth
+        # for selection state.  It will call set_action() for ALL cards in the group
+        # (including this one) so there is no visual flash or state divergence.
+        self.keep_clicked.emit(self._path)
+
+    def _on_delete(self) -> None:
+        self.delete_now.emit(self._path)
+
+    # ── public ─────────────────────────────────────────────────────────────
+
+    def set_action(self, action: str) -> None:
+        self._action = action
         self._apply_visual()
+
+    def get_action(self) -> str:
+        return self._action
+
+
+# ── _VideoCard ──────────────────────────────────────────────────────────────────
+
+class _VideoCard(QFrame):
+    """Displays one video in the side-by-side duplicate comparison.
+
+    Shows a first-frame thumbnail (via ffmpeg), video metadata
+    (resolution, duration, FPS, codec, date) and the same Conservar /
+    Eliminar buttons as _PhotoCard.
+    """
+
+    keep_clicked = pyqtSignal(object)
+    delete_now   = pyqtSignal(object)
+
+    def __init__(self, path: Path, is_best: bool, action: str, parent=None):
+        super().__init__(parent)
+        self._path   = path
+        self._action = action
+
+        self.setFixedWidth(_CARD_WIDTH)
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(4)
+
+        # Thumbnail — first frame via ffmpeg
+        self._thumb = QLabel()
+        self._thumb.setFixedSize(_THUMB_SIZE, _THUMB_SIZE)
+        self._thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._thumb.setStyleSheet(
+            "background-color: #1a1a1f; color: #888888; font-size: 22px;"
+        )
+        self._thumb.setText("🎬")
+        layout.addWidget(self._thumb)
+        self._load_thumb()
+
+        # Quality badge
+        self._badge = QLabel()
+        self._badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self._badge)
+
+        # Info rows helper (same style as _PhotoCard)
+        def _info_row(key: str, value: str) -> QHBoxLayout:
+            row = QHBoxLayout()
+            row.setSpacing(4)
+            k = QLabel(key)
+            k.setMinimumWidth(60)
+            k.setStyleSheet("color: #888888; font-size: 9px; border: none;")
+            v = QLabel(value)
+            v.setStyleSheet("color: #cccccc; font-size: 9px; border: none;")
+            v.setWordWrap(True)
+            row.addWidget(k)
+            row.addWidget(v, 1)
+            return row
+
+        # Fetch metadata (always succeeds — sets 'error' key on failure)
+        meta = get_video_metadata(path)
+
+        layout.addLayout(_info_row("Nombre:", path.name))
+        layout.addLayout(_info_row("Tamaño:", _fmt_bytes(meta.get("size_bytes", 0) or 0)))
+
+        w = meta.get("width", 0) or 0
+        h = meta.get("height", 0) or 0
+        layout.addLayout(_info_row("Resolución:", f"{w} × {h}" if (w and h) else "N/D"))
+
+        dur = meta.get("duration_seconds", 0) or 0
+        if dur:
+            mins, secs = divmod(int(dur), 60)
+            dur_str = f"{mins}:{secs:02d}"
+        else:
+            dur_str = "N/D"
+        layout.addLayout(_info_row("Duración:", dur_str))
+
+        fps = meta.get("fps", 0) or 0
+        layout.addLayout(_info_row("FPS:", f"{fps:.1f}" if fps else "N/D"))
+
+        codec = meta.get("codec_video", "") or "N/D"
+        layout.addLayout(_info_row("Codec:", codec))
+
+        ct = meta.get("creation_time")
+        if ct:
+            date_str = ct.strftime("%Y-%m-%d %H:%M")
+        else:
+            dm = meta.get("date_modified")
+            date_str = dm.strftime("%Y-%m-%d %H:%M") if dm else "—"
+        layout.addLayout(_info_row("Fecha:", date_str))
+
+        # Selectable full path
+        path_lbl = QLabel(str(path))
+        path_lbl.setStyleSheet("color: #666666; font-size: 8px; border: none;")
+        path_lbl.setWordWrap(True)
+        path_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(path_lbl)
+
+        layout.addStretch()
+
+        # Action buttons
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(4)
+        self._btn_keep   = QPushButton("✓ Conservar")
+        self._btn_delete = QPushButton("🗑 Eliminar")
+        self._btn_keep.setFixedHeight(28)
+        self._btn_delete.setFixedHeight(28)
+        btn_row.addWidget(self._btn_keep)
+        btn_row.addWidget(self._btn_delete)
+        layout.addLayout(btn_row)
+
+        self._btn_keep.clicked.connect(self._on_keep)
+        self._btn_delete.clicked.connect(self._on_delete)
+
+        self._apply_visual()
+
+    # ── private ────────────────────────────────────────────────────────────
+
+    def _load_thumb(self) -> None:
+        """Extract first frame with ffmpeg; show emoji placeholder on failure."""
+        thumb_bytes = get_video_thumbnail(self._path, _THUMB_SIZE)
+        if thumb_bytes:
+            pix = QPixmap()
+            if pix.loadFromData(thumb_bytes) and not pix.isNull():
+                self._thumb.setPixmap(pix)
+                self._thumb.setText("")
+
+    def _apply_badge_style(self) -> None:
+        if self._action == "keep":
+            self._badge.setText("★ CONSERVAR")
+            self._badge.setStyleSheet(
+                "background-color: #1e4d1e; color: #70ff70;"
+                " font-weight: bold; font-size: 10px; padding: 2px 6px;"
+                " border-radius: 3px; border: none;"
+            )
+        else:
+            self._badge.setText("DUPLICADO")
+            self._badge.setStyleSheet(
+                "background-color: #4d2a00; color: #ffa050;"
+                " font-weight: bold; font-size: 10px; padding: 2px 6px;"
+                " border-radius: 3px; border: none;"
+            )
+
+    def _apply_visual(self) -> None:
+        if self._action == "keep":
+            self.setStyleSheet(
+                "QFrame { border: 2px solid #50c850; border-radius: 4px;"
+                " background-color: rgba(80,200,80,20); }"
+                "QLabel { border: none; background-color: transparent; }"
+            )
+            self._btn_keep.setStyleSheet(_BTN_KEEP_ON)
+            self._btn_delete.setStyleSheet(_BTN_DEL_OFF)
+        else:
+            self.setStyleSheet(
+                "QFrame { border: 2px solid #c85050; border-radius: 4px;"
+                " background-color: rgba(200,80,80,20); }"
+                "QLabel { border: none; background-color: transparent; }"
+            )
+            self._btn_keep.setStyleSheet(_BTN_KEEP_OFF)
+            self._btn_delete.setStyleSheet(_BTN_DEL_ON)
+        self._apply_badge_style()
+
+    def _on_keep(self) -> None:
         self.keep_clicked.emit(self._path)
 
     def _on_delete(self) -> None:
@@ -479,7 +666,7 @@ class DuplicatePanel(QWidget):
             return
 
         for i, group in enumerate(self._groups):
-            best       = _best_in_group(group)
+            best       = self._get_best(group)
             group_size = sum(_safe_size(p) for p in group)
             item = QListWidgetItem(
                 f"Grupo {i + 1} — {len(group)} archivos · {_fmt_bytes(group_size)}\n"
@@ -702,9 +889,10 @@ class DuplicatePanel(QWidget):
 
         # Initialise per-group selections: best → keep, rest → delete
         for i, group in enumerate(self._groups):
-            best = _best_in_group(group)
+            best = self._get_best(group)
+            best_str = str(best)
             self._selections[i] = {
-                p: ("keep" if p == best else "delete") for p in group
+                p: ("keep" if str(p) == best_str else "delete") for p in group
             }
 
         self._btn_dedup_all.setEnabled(True)
@@ -712,7 +900,7 @@ class DuplicatePanel(QWidget):
 
         # Populate group list with thumbnails
         for i, group in enumerate(self._groups):
-            best       = _best_in_group(group)
+            best       = self._get_best(group)
             group_size = sum(_safe_size(p) for p in group)
             item = QListWidgetItem(
                 f"Grupo {i + 1} — {len(group)} archivos · {_fmt_bytes(group_size)}\n"
@@ -750,6 +938,15 @@ class DuplicatePanel(QWidget):
             self._scan_thread.deleteLater()
             self._scan_thread = None
 
+    # ── Best-in-group helper ───────────────────────────────────────────────
+
+    def _get_best(self, group: List[Path]) -> Path:
+        """Return the highest-quality path using the correct scorer for the
+        current media type (photo → pixel quality; video → resolution/bitrate)."""
+        if self._media_type == "video":
+            return _best_video_in_group(group)
+        return _best_in_group(group)
+
     # ── Group display ──────────────────────────────────────────────────────
 
     def _on_group_selected(self, row: int) -> None:
@@ -763,7 +960,7 @@ class DuplicatePanel(QWidget):
 
         group = self._groups[group_idx]
         sels  = self._selections.get(group_idx, {})
-        best  = _best_in_group(group)
+        best  = self._get_best(group)
 
         self._current_cards.clear()
 
@@ -772,9 +969,15 @@ class DuplicatePanel(QWidget):
         layout.setSpacing(10)
         layout.setContentsMargins(8, 8, 8, 8)
 
-        for p in group:
-            action = sels.get(p, "keep" if p == best else "delete")
-            card   = _PhotoCard(p, is_best=(p == best), action=action)
+        # Sort so the best card is always the LEFTMOST (Issue 12).
+        # Remaining cards keep their original order for stability.
+        sorted_group = [best] + [p for p in group if str(p) != str(best)]
+
+        CardClass = _VideoCard if self._media_type == "video" else _PhotoCard
+
+        for p in sorted_group:
+            action = sels.get(p, "keep" if str(p) == str(best) else "delete")
+            card   = CardClass(p, is_best=(str(p) == str(best)), action=action)
 
             # Default-argument capture avoids the classic loop-closure bug:
             # each lambda captures the value of gi and emitted at definition time.
@@ -796,20 +999,50 @@ class DuplicatePanel(QWidget):
 
     def _on_card_keep(self, path_obj: object, group_idx: int) -> None:
         """User clicked 'Conservar' on a card — exclusive keep: this card green,
-        all others in the group become delete (red)."""
+        all others in the group become delete (red).
+
+        After updating visual state:
+          1. Shows a brief toast in the header label: "✓ Marcado para CONSERVAR"
+          2. Auto-advances to the next group (if one exists).
+        """
         path = path_obj if isinstance(path_obj, Path) else Path(path_obj)
         if group_idx >= len(self._groups):
             return
         sels = self._selections.get(group_idx)
         if sels is None:
             return
-        # Exclusive keep: clicked path → keep, every other path → delete
+
+        # Exclusive keep: the clicked path is the ONLY "keep"; all others become "delete".
+        # Use str() comparison for robustness across Path-object identity differences.
+        path_str = str(path)
         for p in self._groups[group_idx]:
-            sels[p] = "keep" if p == path else "delete"
-        # Sync visual state for all visible cards
+            sels[p] = "keep" if str(p) == path_str else "delete"
+
+        # Sync visual state for ALL visible cards (including the one that was clicked,
+        # since _PhotoCard/_VideoCard no longer pre-sets its own state in _on_keep).
         for p, card in self._current_cards.items():
-            if p in sels:
-                card.set_action(sels[p])
+            action = sels.get(p)
+            if action is not None:
+                card.set_action(action)
+
+        # ── Toast feedback ──────────────────────────────────────────────────
+        n_groups  = len(self._groups)
+        next_idx  = group_idx + 1
+        has_next  = next_idx < n_groups
+        self._lbl_header.setText(
+            f"✓ Marcado para CONSERVAR  —  Grupo {group_idx + 1} / {n_groups}"
+            + ("  →  avanzando al siguiente…" if has_next else "  (último grupo)")
+        )
+
+        # ── Auto-advance to next group ──────────────────────────────────────
+        if has_next:
+            # Small delay so the user can see the toast before the view changes
+            QTimer.singleShot(600, lambda: self._groups_list.setCurrentRow(next_idx))
+            # Restore the summary header after the advance settles
+            QTimer.singleShot(800, self._update_header_label)
+        else:
+            # Last group — restore header after a moment
+            QTimer.singleShot(2500, self._update_header_label)
 
     def _on_card_delete_now(self, path_obj: object, group_idx: int) -> None:
         """User clicked '🗑 Eliminar' — guard, then move the file immediately."""
@@ -819,12 +1052,13 @@ class DuplicatePanel(QWidget):
         if group_idx >= len(self._groups):
             return
         group = self._groups[group_idx]
-        if path not in group:
+        path_str = str(path)
+        if not any(str(p) == path_str for p in group):
             return
 
-        # At least one other photo must be marked keep before deletion
+        # At least one other file must be marked keep before deletion
         sels        = self._selections.get(group_idx, {})
-        other_keeps = sum(1 for p in group if p != path and sels.get(p) == "keep")
+        other_keeps = sum(1 for p in group if str(p) != path_str and sels.get(p) == "keep")
         if other_keeps < 1:
             mb_warning(
                 self, "No se puede eliminar",
@@ -896,7 +1130,7 @@ class DuplicatePanel(QWidget):
         for i in range(self._groups_list.count()):
             item  = self._groups_list.item(i)
             group = self._groups[i]
-            best  = _best_in_group(group)
+            best  = self._get_best(group)
             item.setText(
                 f"Grupo {i + 1} — {len(group)} archivos"
                 f" · {_fmt_bytes(sum(_safe_size(p) for p in group))}\n"
@@ -922,7 +1156,7 @@ class DuplicatePanel(QWidget):
         if item is None or group_idx >= len(self._groups):
             return
         group = self._groups[group_idx]
-        best  = _best_in_group(group)
+        best  = self._get_best(group)
         item.setText(
             f"Grupo {group_idx + 1} — {len(group)} archivos"
             f" · {_fmt_bytes(sum(_safe_size(p) for p in group))}\n"
@@ -949,16 +1183,32 @@ class DuplicatePanel(QWidget):
 
     def _on_dedup_all(self) -> None:
         """Collect all delete-marked paths, confirm, then run _DeduplicateWorker."""
+        from core.video_handler import VIDEO_EXTENSIONS
+
         to_delete: List[Tuple[str, int]] = []   # (abs_path_str, file_size_bytes)
-        n_keep = 0
+        # Breakdown counters
+        del_photos = del_photos_bytes = 0
+        del_videos = del_videos_bytes = 0
+        keep_photos = keep_videos = 0
 
         for i, group in enumerate(self._groups):
             sels = self._selections.get(i, {})
             for p in group:
+                is_video = p.suffix.lower() in VIDEO_EXTENSIONS
                 if sels.get(p) == "delete":
-                    to_delete.append((str(p), _safe_size(p)))
+                    sz = _safe_size(p)
+                    to_delete.append((str(p), sz))
+                    if is_video:
+                        del_videos       += 1
+                        del_videos_bytes += sz
+                    else:
+                        del_photos       += 1
+                        del_photos_bytes += sz
                 else:
-                    n_keep += 1
+                    if is_video:
+                        keep_videos += 1
+                    else:
+                        keep_photos += 1
 
         if not to_delete:
             mb_info(
@@ -967,17 +1217,43 @@ class DuplicatePanel(QWidget):
             )
             return
 
-        n_del    = len(to_delete)
-        del_size = sum(s for _, s in to_delete)
+        # ── Build detailed confirmation message ─────────────────────────────
+        del_lines: List[str] = []
+        if del_photos:
+            del_lines.append(
+                f"  • {del_photos} foto{'s' if del_photos != 1 else ''}"
+                f"  ({_fmt_bytes(del_photos_bytes)})"
+            )
+        if del_videos:
+            del_lines.append(
+                f"  • {del_videos} video{'s' if del_videos != 1 else ''}"
+                f"  ({_fmt_bytes(del_videos_bytes)})"
+            )
 
-        reply = mb_question(
-            self, "Confirmar deduplicación",
-            f"Se moverán {n_del} archivo{'s' if n_del != 1 else ''}"
-            f" a _duplicados_eliminados  ({_fmt_bytes(del_size)})\n"
-            f"Se conservarán {n_keep} archivo{'s' if n_keep != 1 else ''}"
-            f" (los de mayor calidad)\n\n"
-            "¿Continuar?",
+        keep_lines: List[str] = []
+        if keep_photos:
+            keep_lines.append(
+                f"  • {keep_photos} foto{'s' if keep_photos != 1 else ''}"
+            )
+        if keep_videos:
+            keep_lines.append(
+                f"  • {keep_videos} video{'s' if keep_videos != 1 else ''}"
+            )
+
+        total_del  = len(to_delete)
+        total_size = sum(s for _, s in to_delete)
+
+        msg = (
+            f"Se moverán {total_del} archivo{'s' if total_del != 1 else ''}"
+            f" a  _duplicados_eliminados  ({_fmt_bytes(total_size)}):\n\n"
+            "Se eliminará:\n"
+            + "\n".join(del_lines)
+            + "\n\nSe conservará:\n"
+            + "\n".join(keep_lines)
+            + "\n\n¿Continuar?"
         )
+
+        reply = mb_question(self, "Confirmar deduplicación", msg)
         if reply != QMessageBox.StandardButton.Yes:
             return
 
@@ -989,11 +1265,11 @@ class DuplicatePanel(QWidget):
         self._update_button_states()
 
         # Progress dialog (no cancel button — operation is not interruptible)
-        self._dedup_total = n_del
+        self._dedup_total = total_del
         self._dedup_progress_dlg = QProgressDialog(self)
         self._dedup_progress_dlg.setWindowTitle("Deduplicando…")
         self._dedup_progress_dlg.setLabelText("Iniciando…")
-        self._dedup_progress_dlg.setRange(0, n_del)
+        self._dedup_progress_dlg.setRange(0, total_del)
         self._dedup_progress_dlg.setValue(0)
         self._dedup_progress_dlg.setWindowModality(Qt.WindowModality.WindowModal)
         self._dedup_progress_dlg.setCancelButton(None)
@@ -1060,9 +1336,9 @@ class DuplicatePanel(QWidget):
         self._update_button_states()
 
         summary = (
-            f"✅ Deduplicación completa\n\n"
-            f"Eliminados: {deleted_count} archivo{'s' if deleted_count != 1 else ''}"
-            f" · {_fmt_bytes(bytes_freed)} liberados"
+            f"✓ {deleted_count} archivo{'s' if deleted_count != 1 else ''}"
+            f" movido{'s' if deleted_count != 1 else ''} a _duplicados_eliminados/"
+            f"\n{_fmt_bytes(bytes_freed)} liberados"
         )
         if errors:
             summary += (

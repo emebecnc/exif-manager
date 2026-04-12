@@ -21,6 +21,20 @@ _SUPPORTED_WRITE_FORMATS = {".mp4", ".mov", ".m4v", ".mkv", ".avi", ".wmv"}
 FFMPEG_CMD  = "ffmpeg"
 FFPROBE_CMD = "ffprobe"
 
+# Set by main.py after the startup binary check so callers skip the
+# subprocess entirely when ffmpeg is known to be unavailable.
+# None  → not yet checked (first call will attempt normally and may fail)
+# True  → binary confirmed reachable
+# False → binary confirmed missing; all ffmpeg-dependent calls return early
+FFMPEG_AVAILABLE: bool | None = None
+
+
+def set_ffmpeg_available(ok: bool) -> None:
+    """Called once by main.py after the startup _check_ffmpeg() result."""
+    global FFMPEG_AVAILABLE
+    FFMPEG_AVAILABLE = ok
+
+
 # Camera factory-reset years (same logic as exif_handler)
 _INVALID_YEARS = {2000, 2005}
 
@@ -189,6 +203,8 @@ def get_video_thumbnail(path: Path, size: int = 150) -> Optional[bytes]:
     Retries at 00:00:00 for clips shorter than 1 second.
     Returns None on failure or when ffmpeg is unavailable.
     """
+    if FFMPEG_AVAILABLE is False:
+        return None
     try:
         cmd = [
             FFMPEG_CMD, "-y",
@@ -353,6 +369,9 @@ def restore_video_backup(folder: Path) -> dict:
 
 def _read_ffprobe(path: Path, result: dict) -> bool:
     """Fill result dict from ffprobe JSON output.  Returns True on success."""
+    if FFMPEG_AVAILABLE is False:
+        result["error"] = "ffprobe no disponible — instalá ffmpeg desde https://ffmpeg.org"
+        return False
     try:
         cmd = [
             FFPROBE_CMD, "-v", "quiet",

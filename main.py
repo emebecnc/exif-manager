@@ -153,6 +153,12 @@ def main():
 
     # Check for ffmpeg before building the UI (subprocess — safe pre-Qt)
     ffmpeg_ok = _check_ffmpeg()
+
+    # Propagate result to video_handler so all callers skip the subprocess
+    # when ffmpeg is confirmed missing (avoids redundant FileNotFoundError calls).
+    from core.video_handler import set_ffmpeg_available
+    set_ffmpeg_available(ffmpeg_ok)
+
     if not ffmpeg_ok:
         QMessageBox.warning(
             None,

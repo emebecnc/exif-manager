@@ -257,8 +257,8 @@ class VideoDateEditorDialog(QDialog):
         layout.addWidget(grp_mode)
 
         # ── Date group ──────────────────────────────────────────────────────
-        grp_date = QGroupBox("Fecha nueva")
-        date_row = QHBoxLayout(grp_date)
+        self._grp_date = QGroupBox("Fecha nueva")
+        date_row = QHBoxLayout(self._grp_date)
         date_row.setSpacing(12)
 
         self._chk_year = QCheckBox("Año:")
@@ -286,34 +286,36 @@ class VideoDateEditorDialog(QDialog):
         date_row.addWidget(self._chk_day)
         date_row.addWidget(self._spin_day)
         date_row.addStretch()
-        layout.addWidget(grp_date)
+        layout.addWidget(self._grp_date)
 
-        # ── Time group ──────────────────────────────────────────────────────
+        # ── Time group — compact single-row layout ───────────────────────────
         grp_time = QGroupBox("Hora")
-        tl = QVBoxLayout(grp_time)
-        self._radio_preserve_time = QRadioButton("Conservar hora original")
-        self._radio_custom_time   = QRadioButton("Hora personalizada:")
+        time_row = QHBoxLayout(grp_time)
+        time_row.setSpacing(6)
+        self._radio_preserve_time = QRadioButton("Conservar original")
+        self._radio_custom_time   = QRadioButton("Personalizada:")
         self._radio_preserve_time.setChecked(True)
         self._bg_time = QButtonGroup(self)
         self._bg_time.addButton(self._radio_preserve_time, _OPT_PRESERVE)
         self._bg_time.addButton(self._radio_custom_time,   _OPT_CUSTOM)
 
-        time_row = QHBoxLayout()
-        self._spin_hour   = QSpinBox(); self._spin_hour.setRange(0, 23);   self._spin_hour.setFixedWidth(55)
-        self._spin_minute = QSpinBox(); self._spin_minute.setRange(0, 59); self._spin_minute.setFixedWidth(55)
-        self._spin_second = QSpinBox(); self._spin_second.setRange(0, 59); self._spin_second.setFixedWidth(55)
+        self._spin_hour   = QSpinBox(); self._spin_hour.setRange(0, 23);   self._spin_hour.setFixedWidth(50)
+        self._spin_minute = QSpinBox(); self._spin_minute.setRange(0, 59); self._spin_minute.setFixedWidth(50)
+        self._spin_second = QSpinBox(); self._spin_second.setRange(0, 59); self._spin_second.setFixedWidth(50)
         if prefill_dt:
             self._spin_hour.setValue(prefill_dt.hour)
             self._spin_minute.setValue(prefill_dt.minute)
             self._spin_second.setValue(prefill_dt.second)
-        for lbl, spin in [("h", self._spin_hour), ("m", self._spin_minute),
-                           ("s", self._spin_second)]:
-            time_row.addWidget(QLabel(lbl))
-            time_row.addWidget(spin)
+
+        time_row.addWidget(self._radio_preserve_time)
+        time_row.addWidget(self._radio_custom_time)
+        time_row.addWidget(self._spin_hour)
+        time_row.addWidget(QLabel("h"))
+        time_row.addWidget(self._spin_minute)
+        time_row.addWidget(QLabel("m"))
+        time_row.addWidget(self._spin_second)
+        time_row.addWidget(QLabel("s"))
         time_row.addStretch()
-        tl.addWidget(self._radio_preserve_time)
-        tl.addWidget(self._radio_custom_time)
-        tl.addLayout(time_row)
         layout.addWidget(grp_time)
 
         # ── Rename group ────────────────────────────────────────────────────
@@ -400,9 +402,25 @@ class VideoDateEditorDialog(QDialog):
         self._update_state()
 
     def _update_state(self) -> None:
-        keep    = self._radio_keep.isChecked()
-        custom  = self._radio_custom_time.isChecked()
+        keep     = self._radio_keep.isChecked()
+        custom   = self._radio_custom_time.isChecked()
         renaming = self._chk_rename.isChecked()
+
+        # Conservar → disable the whole date group AND uncheck all checkboxes
+        # so it's visually clear nothing will be written.
+        # Cambiar → enable the group; auto-check all three if all were off.
+        self._grp_date.setEnabled(not keep)
+        if keep:
+            self._chk_year.setChecked(False)
+            self._chk_month.setChecked(False)
+            self._chk_day.setChecked(False)
+        else:
+            if not (self._chk_year.isChecked() or self._chk_month.isChecked()
+                    or self._chk_day.isChecked()):
+                self._chk_year.setChecked(True)
+                self._chk_month.setChecked(True)
+                self._chk_day.setChecked(True)
+
         self._spin_year.setEnabled(not keep and self._chk_year.isChecked())
         self._spin_month.setEnabled(not keep and self._chk_month.isChecked())
         self._spin_day.setEnabled(not keep and self._chk_day.isChecked())
