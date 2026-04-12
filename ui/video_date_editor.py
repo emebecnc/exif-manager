@@ -125,7 +125,16 @@ class _ApplyWorker(QObject):
 
                 old_str = existing.isoformat() if existing else ""
                 if not self._keep_mode:
-                    write_video_date(path, new_dt)
+                    success = write_video_date(path, new_dt)
+                    if not success:
+                        # Format not supported (e.g. .3gp) or ffmpeg error —
+                        # skip this file gracefully rather than crashing.
+                        failed += 1
+                        errors.append(
+                            f"{path.name}: formato no soportado para "
+                            f"edición de fecha ({path.suffix})"
+                        )
+                        continue
                     self._log.log(
                         str(path.parent), path.name, "write_exif",
                         old_str, new_dt.isoformat(),

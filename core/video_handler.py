@@ -12,6 +12,11 @@ from typing import Iterator, List, Optional
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".3gp", ".m4v", ".wmv"}
 
+# Formats that reliably support container-level metadata rewrite via
+# `ffmpeg -codec copy`.  .3gp triggers "Operation not permitted" errors on
+# some platforms because ffmpeg needs to rewrite the full atom structure.
+_SUPPORTED_WRITE_FORMATS = {".mp4", ".mov", ".m4v", ".mkv", ".avi", ".wmv"}
+
 # Override these to use a bundled ffmpeg/ffprobe binary
 FFMPEG_CMD  = "ffmpeg"
 FFPROBE_CMD = "ffprobe"
@@ -113,18 +118,32 @@ def is_invalid_date(dt: Optional[datetime]) -> bool:
 
 # ── Metadata writing ──────────────────────────────────────────────────────────
 
-def write_video_date(path: Path, new_dt: datetime) -> None:
-    """
-    Write a new creation_time to video container metadata using ffmpeg -codec copy.
+def write_video_date(path: Path, new_dt: datetime) -> bool:
+    """Write a new creation_time to video container metadata using ffmpeg -codec copy.
+
     Operation is atomic: writes to a temp file then renames over the original.
-    Also updates filesystem modification timestamp via os.utime.
-    Raises RuntimeError on ffmpeg failure.
+    Also updates the filesystem modification timestamp via os.utime.
+
+    Returns:
+        True  — metadata written successfully.
+        False — format not supported (e.g. .3gp) or ffmpeg reported an error.
+                The original file is left untouched.
+
+    Unlike the old behaviour this function never raises — callers should check
+    the return value instead of catching exceptions.
     """
+    # Skip formats that don't support lossless container rewrites.
+    # .3gp in particular triggers "Operation not permitted" on many builds of
+    # ffmpeg because the 3GPP atom layout cannot be patched without re-muxing.
+    if path.suffix.lower() not in _SUPPORTED_WRITE_FORMATS:
+        return False
+
     iso = new_dt.strftime("%Y-%m-%dT%H:%M:%S")
-    tmp_fd, tmp_path = tempfile.mkstemp(
+    tmp_fd, tmp_path_str = tempfile.mkstemp(
         dir=str(path.parent), suffix=path.suffix
     )
     os.close(tmp_fd)
+    tmp_path = Path(tmp_path_str)
     try:
         cmd = [
             FFMPEG_CMD, "-y",
@@ -132,19 +151,25 @@ def write_video_date(path: Path, new_dt: datetime) -> None:
             "-metadata", f"creation_time={iso}",
             "-codec", "copy",
             "-movflags", "use_metadata_tags",
-            tmp_path,
+            str(tmp_path),
         ]
         proc = subprocess.run(cmd, capture_output=True, timeout=120)
         if proc.returncode != 0:
-            stderr = proc.stderr.decode("utf-8", errors="replace")
-            raise RuntimeError(f"ffmpeg error: {stderr[-400:]}")
-        os.replace(tmp_path, str(path))
+            # ffmpeg printed an error — clean up and report failure
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+            return False
+
+        os.replace(str(tmp_path), str(path))
+
     except Exception:
         try:
-            os.unlink(tmp_path)
+            tmp_path.unlink()
         except OSError:
             pass
-        raise
+        return False
 
     # Best-effort filesystem timestamp sync
     ts = new_dt.timestamp()
@@ -152,6 +177,8 @@ def write_video_date(path: Path, new_dt: datetime) -> None:
         os.utime(str(path), (ts, ts))
     except OSError:
         pass
+
+    return True
 
 
 # ── Thumbnail extraction ──────────────────────────────────────────────────────

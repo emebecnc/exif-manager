@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import (
 from core.backup_manager import has_backup, append_historial
 from core.exif_handler import read_exif
 from core.file_scanner import count_images, list_subdirs, root_is_available, unique_dest
+from core.video_handler import VIDEO_EXTENSIONS as _VIDEO_EXTENSIONS
 from ui.styles import mb_warning, mb_question
 
 _PLACEHOLDER = "__loading__"
@@ -204,9 +205,25 @@ class FolderTreePanel(QWidget):
 
     # ── Tree building ──────────────────────────────────────────────────────
 
+    def _count_videos(self, path: Path) -> int:
+        """Count video files in *path* (non-recursive, best-effort)."""
+        count = 0
+        try:
+            for entry in os.scandir(path):
+                if entry.is_file(follow_symlinks=False):
+                    if Path(entry.name).suffix.lower() in _VIDEO_EXTENSIONS:
+                        count += 1
+        except (PermissionError, OSError):
+            pass
+        return count
+
     def _make_item(self, path: Path) -> QTreeWidgetItem:
-        count = count_images(path)
-        label = f"{path.name}  ({count})"
+        photos = count_images(path)
+        videos = self._count_videos(path)
+        if videos:
+            label = f"{path.name}  ({photos}) V({videos})"
+        else:
+            label = f"{path.name}  ({photos})"
         item = QTreeWidgetItem([label])
         item.setData(0, Qt.ItemDataRole.UserRole, str(path))
 
