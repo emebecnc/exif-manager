@@ -1,21 +1,22 @@
 """Left panel: navigable folder tree with lazy loading and backup indicators."""
+import os
 import shutil
 from collections import deque
 from pathlib import Path
 from typing import Optional, List
 
 from PyQt6.QtCore import Qt, pyqtSignal, QUrl
-from PyQt6.QtGui import QColor, QBrush
+from PyQt6.QtGui import QAction, QColor, QBrush
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
-    QTreeWidget, QTreeWidgetItem, QFileDialog, QLabel,
-    QApplication, QMessageBox,
+    QTreeWidget, QTreeWidgetItem, QAbstractItemView, QFileDialog,
+    QInputDialog, QLabel, QMenu, QApplication, QMessageBox,
 )
 
 from core.backup_manager import has_backup, append_historial
 from core.exif_handler import read_exif
 from core.file_scanner import count_images, list_subdirs, root_is_available, unique_dest
-from ui.styles import mb_warning
+from ui.styles import mb_warning, mb_question
 
 _PLACEHOLDER = "__loading__"
 
@@ -31,6 +32,7 @@ class _DropTree(QTreeWidget):
         self._panel = panel          # FolderTreePanel — gives access to _log
         self.setAcceptDrops(True)
         self.setDropIndicatorShown(True)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
 
     def dragEnterEvent(self, event) -> None:
         if event.mimeData().hasUrls():
@@ -137,6 +139,8 @@ class FolderTreePanel(QWidget):
         self._tree.itemExpanded.connect(self._on_item_expanded)
         self._tree.itemClicked.connect(self._on_item_clicked)
         self._tree.files_moved.connect(self.files_moved)   # re-emit on panel
+        self._tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._tree.customContextMenuRequested.connect(self._on_folder_context_menu)
         layout.addWidget(self._tree)
 
     # ── Public API ─────────────────────────────────────────────────────────
@@ -243,6 +247,162 @@ class FolderTreePanel(QWidget):
         path_str = item.data(0, Qt.ItemDataRole.UserRole)
         if path_str:
             self.folder_selected.emit(Path(path_str))
+
+    def _on_folder_context_menu(self, pos) -> None:
+        item = self._tree.itemAt(pos)
+        if not item:
+            return
+        path_str = item.data(0, Qt.ItemDataRole.UserRole)
+        if not path_str:
+            return
+        folder = Path(path_str)
+        menu = QMenu(self)
+
+        act_new = QAction("📁 Nueva subcarpeta", self)
+        act_new.setToolTip("Crea una nueva subcarpeta dentro de esta carpeta.")
+        act_new.triggered.connect(lambda checked, f=folder: self._new_subfolder(f))
+        menu.addAction(act_new)
+
+        menu.addSeparator()
+
+        act_move = QAction("📂 Mover carpeta a…", self)
+        act_move.setToolTip("Mueve esta carpeta (y todo su contenido) a otra ubicación.")
+        act_move.triggered.connect(
+            lambda checked, f=folder, i=item: self._move_folder(f, i)
+        )
+        menu.addAction(act_move)
+
+        act_copy = QAction("📋 Copiar carpeta a…", self)
+        act_copy.setToolTip("Copia esta carpeta (y todo su contenido) a otra ubicación.")
+        act_copy.triggered.connect(lambda checked, f=folder: self._copy_folder(f))
+        menu.addAction(act_copy)
+
+        menu.addSeparator()
+
+        act_del = QAction("🗑 Mover a _eliminados", self)
+        act_del.setToolTip("Mueve esta carpeta a la carpeta _eliminados de su directorio padre.")
+        act_del.triggered.connect(
+            lambda checked, f=folder, i=item: self._delete_folder_to_trash(f, i)
+        )
+        menu.addAction(act_del)
+
+        menu.addSeparator()
+
+        act_open = QAction("📂 Abrir en Explorador", self)
+        act_open.setToolTip("Abre esta carpeta en el Explorador de Windows.")
+        act_open.triggered.connect(lambda checked, f=folder: os.startfile(str(f)))
+        menu.addAction(act_open)
+
+        menu.exec(self._tree.viewport().mapToGlobal(pos))
+
+    def _new_subfolder(self, parent_folder: Path) -> None:
+        name, ok = QInputDialog.getText(
+            self, "Nueva subcarpeta", "Nombre de la nueva subcarpeta:"
+        )
+        if not ok:
+            return
+        name = name.strip()
+        if not name:
+            mb_warning(self, "Nombre vacío", "El nombre no puede estar vacío.")
+            return
+        new_path = parent_folder / name
+        try:
+            new_path.mkdir(exist_ok=False)
+        except FileExistsError:
+            mb_warning(self, "Ya existe", f"Ya existe una carpeta con el nombre '{name}'.")
+            return
+        except OSError as e:
+            mb_warning(self, "Error al crear carpeta", str(e))
+            return
+        self.reveal_folder(new_path)
+
+    def _move_folder(self, folder: Path, item: QTreeWidgetItem) -> None:
+        dest_str = QFileDialog.getExistingDirectory(
+            self, "Mover carpeta a…", str(folder.parent),
+            QFileDialog.Option.DontUseNativeDialog,
+        )
+        if not dest_str:
+            return
+        dest = Path(dest_str)
+        if dest == folder.parent:
+            return  # already in that location
+        new_path = dest / folder.name
+        if new_path.exists():
+            mb_warning(
+                self, "Ya existe",
+                f"Ya existe una carpeta '{folder.name}' en ese destino."
+            )
+            return
+        try:
+            shutil.move(str(folder), str(new_path))
+        except OSError as e:
+            mb_warning(self, "Error al mover carpeta", str(e))
+            return
+        if self._log:
+            self._log.log(
+                str(folder.parent), folder.name, "move_folder", str(folder), str(new_path)
+            )
+        # Remove item from tree
+        parent_item = item.parent()
+        if parent_item:
+            parent_item.removeChild(item)
+        else:
+            idx = self._tree.indexOfTopLevelItem(item)
+            if idx >= 0:
+                self._tree.takeTopLevelItem(idx)
+
+    def _copy_folder(self, folder: Path) -> None:
+        dest_str = QFileDialog.getExistingDirectory(
+            self, "Copiar carpeta a…", str(folder.parent),
+            QFileDialog.Option.DontUseNativeDialog,
+        )
+        if not dest_str:
+            return
+        dest = Path(dest_str)
+        new_path = dest / folder.name
+        try:
+            shutil.copytree(str(folder), str(new_path))
+        except OSError as e:
+            mb_warning(self, "Error al copiar carpeta", str(e))
+            return
+        if self._log:
+            self._log.log(
+                str(folder.parent), folder.name, "copy_folder", str(folder), str(new_path)
+            )
+
+    def _delete_folder_to_trash(self, folder: Path, item: QTreeWidgetItem) -> None:
+        if not mb_question(
+            self, "Confirmar eliminación",
+            f"¿Mover la carpeta '{folder.name}' a _eliminados?\n\n"
+            "Todo el contenido se moverá junto con la carpeta.",
+        ):
+            return
+        trash_dir = folder.parent / "_eliminados"
+        new_path = trash_dir / folder.name
+        if new_path.exists():
+            # Append numeric suffix to avoid collision
+            i = 1
+            while (trash_dir / f"{folder.name}_{i}").exists():
+                i += 1
+            new_path = trash_dir / f"{folder.name}_{i}"
+        try:
+            trash_dir.mkdir(exist_ok=True)
+            shutil.move(str(folder), str(new_path))
+        except OSError as e:
+            mb_warning(self, "Error al mover carpeta", str(e))
+            return
+        if self._log:
+            self._log.log(
+                str(folder.parent), folder.name, "delete_folder", str(folder), str(new_path)
+            )
+        # Remove item from tree
+        parent_item = item.parent()
+        if parent_item:
+            parent_item.removeChild(item)
+        else:
+            idx = self._tree.indexOfTopLevelItem(item)
+            if idx >= 0:
+                self._tree.takeTopLevelItem(idx)
 
     def _find_item(self, target: Path) -> Optional[QTreeWidgetItem]:
         """BFS search for tree item matching target path."""

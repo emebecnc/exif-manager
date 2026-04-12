@@ -1,6 +1,8 @@
 """Center panel: thumbnail grid with two-phase background loading and disk cache."""
 import hashlib
+import os
 import shutil
+from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict
@@ -12,7 +14,7 @@ from PyQt6.QtGui import QPixmap, QColor, QPen, QBrush, QAction, QDrag
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QComboBox,
     QListWidget, QListWidgetItem, QAbstractItemView, QStyledItemDelegate,
-    QStyleOptionViewItem, QApplication, QMenu, QMessageBox, QInputDialog,
+    QStyleOptionViewItem, QApplication, QFileDialog, QMenu, QMessageBox, QInputDialog,
     QProgressBar, QLayout,
 )
 from PyQt6.QtCore import QModelIndex
@@ -45,6 +47,37 @@ _ILLEGAL_NAME_CHARS = frozenset('\\ / : * ? " < > |'.split())
 _PROGRESS_THRESHOLD = 100
 
 
+class ThumbnailCache:
+    """LRU in-memory cache for decoded QPixmap thumbnails.
+
+    Keeps only the *max_size* most-recently-used entries so RAM usage stays
+    bounded even in folders with thousands of images.
+    """
+
+    def __init__(self, max_size: int = 200) -> None:
+        self._cache: OrderedDict = OrderedDict()
+        self._max_size = max_size
+
+    def get(self, key: str):
+        if key in self._cache:
+            self._cache.move_to_end(key)
+            return self._cache[key]
+        return None
+
+    def put(self, key: str, value) -> None:
+        if key in self._cache:
+            self._cache.move_to_end(key)
+        self._cache[key] = value
+        if len(self._cache) > self._max_size:
+            self._cache.popitem(last=False)  # evict oldest
+
+    def pop(self, key: str, default=None):
+        return self._cache.pop(key, default)
+
+    def clear(self) -> None:
+        self._cache.clear()
+
+
 def _thumb_cache_key(path_str: str, mtime: float) -> str:
     """MD5 key for a thumbnail cache entry: encodes path + modification time."""
     data = f"{path_str}|{mtime:.6f}".encode("utf-8")
@@ -53,6 +86,13 @@ def _thumb_cache_key(path_str: str, mtime: float) -> str:
 
 class _DraggableList(QListWidget):
     """QListWidget subclass that produces proper file-URL drag payloads."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setDragEnabled(True)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DragOnly)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.viewport().setAcceptDrops(False)
 
     def startDrag(self, supported_actions) -> None:
         selected = self.selectedItems()
@@ -76,7 +116,7 @@ class _DraggableList(QListWidget):
         drag.setMimeData(mime)
         drag.setPixmap(pixmap)
         drag.setHotSpot(pixmap.rect().center())
-        drag.exec(Qt.DropAction.MoveAction)
+        drag.exec(Qt.DropAction.MoveAction | Qt.DropAction.CopyAction)
 
 
 class _ThumbnailWorker(QObject):
@@ -90,8 +130,9 @@ class _ThumbnailWorker(QObject):
                              (fast re-open) or generates it with Pillow
                              (slow first-open) and emits per-item updates.
     """
-    # Phase 2 per-item update: path, bytes|None, date_str, is_invalid
-    thumbnail_ready = pyqtSignal(str, object, str, bool)
+    # Batch update: list of (path_str, bytes|None, date_str, is_invalid)
+    # Emitted every 20 items so the main thread does fewer round-trips.
+    thumbnails_batch_ready = pyqtSignal(list)
     progress  = pyqtSignal(int, int)   # current, total  (Phase 2)
     finished  = pyqtSignal()
 
@@ -115,8 +156,12 @@ class _ThumbnailWorker(QObject):
             return
         exif_dates = read_exif_dates_batch(self._paths)
 
-        # ── Phase 2: thumbnail loading (cache-aware, sequential) ───────────
+        # ── Phase 2: thumbnail loading (cache-aware, batched) ─────────────
+        # Items are accumulated in batches of 20 before being sent to the main
+        # thread.  This dramatically reduces the number of cross-thread signal
+        # deliveries for large folders (5000 items → 250 signals instead of 5000).
         total = len(self._paths)
+        batch: list = []
         for i, path in enumerate(self._paths):
             if self._cancelled:
                 break
@@ -125,7 +170,15 @@ class _ThumbnailWorker(QObject):
             thumb_bytes = self._get_thumb(path)
             date_str    = exif_dates.get(path, "")
             invalid     = is_invalid_date(date_str)
-            self.thumbnail_ready.emit(str(path), thumb_bytes, date_str, invalid)
+            batch.append((str(path), thumb_bytes, date_str, invalid))
+
+            if len(batch) == 20:
+                self.thumbnails_batch_ready.emit(batch)
+                batch = []
+
+        # Flush any remainder
+        if batch:
+            self.thumbnails_batch_ready.emit(batch)
 
         self.finished.emit()
 
@@ -191,7 +244,7 @@ class ThumbnailGrid(QWidget):
         super().__init__(parent)
         self._log = log_manager
         self._current_folder: Optional[Path] = None
-        self._pixmap_cache: Dict[str, QPixmap] = {}
+        self._pixmap_cache: ThumbnailCache = ThumbnailCache(max_size=200)
         self._path_to_item: Dict[str, QListWidgetItem] = {}
         self._worker: Optional[_ThumbnailWorker] = None
         self._thread: Optional[QThread] = None
@@ -217,10 +270,6 @@ class ThumbnailGrid(QWidget):
         # Batched layout: Qt lays out items in batches → smoother large-folder rendering
         self._list.setLayoutMode(QListWidget.LayoutMode.Batched)
         self._list.setBatchSize(50)
-        self._list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self._list.setDragEnabled(True)
-        self._list.setDragDropMode(QAbstractItemView.DragDropMode.DragOnly)
-        self._list.viewport().setAcceptDrops(False)
         self._list.setItemDelegate(_ThumbnailDelegate(self._list))
         self._list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._list.itemClicked.connect(self._on_item_clicked)
@@ -337,6 +386,16 @@ class ThumbnailGrid(QWidget):
         """Request that path be selected once the next folder load populates
         the skeleton items.  Works for both immediately-starting and queued loads."""
         self._pending_select = str(path)
+
+    def on_folder_changed(self, folder: Path) -> None:
+        """Slot connected to MainWindow.folder_changed signal.
+
+        Ignores no-ops (same folder or None) so switching tabs doesn't
+        trigger a redundant reload.
+        """
+        if not folder or folder == self._current_folder:
+            return
+        self.load_folder(folder)
 
     def load_folder(self, folder_path: Path) -> None:
         """Load thumbnails for all images in folder_path (background thread)."""
@@ -490,6 +549,7 @@ class ThumbnailGrid(QWidget):
         # No EXIF reads, no Pillow — this is nearly instant even for 2000 files.
         images.sort(key=lambda p: p.name.lower())  # stable filename order for now
 
+        self._list.setUpdatesEnabled(False)
         for path in images:
             item = self._make_skeleton_item(path)
             # Seed _ROLE_DATE with mtime so the grid can sort before EXIF arrives
@@ -501,6 +561,7 @@ class ThumbnailGrid(QWidget):
             item.setData(_ROLE_DATE, mtime_str)
             self._list.addItem(item)
             self._path_to_item[str(path)] = item
+        self._list.setUpdatesEnabled(True)
 
         # Apply initial sort using seeded mtime values (fast, no I/O)
         self._apply_sort()
@@ -526,7 +587,7 @@ class ThumbnailGrid(QWidget):
         self._thread = QThread()
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
-        self._worker.thumbnail_ready.connect(self._on_thumbnail_ready)
+        self._worker.thumbnails_batch_ready.connect(self._on_thumbnails_batch_ready)
         self._worker.progress.connect(self._on_load_progress)
         self._worker.finished.connect(self._on_worker_finished)
         self._thread.start()
@@ -539,38 +600,48 @@ class ThumbnailGrid(QWidget):
         item.setSizeHint(QSize(_ITEM_W, _ITEM_H))
         return item
 
-    def _on_thumbnail_ready(self, path_str: str, thumb_bytes, date_str: str, is_inv: bool) -> None:
-        # Running on the MAIN thread (queued connection) — safe to create QPixmap here
-        item = self._path_to_item.get(path_str)
-        if item is None:
-            return
+    def _on_thumbnails_batch_ready(self, batch: list) -> None:
+        """Handle a batch of up to 20 thumbnail updates from the background worker.
 
-        if thumb_bytes:
-            # Decode bytes → QPixmap → centred on a solid background tile
-            src = QPixmap()
-            src.loadFromData(thumb_bytes)
-            if not src.isNull():
-                icon_pixmap = QPixmap(_THUMB_SIZE, _THUMB_SIZE)
-                icon_pixmap.fill(QColor(45, 45, 50))
-                from PyQt6.QtGui import QPainter, QIcon
-                painter = QPainter(icon_pixmap)
-                x = (_THUMB_SIZE - src.width()) // 2
-                y = (_THUMB_SIZE - src.height()) // 2
-                painter.drawPixmap(x, y, src)
-                painter.end()
-                item.setIcon(QIcon(icon_pixmap))
-                self._pixmap_cache[path_str] = icon_pixmap
+        Running on the MAIN thread (queued connection) — safe to create QPixmap.
+        Wrapping the batch in setUpdatesEnabled(False/True) cuts repaint calls
+        from N → 1 per batch, keeping the UI responsive at 5000+ photos.
+        """
+        from PyQt6.QtGui import QPainter, QIcon
 
-        display_date = self._format_date(date_str)
-        item.setText(f"{Path(path_str).name}\n{display_date}")
-        item.setData(_ROLE_DATE, date_str)
-        item.setData(_ROLE_INVALID, is_inv)
+        self._list.setUpdatesEnabled(False)
+        try:
+            for path_str, thumb_bytes, date_str, is_inv in batch:
+                item = self._path_to_item.get(path_str)
+                if item is None:
+                    continue
 
-        # "Sin fecha" / invalid dates get red text
-        if not date_str or is_inv:
-            item.setForeground(QBrush(QColor(220, 80, 80)))
-        else:
-            item.setForeground(QBrush(QColor(220, 220, 225)))
+                if thumb_bytes:
+                    src = QPixmap()
+                    src.loadFromData(thumb_bytes)
+                    if not src.isNull():
+                        icon_pixmap = QPixmap(_THUMB_SIZE, _THUMB_SIZE)
+                        icon_pixmap.fill(QColor(45, 45, 50))
+                        painter = QPainter(icon_pixmap)
+                        x = (_THUMB_SIZE - src.width()) // 2
+                        y = (_THUMB_SIZE - src.height()) // 2
+                        painter.drawPixmap(x, y, src)
+                        painter.end()
+                        item.setIcon(QIcon(icon_pixmap))
+                        self._pixmap_cache.put(path_str, icon_pixmap)
+
+                display_date = self._format_date(date_str)
+                item.setText(f"{Path(path_str).name}\n{display_date}")
+                item.setData(_ROLE_DATE, date_str)
+                item.setData(_ROLE_INVALID, is_inv)
+
+                if not date_str or is_inv:
+                    item.setForeground(QBrush(QColor(220, 80, 80)))
+                else:
+                    item.setForeground(QBrush(QColor(220, 220, 225)))
+        finally:
+            self._list.setUpdatesEnabled(True)
+            self._list.update()
 
     def _on_load_progress(self, current: int, total: int) -> None:
         """Update progress bar and count label during Phase 2 loading."""
@@ -677,7 +748,7 @@ class ThumbnailGrid(QWidget):
         menu = QMenu(self)
 
         if n == 1:
-            # Single photo: direct date edit
+            # Single photo: date edit, filename-date prefill, open in Windows
             act_edit_single = QAction("📅 Editar fecha de esta foto", self)
             act_edit_single.setToolTip(
                 "Abre el editor de fecha para modificar el EXIF de esta foto."
@@ -687,7 +758,6 @@ class ThumbnailGrid(QWidget):
             )
             menu.addAction(act_edit_single)
 
-            # Filename-date prefill shortcut
             act_fn = QAction("📋 Leer fecha del nombre", self)
             act_fn.setToolTip(
                 "Abre el editor de fecha con los controles pre-rellenados\n"
@@ -697,10 +767,19 @@ class ThumbnailGrid(QWidget):
                 lambda: self.read_filename_date_requested.emit(selected[0])
             )
             menu.addAction(act_fn)
+
             menu.addSeparator()
+
+            act_open = QAction("🖼 Abrir en Windows", self)
+            act_open.setToolTip("Abre la foto con el visor predeterminado de Windows.")
+            act_open.triggered.connect(
+                lambda checked, p=selected[0]: os.startfile(str(p))
+            )
+            menu.addAction(act_open)
+
         else:
             # 2+ photos: batch date edit
-            lbl_edit = f"Editar fecha de seleccionadas ({n} fotos)"
+            lbl_edit = f"📅 Editar fecha de seleccionadas ({n} fotos)"
             act_edit = QAction(lbl_edit, self)
             act_edit.setToolTip(
                 "Abre el editor de fecha para las fotos seleccionadas.\n"
@@ -708,16 +787,30 @@ class ThumbnailGrid(QWidget):
             )
             act_edit.triggered.connect(lambda: self.edit_selection_date.emit(list(selected)))
             menu.addAction(act_edit)
-            menu.addSeparator()
 
-        # Eliminar
-        lbl_del = f"Eliminar seleccionadas ({n} foto{'s' if n != 1 else ''})"
+        menu.addSeparator()
+
+        # Move / Copy — always available
+        act_move = QAction("📁 Mover a carpeta…", self)
+        act_move.setToolTip("Mueve las fotos seleccionadas a otra carpeta.")
+        act_move.triggered.connect(lambda: self._prompt_move(list(selected)))
+        menu.addAction(act_move)
+
+        act_copy = QAction("📋 Copiar a carpeta…", self)
+        act_copy.setToolTip("Copia las fotos seleccionadas a otra carpeta.")
+        act_copy.triggered.connect(lambda: self._prompt_copy(list(selected)))
+        menu.addAction(act_copy)
+
+        menu.addSeparator()
+
+        lbl_del = f"🗑 Eliminar ({n} foto{'s' if n != 1 else ''})"
         act_del = QAction(lbl_del, self)
-        act_del.triggered.connect(lambda: self._confirm_and_delete(selected))
+        act_del.setToolTip(f"Mueve las fotos seleccionadas a la carpeta _{_TRASH_DIRNAME}.")
+        act_del.triggered.connect(lambda: self._confirm_and_delete(list(selected)))
         menu.addAction(act_del)
 
-        # Refresh
         menu.addSeparator()
+
         act_refresh = QAction("🔄 Actualizar carpeta", self)
         act_refresh.setToolTip(
             "Recarga las fotos de la carpeta actual desde el disco. "
@@ -727,6 +820,79 @@ class ThumbnailGrid(QWidget):
         menu.addAction(act_refresh)
 
         menu.exec(self._list.viewport().mapToGlobal(pos))
+
+    def _prompt_move(self, paths: List[Path]) -> None:
+        """Ask for a destination folder then move all paths there."""
+        if not paths:
+            return
+        dest_str = QFileDialog.getExistingDirectory(
+            self, "Mover a carpeta…",
+            str(self._current_folder or ""),
+            QFileDialog.Option.DontUseNativeDialog,
+        )
+        if dest_str:
+            self._move_files(paths, Path(dest_str))
+
+    def _prompt_copy(self, paths: List[Path]) -> None:
+        """Ask for a destination folder then copy all paths there."""
+        if not paths:
+            return
+        dest_str = QFileDialog.getExistingDirectory(
+            self, "Copiar a carpeta…",
+            str(self._current_folder or ""),
+            QFileDialog.Option.DontUseNativeDialog,
+        )
+        if dest_str:
+            self._copy_files(paths, Path(dest_str))
+
+    def _move_files(self, paths: List[Path], dest: Path) -> None:
+        """Move files to dest, log each operation, remove items from grid."""
+        moved: List[Path] = []
+        errors: List[str] = []
+        for path in paths:
+            if path.parent == dest:
+                continue
+            try:
+                dst_file = unique_dest(path, dest)
+                original_exif = read_exif(path)["fields"]
+                append_historial(path.parent, path.name, None, original_exif, "movido")
+                shutil.move(str(path), str(dst_file))
+                self._log.log(str(path.parent), path.name, "move", str(path), str(dst_file))
+                moved.append(path)
+            except Exception as e:
+                errors.append(f"{path.name}: {e}")
+
+        if errors:
+            mb_warning(self, "Errores al mover", "\n".join(errors[:10]))
+
+        for path in moved:
+            path_str = str(path)
+            item = self._path_to_item.pop(path_str, None)
+            if item is not None:
+                row = self._list.row(item)
+                if row >= 0:
+                    self._list.takeItem(row)
+            self._pixmap_cache.pop(path_str, None)
+
+        remaining = self._list.count()
+        self._lbl_count.setText(f"{remaining} fotos")
+        self._btn_edit.setEnabled(remaining > 0)
+        if moved:
+            self.photos_deleted.emit(moved)
+
+    def _copy_files(self, paths: List[Path], dest: Path) -> None:
+        """Copy files to dest and log each operation (grid items unchanged)."""
+        errors: List[str] = []
+        for path in paths:
+            try:
+                dst_file = unique_dest(path, dest)
+                shutil.copy2(str(path), str(dst_file))
+                self._log.log(str(path.parent), path.name, "copy", str(path), str(dst_file))
+            except Exception as e:
+                errors.append(f"{path.name}: {e}")
+
+        if errors:
+            mb_warning(self, "Errores al copiar", "\n".join(errors[:10]))
 
     def _confirm_and_delete(self, paths: List[Path]) -> None:
         if not paths or not self._current_folder:

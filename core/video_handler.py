@@ -1,0 +1,460 @@
+"""Video metadata reading, writing, and thumbnail extraction via ffmpeg / hachoir."""
+import hashlib
+import json
+import os
+import subprocess
+import tempfile
+from datetime import datetime
+from pathlib import Path
+from typing import Iterator, List, Optional
+
+# ── Extension registry ────────────────────────────────────────────────────────
+
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".3gp", ".m4v", ".wmv"}
+
+# Override these to use a bundled ffmpeg/ffprobe binary
+FFMPEG_CMD  = "ffmpeg"
+FFPROBE_CMD = "ffprobe"
+
+# Camera factory-reset years (same logic as exif_handler)
+_INVALID_YEARS = {2000, 2005}
+
+
+# ── Public helpers ────────────────────────────────────────────────────────────
+
+def is_video(path: Path) -> bool:
+    return path.suffix.lower() in VIDEO_EXTENSIONS
+
+
+def format_duration(seconds: float) -> str:
+    """Format float seconds → 'H:MM:SS' or 'M:SS'."""
+    s = int(seconds)
+    h = s // 3600
+    m = (s % 3600) // 60
+    sec = s % 60
+    if h:
+        return f"{h}:{m:02d}:{sec:02d}"
+    return f"{m}:{sec:02d}"
+
+
+def format_size(size_bytes: int) -> str:
+    """Format byte count as human-readable string."""
+    if size_bytes >= 1_073_741_824:
+        return f"{size_bytes / 1_073_741_824:.1f} GB"
+    if size_bytes >= 1_048_576:
+        return f"{size_bytes / 1_048_576:.1f} MB"
+    if size_bytes >= 1024:
+        return f"{size_bytes / 1024:.0f} KB"
+    return f"{size_bytes} B"
+
+
+# ── Metadata reading ──────────────────────────────────────────────────────────
+
+def get_video_metadata(path: Path) -> dict:
+    """
+    Return a metadata dict for a video file.  Always succeeds — sets
+    'error' key on failure.  Fields:
+      duration_seconds, width, height, fps, codec_video, codec_audio,
+      bitrate, size_bytes, creation_time (datetime|None),
+      date_modified (datetime), date_created (datetime),
+      make, model, rotation, format_name, all_tags, error.
+    """
+    result: dict = {
+        "duration_seconds": 0.0,
+        "width": 0,
+        "height": 0,
+        "fps": 0.0,
+        "codec_video": "",
+        "codec_audio": "",
+        "bitrate": 0,
+        "size_bytes": 0,
+        "creation_time": None,
+        "date_modified": None,
+        "date_created": None,
+        "make": "",
+        "model": "",
+        "rotation": 0,
+        "format_name": "",
+        "all_tags": {},
+        "error": None,
+    }
+
+    # File stats (always available)
+    try:
+        stat = path.stat()
+        result["size_bytes"]    = stat.st_size
+        result["date_modified"] = datetime.fromtimestamp(stat.st_mtime)
+        result["date_created"]  = datetime.fromtimestamp(stat.st_ctime)
+    except OSError as e:
+        result["error"] = str(e)
+        return result
+
+    # Try ffprobe; fall back to hachoir when unavailable
+    if not _read_ffprobe(path, result):
+        _read_hachoir(path, result)
+
+    return result
+
+
+def get_best_date(metadata: dict) -> Optional[datetime]:
+    """Date priority: metadata creation_time → file modification date."""
+    ct = metadata.get("creation_time")
+    if ct:
+        return ct
+    return metadata.get("date_modified")
+
+
+def is_invalid_date(dt: Optional[datetime]) -> bool:
+    """True if the date looks like a camera factory-reset date (or is None)."""
+    if dt is None:
+        return True
+    return dt.year in _INVALID_YEARS and dt.month == 1 and dt.day == 1
+
+
+# ── Metadata writing ──────────────────────────────────────────────────────────
+
+def write_video_date(path: Path, new_dt: datetime) -> None:
+    """
+    Write a new creation_time to video container metadata using ffmpeg -codec copy.
+    Operation is atomic: writes to a temp file then renames over the original.
+    Also updates filesystem modification timestamp via os.utime.
+    Raises RuntimeError on ffmpeg failure.
+    """
+    iso = new_dt.strftime("%Y-%m-%dT%H:%M:%S")
+    tmp_fd, tmp_path = tempfile.mkstemp(
+        dir=str(path.parent), suffix=path.suffix
+    )
+    os.close(tmp_fd)
+    try:
+        cmd = [
+            FFMPEG_CMD, "-y",
+            "-i", str(path),
+            "-metadata", f"creation_time={iso}",
+            "-codec", "copy",
+            "-movflags", "use_metadata_tags",
+            tmp_path,
+        ]
+        proc = subprocess.run(cmd, capture_output=True, timeout=120)
+        if proc.returncode != 0:
+            stderr = proc.stderr.decode("utf-8", errors="replace")
+            raise RuntimeError(f"ffmpeg error: {stderr[-400:]}")
+        os.replace(tmp_path, str(path))
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+    # Best-effort filesystem timestamp sync
+    ts = new_dt.timestamp()
+    try:
+        os.utime(str(path), (ts, ts))
+    except OSError:
+        pass
+
+
+# ── Thumbnail extraction ──────────────────────────────────────────────────────
+
+def get_video_thumbnail(path: Path, size: int = 150) -> Optional[bytes]:
+    """
+    Extract a frame at 00:00:01 as JPEG bytes using ffmpeg.
+    Retries at 00:00:00 for clips shorter than 1 second.
+    Returns None on failure or when ffmpeg is unavailable.
+    """
+    try:
+        cmd = [
+            FFMPEG_CMD, "-y",
+            "-ss", "00:00:01",
+            "-i", str(path),
+            "-vframes", "1",
+            "-vf", f"scale={size}:{size}:force_original_aspect_ratio=decrease",
+            "-f", "image2pipe",
+            "-vcodec", "mjpeg",
+            "-",
+        ]
+        proc = subprocess.run(cmd, capture_output=True, timeout=30)
+        if proc.returncode != 0 or not proc.stdout:
+            # Retry at t=0 (very short clips)
+            cmd[3] = "00:00:00"
+            proc = subprocess.run(cmd, capture_output=True, timeout=30)
+        if proc.stdout:
+            return bytes(proc.stdout)
+        return None
+    except Exception:
+        return None
+
+
+# ── File system helpers ───────────────────────────────────────────────────────
+
+def compute_md5(path: Path, chunk_size: int = 65536) -> str:
+    """MD5 of file contents. Returns '' on error."""
+    h = hashlib.md5()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(chunk_size), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return ""
+
+
+def scan_video_folder(path: Path) -> List[Path]:
+    """Return sorted list of video files in path (non-recursive)."""
+    results: List[Path] = []
+    try:
+        for entry in os.scandir(path):
+            if entry.is_file(follow_symlinks=False):
+                if Path(entry.name).suffix.lower() in VIDEO_EXTENSIONS:
+                    results.append(Path(entry.path))
+    except (OSError, PermissionError):
+        pass
+    return sorted(results, key=lambda p: p.name.lower())
+
+
+def iter_videos_recursive(root_path: Path) -> Iterator[Path]:
+    """Yield all video files under root_path, skipping excluded folders."""
+    from core.file_scanner import EXCLUDED_FOLDERS
+    try:
+        for dirpath, dirnames, filenames in os.walk(
+            root_path, onerror=lambda _: None
+        ):
+            dirnames[:] = [
+                d for d in dirnames
+                if not d.startswith(".") and d not in EXCLUDED_FOLDERS
+            ]
+            for fname in sorted(filenames):
+                if Path(fname).suffix.lower() in VIDEO_EXTENSIONS:
+                    yield Path(dirpath) / fname
+    except (OSError, PermissionError):
+        return
+
+
+def make_dated_filename(
+    dt: datetime,
+    folder: Path,
+    suffix: str,
+    used: Optional[set] = None,
+    original_stem: Optional[str] = None,
+) -> str:
+    """Collision-free filename like 2007-09-29-02h47m07s.mp4."""
+    base = dt.strftime("%Y-%m-%d-%Hh%Mm%Ss")
+    if original_stem:
+        base = f"{base}_{original_stem}"
+    ext  = suffix.lower()
+    used = used if used is not None else set()
+
+    candidate = f"{base}{ext}"
+    if not (folder / candidate).exists() and candidate not in used:
+        return candidate
+    i = 1
+    while True:
+        candidate = f"{base}_{i}{ext}"
+        if not (folder / candidate).exists() and candidate not in used:
+            return candidate
+        i += 1
+
+
+# ── Backup / restore ──────────────────────────────────────────────────────────
+
+BACKUP_FILENAME = ".video_backup.json"
+
+
+def has_video_backup(folder: Path) -> bool:
+    return (folder / BACKUP_FILENAME).exists()
+
+
+def backup_video_metadata(folder: Path, filename: str, metadata: dict) -> None:
+    """Append one entry to folder/.video_backup.json (atomic write, best-effort)."""
+    backup_path = folder / BACKUP_FILENAME
+    try:
+        if backup_path.exists():
+            with open(backup_path, encoding="utf-8") as f:
+                data = json.load(f)
+        else:
+            data = {
+                "_meta": {
+                    "created_at": datetime.now().isoformat(timespec="seconds")
+                }
+            }
+        entry: dict = {}
+        ct = metadata.get("creation_time")
+        if ct:
+            entry["creation_time"] = ct.isoformat()
+        data[filename] = entry
+        _atomic_write_json(backup_path, data)
+    except Exception:
+        pass  # never abort the main operation
+
+
+def restore_video_backup(folder: Path) -> dict:
+    """Restore video metadata from .video_backup.json."""
+    backup_path = folder / BACKUP_FILENAME
+    if not backup_path.exists():
+        return {"ok": 0, "failed": 0, "errors": ["No hay backup de video"]}
+    try:
+        with open(backup_path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        return {"ok": 0, "failed": 0, "errors": [f"Error leyendo backup: {e}"]}
+
+    ok = failed = 0
+    errors: List[str] = []
+    for filename, entry in data.items():
+        if filename.startswith("_"):
+            continue
+        path = folder / filename
+        if not path.exists():
+            errors.append(f"Archivo no encontrado: {filename}")
+            failed += 1
+            continue
+        ct_str = entry.get("creation_time", "")
+        if not ct_str:
+            ok += 1
+            continue
+        try:
+            dt = datetime.fromisoformat(ct_str)
+            write_video_date(path, dt)
+            ok += 1
+        except Exception as e:
+            errors.append(f"{filename}: {e}")
+            failed += 1
+    return {"ok": ok, "failed": failed, "errors": errors}
+
+
+# ── Private helpers ───────────────────────────────────────────────────────────
+
+def _read_ffprobe(path: Path, result: dict) -> bool:
+    """Fill result dict from ffprobe JSON output.  Returns True on success."""
+    try:
+        cmd = [
+            FFPROBE_CMD, "-v", "quiet",
+            "-print_format", "json",
+            "-show_format", "-show_streams",
+            str(path),
+        ]
+        proc = subprocess.run(cmd, capture_output=True, timeout=15, text=True)
+        if proc.returncode != 0:
+            return False
+        data = json.loads(proc.stdout)
+    except Exception:
+        return False
+
+    fmt     = data.get("format", {})
+    streams = data.get("streams", [])
+
+    result["format_name"] = fmt.get("format_name", "").split(",")[0]
+    try:
+        result["duration_seconds"] = float(fmt.get("duration", 0))
+    except (ValueError, TypeError):
+        pass
+    try:
+        result["bitrate"] = int(fmt.get("bit_rate", 0))
+    except (ValueError, TypeError):
+        pass
+
+    fmt_tags = fmt.get("tags", {})
+    result["all_tags"] = fmt_tags
+    _extract_creation_time(fmt_tags, result)
+    result["make"]  = fmt_tags.get("make",  fmt_tags.get("Make",  ""))
+    result["model"] = fmt_tags.get("model", fmt_tags.get("Model", ""))
+
+    for stream in streams:
+        codec_type = stream.get("codec_type", "")
+        if codec_type == "video" and not result["codec_video"]:
+            result["codec_video"] = stream.get("codec_name", "")
+            result["width"]       = stream.get("width",  0)
+            result["height"]      = stream.get("height", 0)
+            fps_str = stream.get("avg_frame_rate", "")
+            if "/" in fps_str:
+                try:
+                    n, d = fps_str.split("/")
+                    result["fps"] = round(float(n) / float(d), 2) if float(d) else 0.0
+                except (ValueError, ZeroDivisionError):
+                    pass
+            # Rotation from side_data_list
+            for sd in stream.get("side_data_list", []):
+                if sd.get("side_data_type") == "Display Matrix":
+                    try:
+                        result["rotation"] = abs(int(sd.get("rotation", 0)))
+                    except (ValueError, TypeError):
+                        pass
+            # Rotation from stream tags
+            rotate_str = stream.get("tags", {}).get("rotate", "")
+            if rotate_str:
+                try:
+                    result["rotation"] = abs(int(rotate_str))
+                except (ValueError, TypeError):
+                    pass
+            if not result["creation_time"]:
+                _extract_creation_time(stream.get("tags", {}), result)
+        elif codec_type == "audio" and not result["codec_audio"]:
+            result["codec_audio"] = stream.get("codec_name", "")
+
+    return True
+
+
+def _read_hachoir(path: Path, result: dict) -> None:
+    """Fill result dict using hachoir (fallback when ffprobe unavailable)."""
+    try:
+        from hachoir.parser import createParser
+        from hachoir.metadata import extractMetadata
+
+        parser = createParser(str(path))
+        if not parser:
+            return
+        with parser:
+            metadata = extractMetadata(parser)
+        if not metadata:
+            return
+
+        if metadata.has("creation_date"):
+            dt = metadata.get("creation_date")
+            if isinstance(dt, datetime):
+                result["creation_time"] = dt
+        if metadata.has("duration"):
+            dur = metadata.get("duration")
+            secs = getattr(dur, "seconds", 0) + getattr(dur, "microseconds", 0) / 1e6
+            result["duration_seconds"] = secs
+        if metadata.has("width"):
+            result["width"] = int(metadata.get("width"))
+        if metadata.has("height"):
+            result["height"] = int(metadata.get("height"))
+        if metadata.has("bit_rate"):
+            result["bitrate"] = int(metadata.get("bit_rate"))
+    except Exception:
+        pass
+
+
+def _extract_creation_time(tags: dict, result: dict) -> None:
+    """Parse creation_time ISO-8601 string from a tags dict."""
+    raw = (tags.get("creation_time") or "").strip()
+    if not raw:
+        return
+    for fmt in (
+        "%Y-%m-%dT%H:%M:%S.%fZ",
+        "%Y-%m-%dT%H:%M:%SZ",
+        "%Y-%m-%dT%H:%M:%S.%f",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+    ):
+        try:
+            result["creation_time"] = datetime.strptime(raw[:26], fmt)
+            return
+        except ValueError:
+            continue
+
+
+def _atomic_write_json(dest: Path, data: dict) -> None:
+    """Write JSON to dest atomically via a temp file in the same directory."""
+    fd, tmp_path = tempfile.mkstemp(dir=str(dest.parent), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, str(dest))
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise

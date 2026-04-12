@@ -1,4 +1,5 @@
 """EXIF Date Manager — entry point."""
+import subprocess
 import sys
 import traceback
 from pathlib import Path
@@ -6,6 +7,23 @@ from pathlib import Path
 from PyQt6.QtWidgets import QApplication, QMessageBox
 from PyQt6.QtGui import QIcon, QPalette, QColor
 from PyQt6.QtCore import Qt
+
+
+def _check_ffmpeg() -> bool:
+    """Return True if the ffmpeg binary is reachable on PATH (or bundled)."""
+    # Also accept a bundled ffmpeg.exe in the project directory
+    bundled = Path(__file__).parent / "ffmpeg.exe"
+    if bundled.exists():
+        return True
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-version"],
+            capture_output=True,
+            timeout=5,
+        )
+        return result.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
 
 
 def apply_dark_theme(app: QApplication) -> None:
@@ -133,9 +151,22 @@ def main():
         app.setWindowIcon(QIcon(str(_ico)))
     sys.excepthook = _global_exception_hook
 
+    # Check for ffmpeg before building the UI (subprocess — safe pre-Qt)
+    ffmpeg_ok = _check_ffmpeg()
+    if not ffmpeg_ok:
+        QMessageBox.warning(
+            None,
+            "FFmpeg no encontrado",
+            "FFmpeg no encontrado en el PATH ni en la carpeta del programa.\n\n"
+            "Las miniaturas de video y la edición de fecha de video no estarán "
+            "disponibles.\n\n"
+            "Descargá ffmpeg desde https://ffmpeg.org y agregalo al PATH, "
+            "o colocá ffmpeg.exe junto a este programa.",
+        )
+
     # Import after QApplication is created (Qt requires it)
     from ui.main_window import MainWindow
-    window = MainWindow()
+    window = MainWindow(ffmpeg_available=ffmpeg_ok)
     window.show()
     sys.exit(app.exec())
 

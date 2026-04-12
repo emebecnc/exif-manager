@@ -33,6 +33,11 @@ ACTION_LABELS = {
     "create_backup":      "Crear backup",
     "rename":             "Renombrar",
     "cleanup":            "Limpieza",
+    "copy":               "Copiar",
+    "move":               "Mover",
+    "move_folder":        "Mover carpeta",
+    "copy_folder":        "Copiar carpeta",
+    "delete_folder":      "Eliminar carpeta",
 }
 
 _ALL_ACTIONS = "Todas"

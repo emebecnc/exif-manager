@@ -4,7 +4,7 @@ import shutil
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from PyQt6.QtCore import Qt, QObject, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QObject, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QApplication, QDialog, QVBoxLayout, QHBoxLayout,
@@ -233,6 +233,8 @@ class CleanupDialog(QDialog):
         self.setWindowTitle("Limpiar carpetas temporales")
         self.setMinimumWidth(760)
         self._build_ui()
+        # Auto-scan the default scope as soon as the event loop starts (first exec() tick)
+        QTimer.singleShot(0, self._on_scan)
 
     # ── Scan-scope property ───────────────────────────────────────────────
 
@@ -280,21 +282,22 @@ class CleanupDialog(QDialog):
             except ValueError:
                 rel_cf = str(self._current_folder)
 
-            self._radio_root = QRadioButton(
-                f"Toda la carpeta raíz  ({self._root.name})"
-            )
             self._radio_current = QRadioButton(
-                f"Solo carpeta actual  ({rel_cf})"
+                f"📁 Carpeta actual: {rel_cf}"
             )
-            self._radio_root.setChecked(True)
+            self._radio_root = QRadioButton(
+                f"📁 Carpeta raíz: {self._root}"
+            )
+            # Default to the current folder (faster, less surprising)
+            self._radio_current.setChecked(True)
 
             self._btn_group = QButtonGroup(self)
-            self._btn_group.addButton(self._radio_root)
             self._btn_group.addButton(self._radio_current)
+            self._btn_group.addButton(self._radio_root)
 
             radio_row = QHBoxLayout()
-            radio_row.addWidget(self._radio_root)
             radio_row.addWidget(self._radio_current)
+            radio_row.addWidget(self._radio_root)
             radio_row.addStretch()
             scope_vbox.addLayout(radio_row)
 
@@ -430,17 +433,16 @@ class CleanupDialog(QDialog):
     # ── Scope helpers ─────────────────────────────────────────────────────
 
     def _update_scope_label(self) -> None:
-        """Refresh the top label to show the current scan scope."""
+        """Refresh the top label to confirm the active scan scope."""
         root = self._scan_root
         if root == self._root:
             self._lbl_scope.setText(
-                f"📁  Carpeta raíz escaneada: {root}\n"
-                "Se buscarán carpetas temporales en todas las subcarpetas."
+                "Se buscarán carpetas y archivos temporales en toda la colección."
             )
         else:
             self._lbl_scope.setText(
-                f"📁  Carpeta escaneada: {root}\n"
-                "Solo se buscará en esta carpeta y sus subcarpetas."
+                "Se buscarán carpetas y archivos temporales solo en esta carpeta "
+                "y sus subcarpetas."
             )
 
     def _on_scope_changed(self) -> None:
@@ -465,8 +467,10 @@ class CleanupDialog(QDialog):
         """Start a background scan for all matching temp items."""
         self._reset_scan_results()
         self._lbl_total.setText("Escaneando…")
+        # Disable all action buttons for the duration of the scan
         self._btn_scan.setEnabled(False)
         self._btn_delete.setEnabled(False)
+        self._btn_close.setEnabled(False)
         self._scan_bar.setVisible(True)
 
         # Disable scope radios while scanning
@@ -479,15 +483,17 @@ class CleanupDialog(QDialog):
         self._current_scan_root = self._scan_root
 
         self._scan_worker = _CleanupScanWorker(self._current_scan_root)
-        self._scan_thread = QThread()
+        self._scan_thread = QThread(self)
         self._scan_worker.moveToThread(self._scan_thread)
 
+        # Thread lifetime pattern (CLAUDE.md): do NOT connect finished→thread.quit here;
+        # _on_scan_finished calls quit()+wait() directly to avoid double-quit.
         self._scan_thread.started.connect(self._scan_worker.run)
         self._scan_worker.item_found.connect(self._on_item_found)
         self._scan_worker.finished.connect(self._on_scan_finished)
-        self._scan_worker.finished.connect(self._scan_thread.quit)
         self._scan_thread.finished.connect(self._cleanup_scan_thread)
 
+        QApplication.processEvents()   # force scan-bar to paint before thread starts
         self._scan_thread.start()
 
     def _on_item_found(self, path: str, size: int, type_key: str) -> None:
@@ -549,14 +555,18 @@ class CleanupDialog(QDialog):
         self._update_total_label()
 
     def _on_scan_finished(self) -> None:
-        """Called when the scan worker signals it is done."""
-        # Stop the thread synchronously before updating the UI (prevents GC crash)
+        """Called when the scan worker signals it is done.
+
+        Calls quit()+wait() before any UI changes so the OS thread is fully
+        stopped before Qt objects it may still reference are touched.
+        """
         if self._scan_thread and self._scan_thread.isRunning():
             self._scan_thread.quit()
             self._scan_thread.wait()
 
         self._scan_bar.setVisible(False)
         self._btn_scan.setEnabled(True)
+        self._btn_close.setEnabled(True)
 
         # Re-enable scope radios
         if self._radio_root:
@@ -578,13 +588,29 @@ class CleanupDialog(QDialog):
             )
 
     def _cleanup_scan_thread(self) -> None:
-        """Schedule scan worker/thread for safe deferred deletion."""
+        """Stop (if still running) and schedule scan worker/thread for deletion.
+
+        Safe to call from thread.finished signal (thread already stopped) or
+        directly (e.g. from reject()) when we need to force-stop an in-progress scan.
+        Uses a 5 s wait then terminate() as a last-resort fallback for the
+        os.walk loop which cannot be interrupted cooperatively.
+        """
+        if self._scan_thread:
+            if self._scan_thread.isRunning():
+                self._scan_thread.quit()
+                if not self._scan_thread.wait(5000):
+                    self._scan_thread.terminate()
+                    self._scan_thread.wait()
+            self._scan_thread.deleteLater()
+            self._scan_thread = None
         if self._scan_worker:
             self._scan_worker.deleteLater()
             self._scan_worker = None
-        if self._scan_thread:
-            self._scan_thread.deleteLater()
-            self._scan_thread = None
+
+    def reject(self) -> None:
+        """Override to stop any running scan thread before closing the dialog."""
+        self._cleanup_scan_thread()
+        super().reject()
 
     # ── Delete ────────────────────────────────────────────────────────────
 

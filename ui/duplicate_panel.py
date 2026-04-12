@@ -387,6 +387,15 @@ class DuplicatePanel(QWidget):
 
     # ── Public API ─────────────────────────────────────────────────────────
 
+    def on_folder_changed(self, folder: Path) -> None:
+        """Slot connected to MainWindow.folder_changed signal.
+
+        Updates the current folder scope used by 'Buscar duplicados en carpeta
+        actual'.  Does NOT start a scan automatically — the user must press the
+        button explicitly.
+        """
+        self.set_current_folder(folder)
+
     def set_root(self, root: Optional[Path]) -> None:
         self._root = root
         self._update_button_states()

@@ -182,25 +182,23 @@ class PhotoDetailPanel(QWidget):
         apply_button_style(self._btn_edit)
         btn_row.addWidget(self._btn_edit)
 
-        self._btn_rename = QPushButton("Renombrar con fecha EXIF")
-        self._btn_rename.setEnabled(False)
-        self._btn_rename.setToolTip(
-            "Renombra el archivo usando la fecha EXIF actual en formato\n"
-            "2011-12-24-15h40m46s.jpg. Si ya existe un archivo con ese nombre,\n"
-            "agrega _1, _2, etc. para evitar colisiones."
-        )
-        self._btn_rename.clicked.connect(self._on_rename)
-        apply_button_style(self._btn_rename)
-        btn_row.addWidget(self._btn_rename)
-
         layout.addLayout(btn_row)
 
     # ── Public API ─────────────────────────────────────────────────────────
 
+    def on_folder_changed(self, folder: Path) -> None:
+        """Slot connected to MainWindow.folder_changed.
+
+        When the user navigates to a new folder the detail panel is cleared so
+        it doesn't show stale metadata from the previous folder.  Actual photo
+        loading happens later via load_photo() when the user clicks a thumbnail.
+        """
+        self._current_path = None
+        self.clear()
+
     def load_photo(self, path: Path) -> None:
         self._current_path = path
         self._btn_edit.setEnabled(True)
-        self._btn_rename.setEnabled(True)
         self._load_metadata(path)
         self._load_preview_async(path)
 
@@ -215,7 +213,6 @@ class PhotoDetailPanel(QWidget):
         self._clear_form(self._form_exif)
         self._clear_form(self._form_file)
         self._btn_edit.setEnabled(False)
-        self._btn_rename.setEnabled(False)
 
     def show_selection(self, pairs: list) -> None:
         """Display a summary for multiple selected photos.
@@ -228,7 +225,6 @@ class PhotoDetailPanel(QWidget):
         self._current_path = None
         self._original_pixmap = None
         self._btn_edit.setEnabled(False)
-        self._btn_rename.setEnabled(False)
 
         n = len(pairs)
         self._preview.clear()

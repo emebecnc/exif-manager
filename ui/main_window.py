@@ -3,7 +3,7 @@ from collections import deque
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import Qt, QSettings, QStandardPaths
+from PyQt6.QtCore import Qt, QSettings, QStandardPaths, pyqtSignal
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QSplitter, QVBoxLayout,
     QMenuBar, QStatusBar, QMessageBox, QProgressDialog,
@@ -17,11 +17,17 @@ from ui.folder_tree import FolderTreePanel
 from ui.thumbnail_grid import ThumbnailGrid
 from ui.photo_detail import PhotoDetailPanel
 from ui.duplicate_panel import DuplicatePanel
+from ui.video_grid import VideoPanel
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    # Emitted whenever the user selects a folder in the shared tree.
+    # All tabs listen to this signal via their on_folder_changed(Path) slot.
+    folder_changed = pyqtSignal(Path)
+
+    def __init__(self, ffmpeg_available: bool = True):
         super().__init__()
+        self._ffmpeg_available = ffmpeg_available
         self.setWindowTitle("EXIF Date Manager")
         self.resize(1400, 800)
 
@@ -69,11 +75,15 @@ class MainWindow(QMainWindow):
         self._center_tabs.setDocumentMode(True)
         self._center_tabs.setStyleSheet(TAB_STYLE)
 
-        self._thumbnail_grid = ThumbnailGrid(self._log, self)
+        self._thumbnail_grid  = ThumbnailGrid(self._log, self)
         self._duplicate_panel = DuplicatePanel(self._log, self)
+        self._video_panel     = VideoPanel(
+            self._log, ffmpeg_available=self._ffmpeg_available, parent=self
+        )
 
-        self._center_tabs.addTab(self._thumbnail_grid, "📷  Fotos")
+        self._center_tabs.addTab(self._thumbnail_grid,  "📷  Fotos")
         self._center_tabs.addTab(self._duplicate_panel, "🔍  Duplicados")
+        self._center_tabs.addTab(self._video_panel,     "🎬  Videos")
 
         self._content_splitter.addWidget(self._center_tabs)
         self._content_splitter.addWidget(self._photo_detail)
@@ -174,8 +184,24 @@ class MainWindow(QMainWindow):
         tools_menu.addAction(action_cleanup)
 
     def _wire_signals(self) -> None:
-        # Folder selection → load thumbnails
+        # Folder selection → update state + broadcast to all tabs
         self._folder_tree.folder_selected.connect(self._on_folder_selected)
+
+        # Broadcast folder changes to all tabs.
+        # Each tab will grow a proper on_folder_changed(Path) slot; until then
+        # we call the existing per-tab APIs directly via lambdas so the app
+        # keeps working while each tab is progressively refactored.
+        self.folder_changed.connect(self._on_folder_changed_photos)
+        self.folder_changed.connect(self._on_folder_changed_videos)
+        self.folder_changed.connect(self._on_folder_changed_duplicates)
+
+        # Forward shared-tree file-move events to the video panel so its grid
+        # reloads when files are drag-dropped while the Videos tab is visible.
+        self._folder_tree.files_moved.connect(self._on_files_moved_videos)
+
+        # When a new folder is created inside the video grid, reveal it in
+        # the shared folder tree (previously handled inside VideoPanel itself).
+        self._video_panel.folder_created.connect(self._folder_tree.reveal_folder)
 
         # Photo selection → show detail
         self._thumbnail_grid.photo_selected.connect(self._on_photo_selected)
@@ -227,10 +253,29 @@ class MainWindow(QMainWindow):
     # ── Slots ──────────────────────────────────────────────────────────────
 
     def _on_folder_selected(self, path: Path) -> None:
+        """Slot connected to the shared FolderTreePanel.folder_selected signal."""
         self._current_folder = path
-        self._thumbnail_grid.load_folder(path)
         self._status_bar.showMessage(str(path))
-        self._duplicate_panel.set_current_folder(path)
+        # Broadcast to all tabs through the shared signal
+        self.folder_changed.emit(path)
+
+    # ── Per-tab folder-change adapters (replaced by on_folder_changed slots) ──
+
+    def _on_folder_changed_photos(self, path: Path) -> None:
+        """Forward folder change to the photos tab."""
+        self._thumbnail_grid.on_folder_changed(path)
+
+    def _on_folder_changed_videos(self, path: Path) -> None:
+        """Forward folder change to the videos tab."""
+        self._video_panel.on_folder_changed(path)
+
+    def _on_folder_changed_duplicates(self, path: Path) -> None:
+        """Forward folder change to the duplicates tab."""
+        self._duplicate_panel.on_folder_changed(path)
+
+    def _on_files_moved_videos(self, src_folder: Path, moved: list) -> None:
+        """Forward shared-tree file-move events to the video panel."""
+        self._video_panel.on_files_moved(src_folder, moved)
 
     def _on_photo_selected(self, path: Path) -> None:
         self._current_photo = path
