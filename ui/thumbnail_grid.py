@@ -8,9 +8,9 @@ from pathlib import Path
 from typing import Optional, List, Dict
 
 from PyQt6.QtCore import (
-    Qt, pyqtSignal, QObject, QThread, QSize, QEvent, QMimeData, QUrl,
+    Qt, pyqtSignal, QObject, QThread, QSize, QEvent,
 )
-from PyQt6.QtGui import QPixmap, QColor, QPen, QBrush, QAction, QDrag
+from PyQt6.QtGui import QPixmap, QColor, QPen, QBrush, QAction
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QComboBox,
     QListWidget, QListWidgetItem, QAbstractItemView, QStyledItemDelegate,
@@ -82,41 +82,6 @@ def _thumb_cache_key(path_str: str, mtime: float) -> str:
     """MD5 key for a thumbnail cache entry: encodes path + modification time."""
     data = f"{path_str}|{mtime:.6f}".encode("utf-8")
     return hashlib.md5(data).hexdigest()
-
-
-class _DraggableList(QListWidget):
-    """QListWidget subclass that produces proper file-URL drag payloads."""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setDragEnabled(True)
-        self.setDragDropMode(QAbstractItemView.DragDropMode.DragOnly)
-        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.viewport().setAcceptDrops(False)
-
-    def startDrag(self, supported_actions) -> None:
-        selected = self.selectedItems()
-        if not selected:
-            return
-
-        mime = QMimeData()
-        mime.setUrls([
-            QUrl.fromLocalFile(item.data(_ROLE_PATH))
-            for item in selected
-            if item.data(_ROLE_PATH)
-        ])
-
-        # Use the first item's thumbnail as drag icon; fall back to solid tile
-        pixmap = selected[0].icon().pixmap(64, 64)
-        if pixmap.isNull():
-            pixmap = QPixmap(64, 64)
-            pixmap.fill(QColor(80, 80, 90))
-
-        drag = QDrag(self)
-        drag.setMimeData(mime)
-        drag.setPixmap(pixmap)
-        drag.setHotSpot(pixmap.rect().center())
-        drag.exec(Qt.DropAction.MoveAction | Qt.DropAction.CopyAction)
 
 
 class _ThumbnailWorker(QObject):
@@ -259,8 +224,9 @@ class ThumbnailGrid(QWidget):
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(4)
 
-        # List widget in icon mode (subclass handles drag)
-        self._list = _DraggableList()
+        # List widget in icon mode
+        self._list = QListWidget()
+        self._list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self._list.setViewMode(QListWidget.ViewMode.IconMode)
         self._list.setIconSize(QSize(_THUMB_SIZE, _THUMB_SIZE))
         self._list.setGridSize(QSize(_ITEM_W, _ITEM_H))

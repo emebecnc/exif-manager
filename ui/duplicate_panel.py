@@ -245,7 +245,23 @@ class _PhotoCard(QFrame):
         self._apply_badge_style()
         layout.addWidget(self._badge)
 
-        # 3. Info rows
+        # 3. Action buttons — directly below badge
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(4)
+        self._btn_keep   = QPushButton("✓ Conservar")
+        self._btn_delete = QPushButton("🗑 Eliminar")
+        self._btn_keep.setFixedHeight(28)
+        self._btn_delete.setFixedHeight(28)
+        btn_row.addWidget(self._btn_keep)
+        btn_row.addWidget(self._btn_delete)
+        layout.addLayout(btn_row)
+
+        self._btn_keep.clicked.connect(self._on_keep)
+        self._btn_delete.clicked.connect(self._on_delete)
+
+        layout.addStretch()
+
+        # 4. Info rows
         def _info_row(key: str, value: str) -> QHBoxLayout:
             row = QHBoxLayout()
             row.setSpacing(4)
@@ -301,22 +317,6 @@ class _PhotoCard(QFrame):
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
         layout.addWidget(path_lbl)
-
-        layout.addStretch()
-
-        # 5. Action buttons — connected to instance methods, no loop-closure risk
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(4)
-        self._btn_keep   = QPushButton("✓ Conservar")
-        self._btn_delete = QPushButton("🗑 Eliminar")
-        self._btn_keep.setFixedHeight(28)
-        self._btn_delete.setFixedHeight(28)
-        btn_row.addWidget(self._btn_keep)
-        btn_row.addWidget(self._btn_delete)
-        layout.addLayout(btn_row)
-
-        self._btn_keep.clicked.connect(self._on_keep)
-        self._btn_delete.clicked.connect(self._on_delete)
 
         self._apply_visual()
 
@@ -432,6 +432,22 @@ class _VideoCard(QFrame):
         self._badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self._badge)
 
+        # Action buttons — directly below badge
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(4)
+        self._btn_keep   = QPushButton("✓ Conservar")
+        self._btn_delete = QPushButton("🗑 Eliminar")
+        self._btn_keep.setFixedHeight(28)
+        self._btn_delete.setFixedHeight(28)
+        btn_row.addWidget(self._btn_keep)
+        btn_row.addWidget(self._btn_delete)
+        layout.addLayout(btn_row)
+
+        self._btn_keep.clicked.connect(self._on_keep)
+        self._btn_delete.clicked.connect(self._on_delete)
+
+        layout.addStretch()
+
         # Info rows helper (same style as _PhotoCard)
         def _info_row(key: str, value: str) -> QHBoxLayout:
             row = QHBoxLayout()
@@ -490,22 +506,6 @@ class _VideoCard(QFrame):
         path_lbl.setWordWrap(True)
         path_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(path_lbl)
-
-        layout.addStretch()
-
-        # Action buttons
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(4)
-        self._btn_keep   = QPushButton("✓ Conservar")
-        self._btn_delete = QPushButton("🗑 Eliminar")
-        self._btn_keep.setFixedHeight(28)
-        self._btn_delete.setFixedHeight(28)
-        btn_row.addWidget(self._btn_keep)
-        btn_row.addWidget(self._btn_delete)
-        layout.addLayout(btn_row)
-
-        self._btn_keep.clicked.connect(self._on_keep)
-        self._btn_delete.clicked.connect(self._on_delete)
 
         self._apply_visual()
 
@@ -625,10 +625,18 @@ class DuplicatePanel(QWidget):
         Updates the current folder scope and auto-selects the FOTOS or VIDEOS
         toggle based on which media type dominates in the folder.
         Does NOT start a scan automatically — the user must press the button.
+        Does NOT switch media type while there are active scan results — that
+        would clear self._groups and silently break the Conservar button.
         """
         self.set_current_folder(folder)
 
-        # Auto-detect dominant media type (FIX 3)
+        # Don't auto-switch while the user has active scan results to review.
+        # set_media_type() calls _restore_groups_display() which clears _groups;
+        # any Conservar click after that hits the guard and silently does nothing.
+        if self._groups:
+            return
+
+        # Auto-detect dominant media type
         _PHOTO_EXT = {".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp"}
         photo_count = _count_files_with_extensions(folder, _PHOTO_EXT)
         video_count = _count_files_with_extensions(folder, VIDEO_EXTENSIONS)
@@ -771,12 +779,12 @@ class DuplicatePanel(QWidget):
         # ── Media type toggle ─────────────────────────────────────────────
         toggle_row = QHBoxLayout()
         toggle_row.setSpacing(2)
-        self._btn_toggle_photo = QPushButton("📷 Fotos")
+        self._btn_toggle_photo = QPushButton("Fotos")
         self._btn_toggle_photo.setCheckable(True)
         self._btn_toggle_photo.setChecked(True)
-        self._btn_toggle_video = QPushButton("🎬 Videos")
+        self._btn_toggle_video = QPushButton("Videos")
         self._btn_toggle_video.setCheckable(True)
-        self._btn_toggle_all   = QPushButton("🔀 Duplicados")
+        self._btn_toggle_all   = QPushButton("Duplicados")
         self._btn_toggle_all.setCheckable(True)
         self._btn_toggle_photo.setToolTip("Buscar duplicados de fotos")
         self._btn_toggle_video.setToolTip("Buscar duplicados de videos")
@@ -1053,9 +1061,7 @@ class DuplicatePanel(QWidget):
             self._show_group(row)
 
     def _show_group(self, group_idx: int) -> None:
-        print(f"DEBUG: _show_group({group_idx})")
         if group_idx < 0 or group_idx >= len(self._groups):
-            print(f"  ERROR: group_idx {group_idx} out of range (len={len(self._groups)})")
             return
 
         group = self._groups[group_idx]
@@ -1107,8 +1113,10 @@ class DuplicatePanel(QWidget):
     def _on_card_keep(self, path_obj: object, group_idx: int) -> None:
         """User clicked 'Conservar' — immediately move every other file in the group
         to _duplicados_eliminados/, remove the group from the list, and advance."""
+        print(f"[Conservar] clicked: group_idx={group_idx}, groups={len(self._groups)}, path={path_obj}")
         path = path_obj if isinstance(path_obj, Path) else Path(path_obj)
         if group_idx >= len(self._groups):
+            print(f"[Conservar] GUARD FIRED — group_idx {group_idx} >= {len(self._groups)} groups. Bug!")
             return
 
         group    = self._groups[group_idx]
@@ -1137,6 +1145,7 @@ class DuplicatePanel(QWidget):
             except Exception as exc:
                 errors.append(f"{p.name}: {exc}")
 
+        print(f"[Conservar] to_trash={len(to_trash)}, deleted={deleted}, errors={errors}")
         # Remove group from list + state; auto-advances to next group (or shows empty)
         self._remove_group(group_idx)
 

@@ -90,9 +90,9 @@ class MainWindow(QMainWindow):
             self._log, ffmpeg_available=self._ffmpeg_available, parent=self
         )
 
-        self._center_tabs.addTab(self._thumbnail_grid,  "📷  Fotos")
-        self._center_tabs.addTab(self._duplicate_panel, "🔍  Duplicados")
-        self._center_tabs.addTab(self._video_panel,     "🎬  Videos")
+        self._center_tabs.addTab(self._thumbnail_grid,  "Fotos")
+        self._center_tabs.addTab(self._video_panel,     "Videos")
+        self._center_tabs.addTab(self._duplicate_panel, "Duplicados")
 
         self._content_splitter.addWidget(self._center_tabs)
         self._content_splitter.addWidget(self._photo_detail)
@@ -258,7 +258,7 @@ class MainWindow(QMainWindow):
 
         # Switch to duplicates tab when a scan starts
         self._duplicate_panel.scan_started.connect(
-            lambda: self._center_tabs.setCurrentIndex(1)
+            lambda: self._center_tabs.setCurrentIndex(2)
         )
 
         # Tab switching: update duplicate panel media type + clear stale detail panel
@@ -288,13 +288,13 @@ class MainWindow(QMainWindow):
         self._duplicate_panel.on_folder_changed(path)
 
     def _on_center_tab_changed(self, index: int) -> None:
-        """Called when the user switches between Photos / Duplicates / Videos tabs.
+        """Called when the user switches between Fotos / Videos / Duplicados tabs.
 
-        - Photos (0): show detail panel; tell duplicate panel we're in photo mode.
-        - Duplicates (1): hide detail panel (metadata shown per-card inside the panel).
-        - Videos (2): hide detail panel; tell duplicate panel video mode; clear stale image.
+        - Fotos (0): show detail panel; tell duplicate panel we're in photo mode.
+        - Videos (1): hide detail panel; tell duplicate panel video mode; clear stale image.
+        - Duplicados (2): hide detail panel (metadata shown per-card inside the panel).
         """
-        if index == 0:   # Photos tab
+        if index == 0:   # Fotos tab
             self._duplicate_panel.set_media_type("photo")
             # Restore detail panel if it was hidden by another tab
             if not self._photo_detail.isVisible():
@@ -304,11 +304,11 @@ class MainWindow(QMainWindow):
                 w = self._detail_panel_width
                 self._content_splitter.setSizes([max(400, total - w), w])
         else:
-            # Duplicados (1) and Videos (2): hide the detail panel
+            # Videos (1) and Duplicados (2): hide the detail panel
             if self._photo_detail.isVisible():
                 self._detail_panel_width = self._content_splitter.sizes()[1]
                 self._photo_detail.hide()
-            if index == 2:  # Videos tab
+            if index == 1:  # Videos tab
                 self._duplicate_panel.set_media_type("video")
                 # Clear photo detail — its image would otherwise appear "stuck"
                 # while the user is browsing the Videos tab.

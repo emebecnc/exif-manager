@@ -1,6 +1,6 @@
 # EXIF Manager — CLAUDE.md
 
-**Last updated:** 2026-04-12 (session 22)
+**Last updated:** 2026-04-12 (session 25)
 **Repo:** github.com/emebecnc/exif-manager
 **Local:** D:\homelab\exif_manager\
 
@@ -589,3 +589,60 @@ object → Windows exception code -805306369 (`QThread: Destroyed while thread i
 - **`_on_item_clicked`**: added `_apply_backup_indicator()` call so green marker appears on first click
 - **Net effect**: file counts and backup indicators still show — just load on first click instead of at startup
 - `refresh_item()` unchanged — still does full update after edits
+
+---
+
+## Session changes: Cleanup old/debug files (session 23 — PRODUCTION)
+
+### Deleted
+- `run_exif_manager.bat` — superseded by `run.cmd`
+- `launch_exif_manager.ps1` — unused PowerShell launcher
+- `launch_app.cmd` — unused CMD wrapper
+- `start_app.vbs` — unused VBScript launcher
+- `debug_app.py` — debug-only script
+- `error_log.txt` — was already absent
+
+### Kept
+- `run.cmd` — working launcher (double-click to start app)
+- All source code, README.md, CLAUDE.md
+
+### Project state: PRODUCTION READY ✅
+Launcher: `run.cmd`
+Entry point: `main.py`
+
+---
+
+## Session changes: Fix Conservar button (session 24)
+
+### Root cause identified
+
+`on_folder_changed()` auto-detected media type on every folder click. If the new folder
+had a different dominant media type, it called `set_media_type()` → `_restore_groups_display([], {})`
+→ **`self._groups` cleared**. Old cards remained in `_comparison_scroll` (hidden by `_right_stack`
+switching to index 0). When user clicked Conservar on a card, `_on_card_keep` hit:
+`if group_idx >= len(self._groups): return` → **silent return, nothing happened**.
+
+### Fix — `ui/duplicate_panel.py`
+
+- **`on_folder_changed()`**: added early `return` when `self._groups` is non-empty.
+  Auto media-type detection now only runs when there are no active scan results.
+  Once user finishes reviewing (all groups processed), auto-detect resumes normally.
+
+- **`_show_group()`**: removed stale `print(f"DEBUG: _show_group...")` left from prior session.
+
+- **`_on_card_keep()`**: added debug prints:
+  - On entry: `[Conservar] clicked: group_idx=N, groups=M, path=...`
+  - On guard fire: `[Conservar] GUARD FIRED — bug!`
+  - After move loop: `[Conservar] to_trash=N, deleted=M, errors=[...]`
+  → Run app, click Conservar, check console output to confirm fix works.
+
+---
+
+## Session changes: Move buttons below badge in duplicate cards (session 25)
+
+- **`ui/duplicate_panel.py`** — `_PhotoCard` and `_VideoCard` layout reordered:
+  - **Before**: thumb → badge → metadata → path → stretch → buttons (buttons hidden at bottom)
+  - **After**: thumb → badge → **buttons** → stretch → metadata → path
+  - Buttons are now directly visible below the ★ Conservar / Duplicado label
+  - `addStretch()` pushes metadata below buttons — always need to scroll to read metadata,
+    but action buttons are always immediately reachable without scrolling
