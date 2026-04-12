@@ -1,6 +1,6 @@
 # EXIF Manager — CLAUDE.md
 
-**Last updated:** 2026-04-12 (session 13)
+**Last updated:** 2026-04-12 (session 22)
 **Repo:** github.com/emebecnc/exif-manager
 **Local:** D:\homelab\exif_manager\
 
@@ -40,6 +40,7 @@ Signal: FolderTree folder_changed(Path) → all tabs' on_folder_changed() slots
 - Drag & drop to tree
 - Backup (.exif_backup.json) + history
 - Duplicates by MD5 + trash folder
+- Move via "Mover a..." context menu
 - Cleanup tool
 - Log viewer
 
@@ -98,7 +99,7 @@ Config: main.py, build.spec, requirements.txt, run_exif_manager.bat
 ✅ Video backup → _video_backup.json created
 ✅ Video duplicates → _duplicados_eliminados works
 ✅ Cleanup threading → no double-quit race
-✅ Drag & drop → verified OK
+✅ Drag & drop removed from thumbnail grid (use "Mover a..." menu)
 ✅ Conservar button → immediate deletion + auto-advance
 ✅ Right panel hidden in Duplicados and Videos tabs
 ✅ Duplicate cards show complete EXIF / video metadata
@@ -471,3 +472,120 @@ object → Windows exception code -805306369 (`QThread: Destroyed while thread i
   - `_PhotoCard._info_row`: key + value label `font-size: 9px` → `11px`; key `setMinimumWidth` 44 → 72
   - `_VideoCard._info_row`: key + value label `font-size: 9px` → `11px`; key `setMinimumWidth` 60 → 80
   - Path labels (selectable full path at card bottom) kept at `8px` — reference-only, smaller is correct
+
+---
+
+## Session changes: Folder counters, remove drag & drop, README (session 14 — FINAL)
+
+### Files modified
+
+- **`ui/folder_tree.py`** — FIX 1 (folder counters always show V):
+  - `_update_item_label()`: removed `if videos:` branch — label is always `f"{name}  ({photos}) V({videos})"`
+  - `_make_item()`: same — always shows V(n) even when 0
+  - Counting already used `IMAGE_EXTENSIONS` and `VIDEO_EXTENSIONS` correctly; only label format changed
+
+- **`ui/thumbnail_grid.py`** — FIX 2 (remove drag & drop from grid):
+  - Removed entire `_DraggableList` subclass (34 lines) — no more `setDragEnabled`, `startDrag`, `QDrag`
+  - Replaced `self._list = _DraggableList()` → `self._list = QListWidget()` + explicit `setSelectionMode(ExtendedSelection)`
+  - Removed unused imports: `QMimeData`, `QUrl` from `PyQt6.QtCore`; `QDrag` from `PyQt6.QtGui`
+  - Users move photos via "Mover a..." context menu (in `folder_tree.py` / `_DropTree`) — fully functional
+  - `QEvent` kept (used by `eventFilter` for Delete key handling)
+
+- **`README.md`** — already present from session 13, no changes needed
+
+### APP STATUS: DONE ✅
+
+---
+
+## Session changes: Remove emojis from duplicate panel toggle buttons (session 15)
+
+### Files modified
+
+- **`ui/duplicate_panel.py`** — toggle button labels:
+  - `"📷 Fotos"` → `"Fotos"`
+  - `"🎬 Videos"` → `"Videos"`
+  - `"🔀 Duplicados"` → `"Duplicados"`
+
+- **`ui/folder_tree.py`** — no change needed (already correct from session 14):
+  - Counting uses `_IMAGE_EXTENSIONS` and `_VIDEO_EXTENSIONS` ✅
+  - Label always shows `({photos}) V({videos})` ✅
+
+---
+
+## Session changes: Tab order, folder counters fix (session 16)
+
+### Files modified
+
+- **`ui/main_window.py`** — tab reorder + index updates:
+  - Tab order changed: `Fotos(0) → Duplicados(1) → Videos(2)` → `Fotos(0) → Videos(1) → Duplicados(2)`
+  - Removed emojis from tab labels: `"📷  Fotos"` → `"Fotos"`, `"🎬  Videos"` → `"Videos"`, `"🔍  Duplicados"` → `"Duplicados"`
+  - `scan_started` connection: `setCurrentIndex(1)` → `setCurrentIndex(2)` (Duplicados now at index 2)
+  - `_on_center_tab_changed`: updated index logic — Videos now index 1 (was 2), Duplicados now index 2 (was 1)
+
+- **`ui/folder_tree.py`** — rewrite counting to use `path.glob("*")`:
+  - `_count_photos` and `_count_videos` now use `path.glob("*")` + `f.is_file()` instead of `os.scandir` + `entry.is_file(follow_symlinks=False)`
+  - Root cause of (0) bug: `follow_symlinks=False` on Windows can incorrectly classify regular files on certain path types (UNC, junctions)
+  - `_IMAGE_EXTENSIONS` and `_VIDEO_EXTENSIONS` constants unchanged
+
+- **`ui/duplicate_panel.py`** — no change (already correct from session 15)
+
+---
+
+## Session changes: Fix run_exif_manager.bat (session 17)
+
+- **`run_exif_manager.bat`** — replaced broken venv-detection script with simple launcher:
+  ```batch
+  @echo off
+  cd /d D:\homelab\exif_manager
+  python main.py
+  pause
+  ```
+  Old version tried to activate `venv\Scripts\activate.bat` (venv doesn't exist) and had no `pause` on success, so errors were invisible.
+
+---
+
+## Session changes: Fix run_exif_manager.bat — auto-detect python.exe (session 18)
+
+- **`run_exif_manager.bat`** — replaced hardcoded `python` call with `where python` auto-detection:
+  - Uses `for /f` loop over `where python` output to resolve full path to `python.exe`
+  - Exits with clear error message if Python not found in PATH
+  - Runs `main.py` via full resolved path — avoids PATH lookup failures on double-click
+
+---
+
+## Session changes: Fix run_exif_manager.bat — hardcoded Python310 path (session 19)
+
+- **`run_exif_manager.bat`** — simplified to hardcoded full path:
+  - Detected installed version: `Python310` (not 311 as initially assumed)
+  - Path: `C:\Users\%USERNAME%\AppData\Local\Programs\Python\Python310\python.exe`
+  - Uses `%USERNAME%` so it works for any user on this machine
+
+---
+
+## Session changes: Fix launchers — hardcoded Python310 path for user MB (session 20)
+
+- Verified: `python` is in PATH (Python 3.10.10) and `C:\Users\MB\AppData\Local\Programs\Python\Python310\python.exe` exists
+- **`run_exif_manager.bat`** — uses hardcoded full path to python.exe (avoids cmd.exe PATH lookup failures on double-click):
+  `C:\Users\MB\AppData\Local\Programs\Python\Python310\python.exe main.py`
+- **`start_app.vbs`** (NEW) — alternative VBScript launcher using same full path, `Run(..., 1)` keeps window visible
+
+---
+
+## Session changes: Three new launchers (session 21)
+
+- **`run.cmd`** — simplest: `start python main.py` opens app in new process, cmd exits immediately
+- **`launch_exif_manager.ps1`** — PowerShell script with execution policy bypass
+- **`launch_app.cmd`** — CMD wrapper that calls the .ps1 via `powershell -ExecutionPolicy Bypass`
+- Try in order: `run.cmd` first (simplest), then `launch_app.cmd` if that fails
+
+---
+
+## Session changes: Fix startup slowness — lazy folder tree (session 22)
+
+- **`ui/folder_tree.py`** — `_make_item()` rewritten:
+  - **Before**: counted photos + videos (`path.glob("*")` × 2) + checked backup (`has_backup()`) for every tree item created
+  - **After**: creates item with just `path.name`, no disk I/O at creation time
+  - Root cause of 2-min startup: `load_root` expands root → `_on_item_expanded` calls `_make_item` for every child → N subfolders × (2 globs + 1 backup check) = hundreds of disk scans before window appears
+- **`_on_item_clicked`**: added `_apply_backup_indicator()` call so green marker appears on first click
+- **Net effect**: file counts and backup indicators still show — just load on first click instead of at startup
+- `refresh_item()` unchanged — still does full update after edits

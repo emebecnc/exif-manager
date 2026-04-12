@@ -15,7 +15,11 @@ from PyQt6.QtWidgets import (
 
 from core.backup_manager import has_backup, append_historial
 from core.exif_handler import read_exif
-from core.file_scanner import count_images, list_subdirs, root_is_available, unique_dest
+from core.file_scanner import (
+    IMAGE_EXTENSIONS as _IMAGE_EXTENSIONS,
+    EXCLUDED_FOLDERS as _EXCLUDED_FOLDERS,
+    list_subdirs, root_is_available, unique_dest,
+)
 from core.video_handler import VIDEO_EXTENSIONS as _VIDEO_EXTENSIONS
 from ui.styles import mb_warning, mb_question
 
@@ -169,9 +173,10 @@ class FolderTreePanel(QWidget):
         self._tree.expandItem(root_item)
 
     def refresh_item(self, folder_path: Path) -> None:
-        """Refresh backup indicator for an item matching folder_path."""
+        """Refresh backup indicator and file counts for an item matching folder_path."""
         item = self._find_item(folder_path)
         if item:
+            self._update_item_label(item, folder_path)
             self._apply_backup_indicator(item, folder_path)
 
     def reveal_folder(self, folder_path: Path) -> None:
@@ -205,26 +210,37 @@ class FolderTreePanel(QWidget):
 
     # ── Tree building ──────────────────────────────────────────────────────
 
+    def _count_photos(self, path: Path) -> int:
+        """Count image files in *path* (non-recursive, best-effort)."""
+        try:
+            return sum(
+                1 for f in path.glob("*")
+                if f.is_file() and f.suffix.lower() in _IMAGE_EXTENSIONS
+            )
+        except (PermissionError, OSError):
+            return 0
+
     def _count_videos(self, path: Path) -> int:
         """Count video files in *path* (non-recursive, best-effort)."""
-        count = 0
         try:
-            for entry in os.scandir(path):
-                if entry.is_file(follow_symlinks=False):
-                    if Path(entry.name).suffix.lower() in _VIDEO_EXTENSIONS:
-                        count += 1
+            return sum(
+                1 for f in path.glob("*")
+                if f.is_file() and f.suffix.lower() in _VIDEO_EXTENSIONS
+            )
         except (PermissionError, OSError):
-            pass
-        return count
+            return 0
+
+    def _update_item_label(self, item: QTreeWidgetItem, path: Path) -> None:
+        """Refresh the display label for *item* by re-counting files on disk."""
+        photos = self._count_photos(path)
+        videos = self._count_videos(path)
+        label = f"{path.name}  ({photos}) V({videos})"
+        item.setText(0, label)
 
     def _make_item(self, path: Path) -> QTreeWidgetItem:
-        photos = count_images(path)
-        videos = self._count_videos(path)
-        if videos:
-            label = f"{path.name}  ({photos}) V({videos})"
-        else:
-            label = f"{path.name}  ({photos})"
-        item = QTreeWidgetItem([label])
+        # No file counting or backup check here — kept lazy so startup is instant.
+        # Counts and backup indicator are applied in _on_item_clicked / refresh_item.
+        item = QTreeWidgetItem([path.name])
         item.setData(0, Qt.ItemDataRole.UserRole, str(path))
 
         # Folder icon
@@ -233,7 +249,8 @@ class FolderTreePanel(QWidget):
         )
         item.setIcon(0, folder_icon)
 
-        self._apply_backup_indicator(item, path)
+        # Default text color (no backup check at creation time)
+        item.setForeground(0, QBrush(QColor(220, 220, 225)))
 
         # Add placeholder child so expand arrow appears if there are subdirs
         subdirs = list_subdirs(path)
@@ -269,7 +286,10 @@ class FolderTreePanel(QWidget):
             return
         path_str = item.data(0, Qt.ItemDataRole.UserRole)
         if path_str:
-            self.folder_selected.emit(Path(path_str))
+            path = Path(path_str)
+            self._update_item_label(item, path)
+            self._apply_backup_indicator(item, path)
+            self.folder_selected.emit(path)
 
     def _on_folder_context_menu(self, pos) -> None:
         item = self._tree.itemAt(pos)
