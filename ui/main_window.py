@@ -118,6 +118,8 @@ class MainWindow(QMainWindow):
         grid_w = max(400, total_w - tree_w - detail_w)
         self._main_splitter.setSizes([tree_w, grid_w + detail_w])
         self._content_splitter.setSizes([grid_w, detail_w])
+        # Saved width used to restore the detail panel when returning to Photos tab
+        self._detail_panel_width: int = detail_w
 
         root_layout.addWidget(self._main_splitter)
 
@@ -288,18 +290,29 @@ class MainWindow(QMainWindow):
     def _on_center_tab_changed(self, index: int) -> None:
         """Called when the user switches between Photos / Duplicates / Videos tabs.
 
-        - Photos (0): tell duplicate panel we're in photo mode.
-        - Videos (2): tell duplicate panel we're in video mode; clear the photo
-          detail panel so the stale image doesn't remain visible.
-        - Duplicates (1): no media-type change (inherits from last Photos/Videos visit).
+        - Photos (0): show detail panel; tell duplicate panel we're in photo mode.
+        - Duplicates (1): hide detail panel (metadata shown per-card inside the panel).
+        - Videos (2): hide detail panel; tell duplicate panel video mode; clear stale image.
         """
         if index == 0:   # Photos tab
             self._duplicate_panel.set_media_type("photo")
-        elif index == 2:  # Videos tab
-            self._duplicate_panel.set_media_type("video")
-            # Clear photo detail — its image would otherwise appear "stuck"
-            # while the user is browsing the Videos tab.
-            self._photo_detail.clear()
+            # Restore detail panel if it was hidden by another tab
+            if not self._photo_detail.isVisible():
+                self._photo_detail.show()
+                sizes = self._content_splitter.sizes()
+                total = sum(sizes)
+                w = self._detail_panel_width
+                self._content_splitter.setSizes([max(400, total - w), w])
+        else:
+            # Duplicados (1) and Videos (2): hide the detail panel
+            if self._photo_detail.isVisible():
+                self._detail_panel_width = self._content_splitter.sizes()[1]
+                self._photo_detail.hide()
+            if index == 2:  # Videos tab
+                self._duplicate_panel.set_media_type("video")
+                # Clear photo detail — its image would otherwise appear "stuck"
+                # while the user is browsing the Videos tab.
+                self._photo_detail.clear()
 
     def _on_files_moved_videos(self, src_folder: Path, moved: list) -> None:
         """Forward shared-tree file-move events to the video panel."""

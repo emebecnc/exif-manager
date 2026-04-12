@@ -1,6 +1,6 @@
 # EXIF Manager — CLAUDE.md
 
-**Last updated:** 2026-04-12 (session 6)
+**Last updated:** 2026-04-12 (session 13)
 **Repo:** github.com/emebecnc/exif-manager
 **Local:** D:\homelab\exif_manager\
 
@@ -99,7 +99,25 @@ Config: main.py, build.spec, requirements.txt, run_exif_manager.bat
 ✅ Video duplicates → _duplicados_eliminados works
 ✅ Cleanup threading → no double-quit race
 ✅ Drag & drop → verified OK
-✅ Conservar button → verified OK
+✅ Conservar button → immediate deletion + auto-advance
+✅ Right panel hidden in Duplicados and Videos tabs
+✅ Duplicate cards show complete EXIF / video metadata
+✅ Duplicate card metadata font increased to 11px (readable)
+✅ Duplicate card fonts upgraded to pt units (11pt metadata, 10pt path)
+✅ Toggle buttons renamed: FOTOS / VIDEOS / DUPLICADOS (3-way)
+✅ DUPLICADOS mode auto-detects dominant media type from folder
+✅ on_folder_changed auto-selects FOTOS or VIDEOS based on file count
+✅ Toggle buttons: normal case (Fotos/Videos/Duplicados), pill-style rounded
+✅ FPS row removed from video duplicate cards
+✅ Cards: rounder corners (10px), pill badges, better button colors
+✅ Global APP_STYLE applied: refined scrollbars, lists, inputs, tooltips, checkboxes
+✅ CRASH FIX: _on_scan_error now calls thread.quit()+wait() → no more -805306369
+✅ Workers: traceback.print_exc() for full crash debugging
+✅ Folder tree: SP_DirIcon folder icons on all tree items
+✅ Workers: per-file try/except → one bad file never aborts scan
+✅ Workers: 100-file checkpoints + zero-byte + stat-fail guards
+✅ Workers: separate inner try/except for file-collection phase
+✅ README.md updated: video support, duplicados features, v1.0 changelog
 
 ---
 
@@ -273,3 +291,183 @@ Config: main.py, build.spec, requirements.txt, run_exif_manager.bat
 - **`ui/date_editor.py`** — Issues 14, 15:
   - **Issue 14 (Hora layout)**: Replaced `_time_grp` VBox + `_custom_time_widget` show/hide pattern with a single compact HBox row. Spinboxes start disabled; `_on_time_option_changed` enables/disables them (no widget show/hide). `_apply_exif_mode_state` re-syncs spinbox enabled state when switching Conservar/Cambiar. Removed `_custom_time_widget` reference from `_try_apply_filename_date`.
   - **Issue 15 (Nombre nuevo column)**: `_COL_RENAME` is now always visible (removed `setColumnHidden(_COL_RENAME, True)` from init and `setColumnHidden` from `_on_rename_toggled`). When rename is OFF, preview shows `"— (conservar nombre)"` in grey. Fixed in both `_PreviewWorker.run()` and the sync path in `_on_preview()`.
+
+## Session changes: Conservar immediate deletion + hide right panel (session 7)
+
+### Files modified
+
+- **`core/duplicate_finder.py`** — debug logging added:
+  - Prints scan path, file count, group count + filenames at start/end of `run()`
+
+- **`core/video_duplicate_finder.py`** — debug logging added:
+  - Same pattern as above for video scans
+
+- **`ui/duplicate_panel.py`** — `_on_card_keep()` rewritten (Workflow 1):
+  - Was: mark cards green/red, show toast, auto-advance (no file changes)
+  - Now: immediately move every non-kept file to `_duplicados_eliminados/`, log each,
+    call `_remove_group()` (which auto-advances), then set toast
+    `"✓ N archivos eliminados, X MB liberados"` overriding `_remove_group`'s header
+  - QTimer 2500 ms restores `_update_header_label()` if groups remain
+  - `"— ✓ Todos procesados"` appended to toast when last group is resolved
+  - Debug `print()` statements added to `_on_scan_finished()` and `_show_group()`
+
+- **`ui/main_window.py`** — right panel hidden in non-Photos tabs:
+  - Added `self._detail_panel_width: int = detail_w` in `_build_ui()` to persist width
+  - `_on_center_tab_changed()` rewritten:
+    - index 0 (Fotos): calls `_photo_detail.show()` + restores splitter sizes from saved width
+    - index 1 (Duplicados): saves current detail width, calls `_photo_detail.hide()`
+    - index 2 (Videos): saves width + hides detail panel (same as Duplicados) + clears detail
+
+## Session changes: Complete EXIF/metadata in duplicate cards (session 8)
+
+### Files modified
+
+- **`ui/duplicate_panel.py`**:
+  - Added `get_all_metadata` to `core.exif_handler` import
+  - Added `format_duration`, `format_size` to `core.video_handler` import
+  - **`_PhotoCard`**: replaced 4 sparse info rows with full `get_all_metadata()` output:
+    - File: Nombre, Tamaño, Dims
+    - EXIF dates: Fecha orig, Fecha digit, Fecha sist (only if present)
+    - EXIF display tags: Make, Model, Orientación, Resolución X/Y, ISO, Exposición, Apertura, Flash (only if present)
+    - GPS (if present)
+    - File timestamps: Modificado, Creado
+    - Selectable path label
+  - **`_VideoCard`**: replaced 7 sparse rows with full `get_video_metadata()` output (matches `video_detail.py`):
+    - Nombre, Tamaño, Resolución, Duración, FPS, Video codec, Audio codec, Bitrate, Rotación, Formato, Cámara
+    - Dates: Fecha meta (creation_time), Modificado, Creado
+    - Selectable path label
+  - **`_comparison_scroll`**: changed `ScrollBarAlwaysOff` → `ScrollBarAsNeeded` for vertical axis
+    (allows scrolling to action buttons when cards grow tall with full metadata)
+
+## Session changes: Robust scan logging + README update (session 13)
+
+### What was already done (sessions 10–12, no changes needed)
+- Buttons: `📷 Fotos`, `🎬 Videos`, `🔀 Duplicados` — already normal case ✅
+- FPS removed from `_VideoCard` — already done ✅
+- Visual polish (rounded cards 10px, pill badges, gradient buttons, APP_STYLE) — done ✅
+- Folder icons (SP_DirIcon) — done ✅
+
+### Files modified
+
+- **`core/duplicate_finder.py`** — hardened `DuplicateScanWorker.run()`:
+  - File-collection phase wrapped in its own `try/except` with `error.emit()`
+  - Per-file `try/except` inside MD5 loop — one bad file skips with `[skip]` log, scan continues
+  - `path.stat()` guard before MD5: catches inaccessible files, skips zero-byte files
+  - 100-file checkpoint: prints processed/total/unique-hashes/skipped to console
+  - Summary log on completion: total, skipped, groups found
+  - Clean `[PhotoScan]` prefix on all log lines
+
+- **`core/video_duplicate_finder.py`** — same hardening for `VideoDuplicateScanWorker.run()`:
+  - Identical structure: collection try/except, per-file guard, stat check, 100-file checkpoint
+  - Clean `[VideoScan]` prefix on all log lines
+
+- **`README.md`** — complete rewrite to reflect current state:
+  - Added video grid, video date editor, video duplicates sections
+  - Updated duplicados section: 3-mode toggle, auto-detect, per-file robustness
+  - ffmpeg listed as prerequisite
+  - Stack table updated (ffmpeg, hachoir)
+  - Roadmap replaced with v1.0 changelog (all features shipped)
+  - `.video_backup.json` added to folder table
+
+---
+
+## Session changes: Crash fix on scan error + folder icons (session 12)
+
+### Root cause of crash -805306369
+
+`_on_scan_error()` in `duplicate_panel.py` was not calling `thread.quit()+wait()`.
+When the worker emitted `error`, the main thread handler updated UI state but left
+the QThread running. The next scan or app close destroyed the still-running QThread
+object → Windows exception code -805306369 (`QThread: Destroyed while thread is still running`).
+
+### Files modified
+
+- **`core/duplicate_finder.py`**:
+  - Added `import traceback`
+  - `DuplicateScanWorker.run()`: added `traceback.print_exc()` in `except` block
+    (prints full stack trace to console for debugging)
+
+- **`core/video_duplicate_finder.py`**:
+  - Added `import traceback`
+  - `VideoDuplicateScanWorker.run()`: same `traceback.print_exc()` in `except` block
+
+- **`ui/duplicate_panel.py`**:
+  - `_on_scan_error()`: added `thread.quit()+wait(5000)` before UI updates,
+    with `terminate()+wait(1000)` fallback if thread doesn't stop in time.
+    Same pattern as `_on_scan_finished()`. Also prints error to console.
+    Label text updated to `"⚠ Error al escanear:\n{msg}"`.
+
+- **`ui/folder_tree.py`**:
+  - Added `QStyle` to PyQt6 imports
+  - `_make_item()`: sets `SP_DirIcon` folder icon on every tree item
+    (`self._tree.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon)`)
+
+---
+
+## Session changes: Visual polish, button rename, remove FPS (session 11)
+
+### Files modified
+
+- **`ui/duplicate_panel.py`**:
+  - **FIX 1 (normal case buttons)**: Toggle buttons renamed from ALL-CAPS to normal case:
+    `"📷 FOTOS"` → `"📷 Fotos"`, `"🎬 VIDEOS"` → `"🎬 Videos"`, `"🔀 DUPLICADOS"` → `"🔀 Duplicados"`.
+  - **FIX 2 (remove FPS)**: Removed FPS row from `_VideoCard` metadata display.
+    Card now shows: Nombre, Tamaño, Resolución, Duración, Video codec, Audio codec, Bitrate, Rotación, Formato, Cámara, Fecha meta, Modificado, Creado.
+  - **FIX 3 (visual polish)**:
+    - Card buttons (`_BTN_KEEP_ON/OFF`, `_BTN_DEL_ON/OFF`, `_BTN_NEUTRAL`, `_BTN_CANCEL`):
+      border-radius 4px → 8px; larger padding (5px 10px); font-size 10pt; better hover contrast.
+    - Card frames (`_apply_visual` in both `_PhotoCard` and `_VideoCard`):
+      border-radius 4px → 10px; subtler background tint (18 alpha vs 20).
+    - Badges (`_apply_badge_style` in both cards): pill shape (border-radius: 10px);
+      border added; text changed to normal case ("★ Conservar" / "Duplicado"); font-size 10pt.
+    - Toggle buttons (`_update_toggle_style`): teal ON state (#0d7377), pill shape (border-radius: 10px),
+      font-size 10pt, better hover for OFF state.
+
+- **`ui/styles.py`**:
+  - `BUTTON_STYLE`: border-radius 6px → 8px; font-size 10pt; better hover brightness.
+  - `BUTTON_PRIMARY`: border-radius 6px → 8px; font-size 10pt; brighter hover.
+  - `BUTTON_DANGER`: border-radius 6px → 8px; font-size 10pt.
+  - `TAB_STYLE`: height 32px → 34px; padding 18px → 22px; font-size 10pt; pane border-top 2px.
+  - Added `APP_STYLE`: comprehensive global stylesheet — scrollbars (10px, rounded handles),
+    lists (border-radius: 6px, teal selection), tree, inputs, status bar, group boxes,
+    checkboxes, radio buttons, tooltips. All font-size: 10pt baseline.
+  - Added `apply_app_style(app)` helper function.
+
+- **`main.py`**:
+  - Replaced inline `app.setStyleSheet(...)` block in `apply_dark_theme()` with
+    `from ui.styles import APP_STYLE; app.setStyleSheet(APP_STYLE)`.
+    QPalette (Fusion dark) is retained; only the stylesheet part is replaced.
+
+---
+
+## Session changes: Font sizes, button rename, auto-detect media type (session 10)
+
+### Files modified
+
+- **`ui/duplicate_panel.py`**:
+  - **FIX 1 (font sizes)**: `_PhotoCard._info_row` and `_VideoCard._info_row` key+value labels
+    changed from `font-size: 11px` → `font-size: 11pt` (proper point sizing, more readable).
+    Path labels at card bottom changed from `font-size: 8px` → `font-size: 10pt`.
+  - **FIX 2 (button rename)**: Toggle buttons renamed `"📷 Fotos"` → `"📷 FOTOS"`,
+    `"🎬 Videos"` → `"🎬 VIDEOS"`. Added third toggle `"🔀 DUPLICADOS"` (`media_type="both"`).
+    `_update_toggle_style()` updated to handle 3-way state.
+    `set_media_type()` updated to handle `"both"` mode with `_all_groups/_all_selections` cache.
+    `_begin_scan()` in "both" mode auto-detects dominant type from folder before scanning.
+    `_get_best()` and `_show_group()` in "both" mode infer type from file extension.
+  - **FIX 3 (auto-detect)**: `on_folder_changed()` now counts photos vs videos in the folder
+    (using new `_count_files_with_extensions()` helper) and auto-selects FOTOS or VIDEOS toggle.
+    Videos > photos → auto-select VIDEOS; photos >= videos → auto-select FOTOS.
+    User can still manually click any toggle button to override.
+  - Added `import os` and top-level imports: `EXCLUDED_FOLDERS` from `file_scanner`,
+    `VIDEO_EXTENSIONS` from `video_handler` (removed redundant local import in `_on_dedup_all`).
+
+---
+
+## Session changes: Increase metadata font size in duplicate cards (session 9)
+
+### Files modified
+
+- **`ui/duplicate_panel.py`**:
+  - `_PhotoCard._info_row`: key + value label `font-size: 9px` → `11px`; key `setMinimumWidth` 44 → 72
+  - `_VideoCard._info_row`: key + value label `font-size: 9px` → `11px`; key `setMinimumWidth` 60 → 80
+  - Path labels (selectable full path at card bottom) kept at `8px` — reference-only, smaller is correct

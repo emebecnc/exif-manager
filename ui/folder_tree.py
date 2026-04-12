@@ -10,7 +10,7 @@ from PyQt6.QtGui import QAction, QColor, QBrush
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QTreeWidget, QTreeWidgetItem, QAbstractItemView, QFileDialog,
-    QInputDialog, QLabel, QMenu, QApplication, QMessageBox,
+    QInputDialog, QLabel, QMenu, QApplication, QMessageBox, QStyle,
 )
 
 from core.backup_manager import has_backup, append_historial
@@ -226,6 +226,12 @@ class FolderTreePanel(QWidget):
             label = f"{path.name}  ({photos})"
         item = QTreeWidgetItem([label])
         item.setData(0, Qt.ItemDataRole.UserRole, str(path))
+
+        # Folder icon
+        folder_icon = self._tree.style().standardIcon(
+            QStyle.StandardPixmap.SP_DirIcon
+        )
+        item.setIcon(0, folder_icon)
 
         self._apply_backup_indicator(item, path)
 

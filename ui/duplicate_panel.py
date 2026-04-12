@@ -1,4 +1,5 @@
 """DuplicatePanel — permanent tab for scanning and resolving duplicate images."""
+import os
 import shutil
 from io import BytesIO
 from pathlib import Path
@@ -14,10 +15,13 @@ from PyQt6.QtWidgets import (
 )
 
 from core.duplicate_finder import DuplicateScanWorker
-from core.exif_handler import read_exif
-from core.file_scanner import unique_dest
+from core.exif_handler import get_all_metadata, read_exif
+from core.file_scanner import unique_dest, EXCLUDED_FOLDERS
 from core.video_duplicate_finder import VideoDuplicateScanWorker
-from core.video_handler import get_video_metadata, get_video_thumbnail
+from core.video_handler import (
+    VIDEO_EXTENSIONS,
+    format_duration, format_size, get_video_metadata, get_video_thumbnail,
+)
 from ui.log_viewer import LogManager
 from ui.styles import apply_button_style, apply_primary_button_style, mb_warning, mb_info, mb_question
 
@@ -30,45 +34,47 @@ _CARD_WIDTH      = 280   # fixed width of each photo card (px)
 
 _BTN_KEEP_ON = (
     "QPushButton {"
-    " background-color: #2d5a2d; border: 1px solid #4a8a4a;"
-    " border-radius: 4px; color: white; padding: 3px 8px; font-size: 10px; }"
-    "QPushButton:hover { background-color: #3a7a3a; border-color: #6ab06a; }"
-    "QPushButton:pressed { background-color: #1f3f1f; }"
+    " background-color: #236b23; border: 1px solid #3fa83f;"
+    " border-radius: 8px; color: #e8ffe8; padding: 5px 10px; font-size: 10pt;"
+    " font-weight: bold; }"
+    "QPushButton:hover { background-color: #2e8f2e; border-color: #5ecb5e; }"
+    "QPushButton:pressed { background-color: #174f17; }"
 )
 _BTN_KEEP_OFF = (
     "QPushButton {"
-    " background-color: #333333; border: 1px solid #555555;"
-    " border-radius: 4px; color: #999999; padding: 3px 8px; font-size: 10px; }"
-    "QPushButton:hover { background-color: #444444; border-color: #666666; }"
-    "QPushButton:pressed { background-color: #222222; }"
+    " background-color: #2a2a2a; border: 1px solid #484848;"
+    " border-radius: 8px; color: #777777; padding: 5px 10px; font-size: 10pt; }"
+    "QPushButton:hover { background-color: #363636; border-color: #5a5a5a; color: #aaaaaa; }"
+    "QPushButton:pressed { background-color: #1e1e1e; }"
 )
 _BTN_DEL_ON = (
     "QPushButton {"
-    " background-color: #5a2d2d; border: 1px solid #8a4a4a;"
-    " border-radius: 4px; color: white; padding: 3px 8px; font-size: 10px; }"
-    "QPushButton:hover { background-color: #7a3a3a; border-color: #b06a6a; }"
-    "QPushButton:pressed { background-color: #3f1f1f; }"
+    " background-color: #6b2323; border: 1px solid #a83f3f;"
+    " border-radius: 8px; color: #ffe8e8; padding: 5px 10px; font-size: 10pt;"
+    " font-weight: bold; }"
+    "QPushButton:hover { background-color: #8f2e2e; border-color: #cb5e5e; }"
+    "QPushButton:pressed { background-color: #4f1717; }"
 )
 _BTN_DEL_OFF = (
     "QPushButton {"
-    " background-color: #333333; border: 1px solid #555555;"
-    " border-radius: 4px; color: #999999; padding: 3px 8px; font-size: 10px; }"
-    "QPushButton:hover { background-color: #444444; border-color: #666666; }"
-    "QPushButton:pressed { background-color: #222222; }"
+    " background-color: #2a2a2a; border: 1px solid #484848;"
+    " border-radius: 8px; color: #777777; padding: 5px 10px; font-size: 10pt; }"
+    "QPushButton:hover { background-color: #363636; border-color: #5a5a5a; color: #aaaaaa; }"
+    "QPushButton:pressed { background-color: #1e1e1e; }"
 )
 _BTN_NEUTRAL = (
     "QPushButton {"
-    " background-color: #3a3a3a; border: 1px solid #555555;"
-    " border-radius: 4px; color: white; padding: 6px 12px; }"
-    "QPushButton:hover { background-color: #4a4a4a; border-color: #777777; }"
-    "QPushButton:pressed { background-color: #2a2a2a; }"
+    " background-color: #383838; border: 1px solid #555555;"
+    " border-radius: 8px; color: white; padding: 6px 14px; }"
+    "QPushButton:hover { background-color: #484848; border-color: #888888; }"
+    "QPushButton:pressed { background-color: #282828; }"
 )
 _BTN_CANCEL = (
     "QPushButton {"
-    " background-color: #4a3030; border: 1px solid #7a5050;"
-    " border-radius: 4px; color: #ffaaaa; padding: 6px 12px; }"
-    "QPushButton:hover { background-color: #5a3a3a; border-color: #9a6060; }"
-    "QPushButton:pressed { background-color: #3a2020; }"
+    " background-color: #3e2424; border: 1px solid #6b3838;"
+    " border-radius: 8px; color: #ffbbbb; padding: 6px 14px; }"
+    "QPushButton:hover { background-color: #4e2e2e; border-color: #8a5050; }"
+    "QPushButton:pressed { background-color: #2e1818; }"
 )
 
 
@@ -143,6 +149,18 @@ def _best_video_in_group(group: List[Path]) -> Path:
         except OSError: ctime = float("inf")
         return (-video_quality_score(p), ctime)
     return min(group, key=_key)
+
+
+def _count_files_with_extensions(folder: Path, extensions: set) -> int:
+    """Recursively count files whose suffix (lowercase) is in *extensions*.
+    Skips EXCLUDED_FOLDERS so trash/cache dirs are not counted."""
+    count = 0
+    for root, dirs, files in os.walk(folder):
+        dirs[:] = [d for d in dirs if d not in EXCLUDED_FOLDERS]
+        for file in files:
+            if Path(file).suffix.lower() in extensions:
+                count += 1
+    return count
 
 
 # ── Deduplication worker ───────────────────────────────────────────────────────
@@ -232,42 +250,52 @@ class _PhotoCard(QFrame):
             row = QHBoxLayout()
             row.setSpacing(4)
             k = QLabel(key)
-            k.setMinimumWidth(44)
-            k.setStyleSheet("color: #888888; font-size: 9px; border: none;")
+            k.setMinimumWidth(72)
+            k.setStyleSheet("color: #888888; font-size: 11pt; border: none;")
             v = QLabel(value)
-            v.setStyleSheet("color: #cccccc; font-size: 9px; border: none;")
+            v.setStyleSheet("color: #cccccc; font-size: 11pt; border: none;")
             v.setWordWrap(True)
             row.addWidget(k)
             row.addWidget(v, 1)
             return row
 
+        # 4. Full metadata
+        _meta      = get_all_metadata(path)
+        _exif_sec  = _meta.get("exif", {})
+        _fields    = _exif_sec.get("fields", {})
+        _display   = _exif_sec.get("display", {})
+        _gps       = _exif_sec.get("gps")
+        _file_info = _meta.get("file", {})
+
         layout.addLayout(_info_row("Nombre:", path.name))
+        layout.addLayout(_info_row("Tamaño:", _file_info.get("tamaño", "N/D")))
+        if _file_info.get("dimensiones"):
+            layout.addLayout(_info_row("Dims:", _file_info["dimensiones"]))
 
-        try:
-            size_str = _fmt_bytes(path.stat().st_size)
-        except OSError:
-            size_str = "N/D"
-        layout.addLayout(_info_row("Tamaño:", size_str))
+        for _lbl, _key in [
+            ("Fecha orig:", "DateTimeOriginal"),
+            ("Fecha digit:", "DateTimeDigitized"),
+            ("Fecha sist:", "DateTime"),
+        ]:
+            _val = _fields.get(_key)
+            if _val:
+                layout.addLayout(_info_row(_lbl, _val))
 
-        dims_str = "N/D"
-        try:
-            with Image.open(path) as img:
-                dims_str = f"{img.width} × {img.height}"
-        except Exception:
-            pass
-        layout.addLayout(_info_row("Dims:", dims_str))
+        for _lbl, _val in _display.items():
+            if _val:
+                layout.addLayout(_info_row(f"{_lbl}:", _val))
 
-        date_str = "—"
-        try:
-            fields = read_exif(path).get("fields", {})
-            date_str = fields.get("DateTimeOriginal") or fields.get("DateTime") or "—"
-        except Exception:
-            pass
-        layout.addLayout(_info_row("Fecha:", date_str))
+        if _gps:
+            layout.addLayout(_info_row("GPS:", _gps))
 
-        # 4. Selectable full path
+        if _file_info.get("modificado"):
+            layout.addLayout(_info_row("Modificado:", _file_info["modificado"]))
+        if _file_info.get("creado"):
+            layout.addLayout(_info_row("Creado:", _file_info["creado"]))
+
+        # Selectable full path
         path_lbl = QLabel(str(path))
-        path_lbl.setStyleSheet("color: #666666; font-size: 8px; border: none;")
+        path_lbl.setStyleSheet("color: #666666; font-size: 10pt; border: none;")
         path_lbl.setWordWrap(True)
         path_lbl.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
@@ -306,18 +334,18 @@ class _PhotoCard(QFrame):
     def _apply_badge_style(self) -> None:
         """Style and text of badge are driven by the current action, not is_best."""
         if self._action == "keep":
-            self._badge.setText("★ CONSERVAR")
+            self._badge.setText("★ Conservar")
             self._badge.setStyleSheet(
-                "background-color: #1e4d1e; color: #70ff70;"
-                " font-weight: bold; font-size: 10px; padding: 2px 6px;"
-                " border-radius: 3px; border: none;"
+                "background-color: #1a4d1a; color: #7fff7f;"
+                " font-weight: bold; font-size: 10pt; padding: 3px 10px;"
+                " border-radius: 10px; border: 1px solid #3a8a3a;"
             )
         else:
-            self._badge.setText("DUPLICADO")
+            self._badge.setText("Duplicado")
             self._badge.setStyleSheet(
-                "background-color: #4d2a00; color: #ffa050;"
-                " font-weight: bold; font-size: 10px; padding: 2px 6px;"
-                " border-radius: 3px; border: none;"
+                "background-color: #4a2800; color: #ffaa55;"
+                " font-weight: bold; font-size: 10pt; padding: 3px 10px;"
+                " border-radius: 10px; border: 1px solid #7a4800;"
             )
 
     def _apply_visual(self) -> None:
@@ -325,8 +353,8 @@ class _PhotoCard(QFrame):
         if self._action == "keep":
             self.setStyleSheet(
                 "QFrame {"
-                " border: 2px solid #50c850; border-radius: 4px;"
-                " background-color: rgba(80,200,80,20); }"
+                " border: 2px solid #3ea83e; border-radius: 10px;"
+                " background-color: rgba(62,168,62,18); }"
                 "QLabel { border: none; background-color: transparent; }"
             )
             self._btn_keep.setStyleSheet(_BTN_KEEP_ON)
@@ -334,8 +362,8 @@ class _PhotoCard(QFrame):
         else:
             self.setStyleSheet(
                 "QFrame {"
-                " border: 2px solid #c85050; border-radius: 4px;"
-                " background-color: rgba(200,80,80,20); }"
+                " border: 2px solid #a83e3e; border-radius: 10px;"
+                " background-color: rgba(168,62,62,18); }"
                 "QLabel { border: none; background-color: transparent; }"
             )
             self._btn_keep.setStyleSheet(_BTN_KEEP_OFF)
@@ -409,50 +437,56 @@ class _VideoCard(QFrame):
             row = QHBoxLayout()
             row.setSpacing(4)
             k = QLabel(key)
-            k.setMinimumWidth(60)
-            k.setStyleSheet("color: #888888; font-size: 9px; border: none;")
+            k.setMinimumWidth(80)
+            k.setStyleSheet("color: #888888; font-size: 11pt; border: none;")
             v = QLabel(value)
-            v.setStyleSheet("color: #cccccc; font-size: 9px; border: none;")
+            v.setStyleSheet("color: #cccccc; font-size: 11pt; border: none;")
             v.setWordWrap(True)
             row.addWidget(k)
             row.addWidget(v, 1)
             return row
 
-        # Fetch metadata (always succeeds — sets 'error' key on failure)
+        # Full metadata
         meta = get_video_metadata(path)
 
         layout.addLayout(_info_row("Nombre:", path.name))
-        layout.addLayout(_info_row("Tamaño:", _fmt_bytes(meta.get("size_bytes", 0) or 0)))
+        layout.addLayout(_info_row("Tamaño:", format_size(meta.get("size_bytes", 0) or 0)))
 
-        w = meta.get("width", 0) or 0
-        h = meta.get("height", 0) or 0
-        layout.addLayout(_info_row("Resolución:", f"{w} × {h}" if (w and h) else "N/D"))
+        _w = meta.get("width", 0) or 0
+        _h = meta.get("height", 0) or 0
+        if _w and _h:
+            layout.addLayout(_info_row("Resolución:", f"{_w} × {_h}"))
 
-        dur = meta.get("duration_seconds", 0) or 0
-        if dur:
-            mins, secs = divmod(int(dur), 60)
-            dur_str = f"{mins}:{secs:02d}"
-        else:
-            dur_str = "N/D"
-        layout.addLayout(_info_row("Duración:", dur_str))
+        _dur = meta.get("duration_seconds", 0) or 0
+        layout.addLayout(_info_row("Duración:", format_duration(_dur) if _dur else "N/D"))
 
-        fps = meta.get("fps", 0) or 0
-        layout.addLayout(_info_row("FPS:", f"{fps:.1f}" if fps else "N/D"))
+        if meta.get("codec_video"):
+            layout.addLayout(_info_row("Video codec:", meta["codec_video"]))
+        if meta.get("codec_audio"):
+            layout.addLayout(_info_row("Audio codec:", meta["codec_audio"]))
+        if meta.get("bitrate"):
+            layout.addLayout(_info_row("Bitrate:", f"{meta['bitrate'] / 1_000_000:.1f} Mbps"))
+        if meta.get("rotation"):
+            layout.addLayout(_info_row("Rotación:", f"{meta['rotation']}°"))
+        if meta.get("format_name"):
+            layout.addLayout(_info_row("Formato:", meta["format_name"]))
+        _cam = f"{meta.get('make', '')} {meta.get('model', '')}".strip()
+        if _cam:
+            layout.addLayout(_info_row("Cámara:", _cam))
 
-        codec = meta.get("codec_video", "") or "N/D"
-        layout.addLayout(_info_row("Codec:", codec))
-
-        ct = meta.get("creation_time")
-        if ct:
-            date_str = ct.strftime("%Y-%m-%d %H:%M")
-        else:
-            dm = meta.get("date_modified")
-            date_str = dm.strftime("%Y-%m-%d %H:%M") if dm else "—"
-        layout.addLayout(_info_row("Fecha:", date_str))
+        _ct = meta.get("creation_time")
+        if _ct:
+            layout.addLayout(_info_row("Fecha meta:", _ct.strftime("%Y:%m:%d %H:%M:%S")))
+        _dm = meta.get("date_modified")
+        if _dm:
+            layout.addLayout(_info_row("Modificado:", _dm.strftime("%d/%m/%Y %H:%M")))
+        _dc = meta.get("date_created")
+        if _dc:
+            layout.addLayout(_info_row("Creado:", _dc.strftime("%d/%m/%Y")))
 
         # Selectable full path
         path_lbl = QLabel(str(path))
-        path_lbl.setStyleSheet("color: #666666; font-size: 8px; border: none;")
+        path_lbl.setStyleSheet("color: #666666; font-size: 10pt; border: none;")
         path_lbl.setWordWrap(True)
         path_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(path_lbl)
@@ -488,33 +522,33 @@ class _VideoCard(QFrame):
 
     def _apply_badge_style(self) -> None:
         if self._action == "keep":
-            self._badge.setText("★ CONSERVAR")
+            self._badge.setText("★ Conservar")
             self._badge.setStyleSheet(
-                "background-color: #1e4d1e; color: #70ff70;"
-                " font-weight: bold; font-size: 10px; padding: 2px 6px;"
-                " border-radius: 3px; border: none;"
+                "background-color: #1a4d1a; color: #7fff7f;"
+                " font-weight: bold; font-size: 10pt; padding: 3px 10px;"
+                " border-radius: 10px; border: 1px solid #3a8a3a;"
             )
         else:
-            self._badge.setText("DUPLICADO")
+            self._badge.setText("Duplicado")
             self._badge.setStyleSheet(
-                "background-color: #4d2a00; color: #ffa050;"
-                " font-weight: bold; font-size: 10px; padding: 2px 6px;"
-                " border-radius: 3px; border: none;"
+                "background-color: #4a2800; color: #ffaa55;"
+                " font-weight: bold; font-size: 10pt; padding: 3px 10px;"
+                " border-radius: 10px; border: 1px solid #7a4800;"
             )
 
     def _apply_visual(self) -> None:
         if self._action == "keep":
             self.setStyleSheet(
-                "QFrame { border: 2px solid #50c850; border-radius: 4px;"
-                " background-color: rgba(80,200,80,20); }"
+                "QFrame { border: 2px solid #3ea83e; border-radius: 10px;"
+                " background-color: rgba(62,168,62,18); }"
                 "QLabel { border: none; background-color: transparent; }"
             )
             self._btn_keep.setStyleSheet(_BTN_KEEP_ON)
             self._btn_delete.setStyleSheet(_BTN_DEL_OFF)
         else:
             self.setStyleSheet(
-                "QFrame { border: 2px solid #c85050; border-radius: 4px;"
-                " background-color: rgba(200,80,80,20); }"
+                "QFrame { border: 2px solid #a83e3e; border-radius: 10px;"
+                " background-color: rgba(168,62,62,18); }"
                 "QLabel { border: none; background-color: transparent; }"
             )
             self._btn_keep.setStyleSheet(_BTN_KEEP_OFF)
@@ -573,6 +607,8 @@ class DuplicatePanel(QWidget):
         self._photo_selections:  Dict[int, Dict[Path, str]]  = {}
         self._video_groups:      List[List[Path]]            = []
         self._video_selections:  Dict[int, Dict[Path, str]]  = {}
+        self._all_groups:        List[List[Path]]            = []
+        self._all_selections:    Dict[int, Dict[Path, str]]  = {}
         # Active display (always points to the current type's cache)
         self._groups:            List[List[Path]]            = []
         self._selections:        Dict[int, Dict[Path, str]]  = {}
@@ -586,11 +622,24 @@ class DuplicatePanel(QWidget):
     def on_folder_changed(self, folder: Path) -> None:
         """Slot connected to MainWindow.folder_changed signal.
 
-        Updates the current folder scope used by 'Buscar duplicados en carpeta
-        actual'.  Does NOT start a scan automatically — the user must press the
-        button explicitly.
+        Updates the current folder scope and auto-selects the FOTOS or VIDEOS
+        toggle based on which media type dominates in the folder.
+        Does NOT start a scan automatically — the user must press the button.
         """
         self.set_current_folder(folder)
+
+        # Auto-detect dominant media type (FIX 3)
+        _PHOTO_EXT = {".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp"}
+        photo_count = _count_files_with_extensions(folder, _PHOTO_EXT)
+        video_count = _count_files_with_extensions(folder, VIDEO_EXTENSIONS)
+
+        if video_count > photo_count:
+            if self._media_type != "video":
+                self.set_media_type("video")
+        else:
+            # photos >= videos → default to FOTOS
+            if self._media_type != "photo":
+                self.set_media_type("photo")
 
     def set_root(self, root: Optional[Path]) -> None:
         self._root = root
@@ -601,7 +650,7 @@ class DuplicatePanel(QWidget):
         self._update_button_states()
 
     def set_media_type(self, media_type: str) -> None:
-        """Switch between 'photo' and 'video' duplicate search mode.
+        """Switch between 'photo', 'video', or 'both' duplicate search mode.
 
         Saves the current type's results, restores the new type's cached
         results (if any), and updates button labels and toggle buttons.
@@ -613,14 +662,22 @@ class DuplicatePanel(QWidget):
         if self._media_type == "photo":
             self._photo_groups     = list(self._groups)
             self._photo_selections = {k: dict(v) for k, v in self._selections.items()}
-        else:
+        elif self._media_type == "video":
             self._video_groups     = list(self._groups)
             self._video_selections = {k: dict(v) for k, v in self._selections.items()}
+        else:  # "both"
+            self._all_groups     = list(self._groups)
+            self._all_selections = {k: dict(v) for k, v in self._selections.items()}
 
         self._media_type = media_type
 
         # Update scan button labels
-        kind = "foto" if media_type == "photo" else "video"
+        if media_type == "photo":
+            kind = "foto"
+        elif media_type == "video":
+            kind = "video"
+        else:
+            kind = "auto"
         self._btn_scan_folder.setText(f"🔍 Buscar duplicados de {kind}")
         self._btn_scan_root.setText(f"🔍 Buscar duplicados de {kind} (raíz)")
 
@@ -630,22 +687,28 @@ class DuplicatePanel(QWidget):
         # Restore the new type's cached results (or clear if none)
         if media_type == "photo":
             self._restore_groups_display(self._photo_groups, self._photo_selections)
-        else:
+        elif media_type == "video":
             self._restore_groups_display(self._video_groups, self._video_selections)
+        else:
+            self._restore_groups_display(self._all_groups, self._all_selections)
 
     def _update_toggle_style(self) -> None:
         """Apply checked/unchecked stylesheet to the media-type toggle buttons."""
-        _ON  = ("QPushButton { background-color: #2a4a6a; border: 1px solid #4a7ab0;"
-                " border-radius: 3px; color: white; padding: 4px 8px; }"
-                "QPushButton:hover { background-color: #3a5a7a; }")
-        _OFF = ("QPushButton { background-color: #2a2a2a; border: 1px solid #444444;"
-                " border-radius: 3px; color: #888888; padding: 4px 8px; }"
-                "QPushButton:hover { background-color: #3a3a3a; }")
-        is_photo = (self._media_type == "photo")
-        self._btn_toggle_photo.setStyleSheet(_ON if is_photo else _OFF)
-        self._btn_toggle_video.setStyleSheet(_OFF if is_photo else _ON)
-        self._btn_toggle_photo.setChecked(is_photo)
-        self._btn_toggle_video.setChecked(not is_photo)
+        _ON  = ("QPushButton { background-color: #0d7377; border: 1px solid #14a0a6;"
+                " border-radius: 10px; color: white; padding: 5px 10px;"
+                " font-weight: bold; font-size: 10pt; }"
+                "QPushButton:hover { background-color: #14a0a6; border-color: #1dc0c8; }"
+                "QPushButton:pressed { background-color: #0a5558; }")
+        _OFF = ("QPushButton { background-color: #252525; border: 1px solid #404040;"
+                " border-radius: 10px; color: #777777; padding: 5px 10px; font-size: 10pt; }"
+                "QPushButton:hover { background-color: #303030; border-color: #5a5a5a;"
+                " color: #aaaaaa; }")
+        self._btn_toggle_photo.setStyleSheet(_ON if self._media_type == "photo" else _OFF)
+        self._btn_toggle_video.setStyleSheet(_ON if self._media_type == "video" else _OFF)
+        self._btn_toggle_all.setStyleSheet(_ON if self._media_type == "both" else _OFF)
+        self._btn_toggle_photo.setChecked(self._media_type == "photo")
+        self._btn_toggle_video.setChecked(self._media_type == "video")
+        self._btn_toggle_all.setChecked(self._media_type == "both")
 
     def _restore_groups_display(
         self,
@@ -713,13 +776,18 @@ class DuplicatePanel(QWidget):
         self._btn_toggle_photo.setChecked(True)
         self._btn_toggle_video = QPushButton("🎬 Videos")
         self._btn_toggle_video.setCheckable(True)
+        self._btn_toggle_all   = QPushButton("🔀 Duplicados")
+        self._btn_toggle_all.setCheckable(True)
         self._btn_toggle_photo.setToolTip("Buscar duplicados de fotos")
         self._btn_toggle_video.setToolTip("Buscar duplicados de videos")
+        self._btn_toggle_all.setToolTip("Buscar duplicados de todos los archivos (auto-detecta tipo)")
         self._btn_toggle_photo.clicked.connect(lambda: self.set_media_type("photo"))
         self._btn_toggle_video.clicked.connect(lambda: self.set_media_type("video"))
+        self._btn_toggle_all.clicked.connect(lambda: self.set_media_type("both"))
         self._update_toggle_style()
         toggle_row.addWidget(self._btn_toggle_photo)
         toggle_row.addWidget(self._btn_toggle_video)
+        toggle_row.addWidget(self._btn_toggle_all)
         left_layout.addLayout(toggle_row)
 
         self._lbl_header = QLabel("No hay duplicados escaneados aún.")
@@ -785,7 +853,7 @@ class DuplicatePanel(QWidget):
             Qt.ScrollBarPolicy.ScrollBarAsNeeded
         )
         self._comparison_scroll.setVerticalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
         )
         self._right_stack.addWidget(self._comparison_scroll)   # index 1
 
@@ -835,8 +903,16 @@ class DuplicatePanel(QWidget):
         self._btn_scan_folder.setEnabled(False)
         self._btn_scan_root.setEnabled(False)
 
-        # Use the appropriate worker based on the active media type
-        if self._media_type == "video":
+        # Use the appropriate worker based on the active media type.
+        # In "both" mode, auto-detect the dominant type from the folder.
+        _PHOTO_EXT = {".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp"}
+        effective_type = self._media_type
+        if effective_type == "both":
+            photo_count = _count_files_with_extensions(path, _PHOTO_EXT)
+            video_count = _count_files_with_extensions(path, VIDEO_EXTENSIONS)
+            effective_type = "video" if video_count > photo_count else "photo"
+
+        if effective_type == "video":
             self._scan_worker = VideoDuplicateScanWorker(path)
         else:
             self._scan_worker = DuplicateScanWorker(path)
@@ -861,6 +937,7 @@ class DuplicatePanel(QWidget):
         self._lbl_header.setText(f"Escaneando… {current}/{total}\n{fname}")
 
     def _on_scan_finished(self, groups: list) -> None:
+        print(f"DEBUG: _on_scan_finished called with {len(groups)} groups")
         # Quit+wait before any UI changes to prevent 'QThread destroyed while running'
         if self._scan_thread and self._scan_thread.isRunning():
             self._scan_thread.quit()
@@ -882,9 +959,12 @@ class DuplicatePanel(QWidget):
             if self._media_type == "photo":
                 self._photo_groups = []
                 self._photo_selections = {}
-            else:
+            elif self._media_type == "video":
                 self._video_groups = []
                 self._video_selections = {}
+            else:
+                self._all_groups = []
+                self._all_selections = {}
             return
 
         # Initialise per-group selections: best → keep, rest → delete
@@ -920,15 +1000,28 @@ class DuplicatePanel(QWidget):
         if self._media_type == "photo":
             self._photo_groups     = list(self._groups)
             self._photo_selections = {k: dict(v) for k, v in self._selections.items()}
-        else:
+        elif self._media_type == "video":
             self._video_groups     = list(self._groups)
             self._video_selections = {k: dict(v) for k, v in self._selections.items()}
+        else:
+            self._all_groups     = list(self._groups)
+            self._all_selections = {k: dict(v) for k, v in self._selections.items()}
 
     def _on_scan_error(self, msg: str) -> None:
+        # Quit+wait the thread FIRST — same pattern as _on_scan_finished.
+        # Without this, the QThread is destroyed while still running → crash -805306369.
+        if self._scan_thread and self._scan_thread.isRunning():
+            self._scan_thread.quit()
+            self._scan_thread.wait(5000)
+            if self._scan_thread and self._scan_thread.isRunning():
+                self._scan_thread.terminate()
+                self._scan_thread.wait(1000)
+
         self._scanning = False
         self._btn_cancel.setVisible(False)
         self._update_button_states()
-        self._lbl_header.setText(f"Error durante el escaneo: {msg}")
+        self._lbl_header.setText(f"⚠ Error al escanear:\n{msg}")
+        print(f"ERROR in scan: {msg}")
 
     def _cleanup_scan_thread(self) -> None:
         if self._scan_worker:
@@ -942,9 +1035,14 @@ class DuplicatePanel(QWidget):
 
     def _get_best(self, group: List[Path]) -> Path:
         """Return the highest-quality path using the correct scorer for the
-        current media type (photo → pixel quality; video → resolution/bitrate)."""
+        current media type (photo → pixel quality; video → resolution/bitrate).
+        In 'both' mode, infer type from the first file's extension."""
         if self._media_type == "video":
             return _best_video_in_group(group)
+        if self._media_type == "both":
+            # Infer from file extension
+            if group and group[0].suffix.lower() in VIDEO_EXTENSIONS:
+                return _best_video_in_group(group)
         return _best_in_group(group)
 
     # ── Group display ──────────────────────────────────────────────────────
@@ -955,11 +1053,14 @@ class DuplicatePanel(QWidget):
             self._show_group(row)
 
     def _show_group(self, group_idx: int) -> None:
+        print(f"DEBUG: _show_group({group_idx})")
         if group_idx < 0 or group_idx >= len(self._groups):
+            print(f"  ERROR: group_idx {group_idx} out of range (len={len(self._groups)})")
             return
 
         group = self._groups[group_idx]
         sels  = self._selections.get(group_idx, {})
+        print(f"  Group has {len(group)} files: {[p.name for p in group]}")
         best  = self._get_best(group)
 
         self._current_cards.clear()
@@ -973,7 +1074,13 @@ class DuplicatePanel(QWidget):
         # Remaining cards keep their original order for stability.
         sorted_group = [best] + [p for p in group if str(p) != str(best)]
 
-        CardClass = _VideoCard if self._media_type == "video" else _PhotoCard
+        if self._media_type == "video":
+            CardClass = _VideoCard
+        elif self._media_type == "both":
+            # Infer from first file's extension
+            CardClass = _VideoCard if (group and group[0].suffix.lower() in VIDEO_EXTENSIONS) else _PhotoCard
+        else:
+            CardClass = _PhotoCard
 
         for p in sorted_group:
             action = sels.get(p, "keep" if str(p) == str(best) else "delete")
@@ -998,50 +1105,57 @@ class DuplicatePanel(QWidget):
     # ── Card signal handlers ───────────────────────────────────────────────
 
     def _on_card_keep(self, path_obj: object, group_idx: int) -> None:
-        """User clicked 'Conservar' on a card — exclusive keep: this card green,
-        all others in the group become delete (red).
-
-        After updating visual state:
-          1. Shows a brief toast in the header label: "✓ Marcado para CONSERVAR"
-          2. Auto-advances to the next group (if one exists).
-        """
+        """User clicked 'Conservar' — immediately move every other file in the group
+        to _duplicados_eliminados/, remove the group from the list, and advance."""
         path = path_obj if isinstance(path_obj, Path) else Path(path_obj)
         if group_idx >= len(self._groups):
             return
-        sels = self._selections.get(group_idx)
-        if sels is None:
-            return
 
-        # Exclusive keep: the clicked path is the ONLY "keep"; all others become "delete".
-        # Use str() comparison for robustness across Path-object identity differences.
+        group    = self._groups[group_idx]
         path_str = str(path)
-        for p in self._groups[group_idx]:
-            sels[p] = "keep" if str(p) == path_str else "delete"
 
-        # Sync visual state for ALL visible cards (including the one that was clicked,
-        # since _PhotoCard/_VideoCard no longer pre-sets its own state in _on_keep).
-        for p, card in self._current_cards.items():
-            action = sels.get(p)
-            if action is not None:
-                card.set_action(action)
+        # Trash every file except the kept one
+        to_trash = [p for p in group if str(p) != path_str]
 
-        # ── Toast feedback ──────────────────────────────────────────────────
-        n_groups  = len(self._groups)
-        next_idx  = group_idx + 1
-        has_next  = next_idx < n_groups
-        self._lbl_header.setText(
-            f"✓ Marcado para CONSERVAR  —  Grupo {group_idx + 1} / {n_groups}"
-            + ("  →  avanzando al siguiente…" if has_next else "  (último grupo)")
+        deleted     = 0
+        bytes_freed = 0
+        errors: List[str] = []
+
+        for p in to_trash:
+            sz = _safe_size(p)
+            if not p.exists():
+                continue
+            trash_dir = p.parent / _TRASH_DIRNAME
+            try:
+                trash_dir.mkdir(exist_ok=True)
+                dest = unique_dest(p, trash_dir)
+                shutil.move(str(p), str(dest))
+                deleted     += 1
+                bytes_freed += sz
+                self._log.log(str(p.parent), p.name,
+                              "delete_duplicate", p.name, "conservar")
+            except Exception as exc:
+                errors.append(f"{p.name}: {exc}")
+
+        # Remove group from list + state; auto-advances to next group (or shows empty)
+        self._remove_group(group_idx)
+
+        # Build toast — override whatever _remove_group wrote into the header
+        toast = (
+            f"✓ {deleted} archivo{'s' if deleted != 1 else ''}"
+            f" eliminado{'s' if deleted != 1 else ''}"
+            f", {_fmt_bytes(bytes_freed)} liberados"
+            if deleted else "✓ Grupo procesado"
         )
+        if errors:
+            toast += f"  ⚠ {len(errors)} error{'es' if len(errors) != 1 else ''}"
+        if not self._groups:
+            toast += " — ✓ Todos procesados"
 
-        # ── Auto-advance to next group ──────────────────────────────────────
-        if has_next:
-            # Small delay so the user can see the toast before the view changes
-            QTimer.singleShot(600, lambda: self._groups_list.setCurrentRow(next_idx))
-            # Restore the summary header after the advance settles
-            QTimer.singleShot(800, self._update_header_label)
-        else:
-            # Last group — restore header after a moment
+        self._lbl_header.setText(toast)
+
+        # Restore summary header after a pause so the user can read the toast
+        if self._groups:
             QTimer.singleShot(2500, self._update_header_label)
 
     def _on_card_delete_now(self, path_obj: object, group_idx: int) -> None:
@@ -1183,8 +1297,6 @@ class DuplicatePanel(QWidget):
 
     def _on_dedup_all(self) -> None:
         """Collect all delete-marked paths, confirm, then run _DeduplicateWorker."""
-        from core.video_handler import VIDEO_EXTENSIONS
-
         to_delete: List[Tuple[str, int]] = []   # (abs_path_str, file_size_bytes)
         # Breakdown counters
         del_photos = del_photos_bytes = 0

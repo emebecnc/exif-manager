@@ -66,64 +66,9 @@ def apply_dark_theme(app: QApplication) -> None:
 
     app.setPalette(palette)
 
-    # Extra stylesheet tweaks
-    app.setStyleSheet("""
-        QToolTip {
-            color: #dcdcdc;
-            background-color: #3c3c44;
-            border: 1px solid #555560;
-            padding: 2px;
-        }
-        QGroupBox {
-            font-weight: bold;
-            border: 1px solid #555560;
-            border-radius: 4px;
-            margin-top: 8px;
-            padding-top: 4px;
-        }
-        QGroupBox::title {
-            subcontrol-origin: margin;
-            left: 8px;
-            padding: 0 4px;
-        }
-        QScrollBar:vertical {
-            background: #2d2d35;
-            width: 10px;
-        }
-        QScrollBar::handle:vertical {
-            background: #555560;
-            min-height: 20px;
-            border-radius: 4px;
-        }
-        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-        QScrollBar:horizontal {
-            background: #2d2d35;
-            height: 10px;
-        }
-        QScrollBar::handle:horizontal {
-            background: #555560;
-            min-width: 20px;
-            border-radius: 4px;
-        }
-        QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
-        QHeaderView::section {
-            background-color: #3c3c44;
-            color: #dcdcdc;
-            border: none;
-            border-right: 1px solid #555560;
-            padding: 4px;
-        }
-        QTableWidget { gridline-color: #44444e; }
-        QPushButton {
-            padding: 4px 12px;
-            border-radius: 3px;
-        }
-        QPushButton:hover { background-color: #555560; }
-        QPushButton:pressed { background-color: #2a82da; }
-        QTreeWidget::item:selected, QListWidget::item:selected {
-            background-color: #2a82da;
-        }
-    """)
+    # Apply polished stylesheet from styles module
+    from ui.styles import APP_STYLE
+    app.setStyleSheet(APP_STYLE)
 
 
 def _global_exception_hook(exc_type, exc_value, exc_tb):
