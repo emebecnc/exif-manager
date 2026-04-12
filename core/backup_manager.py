@@ -9,23 +9,27 @@ from typing import Optional
 from core.exif_handler import read_exif, write_exif_timestamps
 from core.file_scanner import scan_folder
 
-BACKUP_FILENAME    = ".exif_backup.json"
-HISTORIAL_FILENAME = "_historial_original.txt"
-_HISTORIAL_HEADER  = "# Historial de cambios — generado por ExifManager\n"
-
-_EXIF_FIELDS_ORDER = ("DateTimeOriginal", "DateTimeDigitized", "DateTime")
+BACKUP_FILENAME       = ".exif_backup.json"
+VIDEO_BACKUP_FILENAME = ".video_backup.json"   # mirrors video_handler.BACKUP_FILENAME
+HISTORIAL_FILENAME    = "_historial_original.txt"
+_HISTORIAL_HEADER     = "# Historial de cambios — generado por ExifManager\n"
 
 
 def create_backup(folder_path: Path) -> int:
-    """Backup current EXIF timestamps for all JPGs in folder_path.
+    """Backup current EXIF fields for all JPGs in folder_path.
 
     Returns the number of files backed up.
     Writes .exif_backup.json atomically using tempfile + os.replace.
+
+    Entry format (v2):
+        {"filename.jpg": {"original_exif_dict": {fields}, "timestamp": "ISO"}, ...}
+    restore_backup() handles both v1 (flat fields dict) and v2 transparently.
     """
     images = scan_folder(folder_path)
+    now_iso = datetime.now().isoformat(timespec="seconds")
     backup = {
         "_meta": {
-            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "created_at": now_iso,
             "file_count": len(images),
             "folder": str(folder_path),
         }
@@ -33,7 +37,10 @@ def create_backup(folder_path: Path) -> int:
 
     for img_path in images:
         exif = read_exif(img_path)
-        backup[img_path.name] = exif["fields"]  # may be empty dict if no EXIF
+        backup[img_path.name] = {
+            "original_exif_dict": exif["fields"],   # full fields dict
+            "timestamp": now_iso,
+        }
 
     _atomic_write_json(folder_path / BACKUP_FILENAME, backup)
     return len(images)
@@ -65,26 +72,29 @@ def restore_backup(folder_path: Path) -> dict:
     failed = 0
     errors = []
 
-    for filename, fields in backup.items():
+    for filename, entry in backup.items():
         if filename.startswith("_"):
             continue  # skip _meta
+
+        # Handle both v1 (flat fields dict) and v2 ({"original_exif_dict": ...})
+        actual_fields = _extract_fields(entry)
 
         img_path = folder_path / filename
 
         # Fallback: file may have been renamed (Conservar+rename) — scan by dates
         if not img_path.exists():
-            img_path = _find_by_exif_dates(folder_path, fields)
+            img_path = _find_by_exif_dates(folder_path, actual_fields)
 
         if img_path is None or not img_path.exists():
             errors.append(f"Archivo no encontrado: {filename}")
             failed += 1
             continue
 
-        if not fields:
+        if not actual_fields:
             ok += 1  # nothing to restore, counts as success
             continue
         try:
-            write_exif_timestamps(img_path, fields)
+            write_exif_timestamps(img_path, actual_fields)
             ok += 1
         except Exception as e:
             errors.append(f"{filename}: {e}")
@@ -118,7 +128,11 @@ def rename_backup_entry(folder_path: Path, old_name: str, new_name: str) -> None
 
 
 def has_backup(folder_path: Path) -> bool:
-    return (folder_path / BACKUP_FILENAME).exists()
+    """Return True if folder has a photo or video backup file."""
+    return (
+        (folder_path / BACKUP_FILENAME).exists()
+        or (folder_path / VIDEO_BACKUP_FILENAME).exists()
+    )
 
 
 def get_backup_info(folder_path: Path) -> dict:
@@ -158,8 +172,8 @@ def append_historial(
         "EXIF original:",
     ]
     has_any = False
-    for field in _EXIF_FIELDS_ORDER:
-        val = original_exif.get(field)
+    # Show all fields present in the dict, sorted for consistent output
+    for field, val in sorted(original_exif.items()):
         if val:
             lines.append(f"  {field}:  {val}")
             has_any = True
@@ -177,6 +191,21 @@ def append_historial(
             f.write("\n".join(lines) + "\n")
     except OSError:
         pass
+
+
+def _extract_fields(entry) -> dict:
+    """Return the actual EXIF fields dict from a backup entry.
+
+    Handles both the v1 format (flat fields dict stored directly) and the v2
+    format ({"original_exif_dict": {...fields...}, "timestamp": "..."}).
+    Returns an empty dict for any unexpected value.
+    """
+    if isinstance(entry, dict):
+        if "original_exif_dict" in entry:
+            result = entry["original_exif_dict"]
+            return result if isinstance(result, dict) else {}
+        return entry   # v1: entry IS the fields dict
+    return {}
 
 
 def _find_by_exif_dates(folder_path: Path, fields: dict) -> Optional[Path]:

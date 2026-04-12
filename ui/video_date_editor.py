@@ -156,12 +156,15 @@ class _ApplyWorker(QObject):
                     )
                     self.applied_renames[path] = new_path
 
-                # Historial entry — mirrors date_editor.py pattern
+                # Historial entry — mirrors date_editor.py pattern.
+                # Operation is "fecha_editada" when the date was changed,
+                # "renombrado" when keep_mode (only a rename happened).
                 try:
                     video_fields = {"DateTimeOriginal": old_str}
+                    operation = "renombrado" if self._keep_mode else "fecha_editada"
                     append_historial(
                         path.parent, path.name, applied_new_name,
-                        video_fields, "fecha_editada",
+                        video_fields, operation,
                     )
                 except Exception:
                     pass

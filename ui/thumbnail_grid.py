@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QComboBox,
     QListWidget, QListWidgetItem, QAbstractItemView, QStyledItemDelegate,
     QStyleOptionViewItem, QApplication, QFileDialog, QMenu, QMessageBox, QInputDialog,
-    QProgressBar, QLayout,
+    QProgressBar, QLayout, QCheckBox,
 )
 from PyQt6.QtCore import QModelIndex
 
@@ -309,6 +309,17 @@ class ThumbnailGrid(QWidget):
         self._btn_sort_dir.clicked.connect(self._on_sort_dir_toggled)
         apply_button_style(self._btn_sort_dir)
 
+        # "Solo sin fecha" filter checkbox — default ON so the user immediately
+        # sees only the photos that need attention.
+        self._chk_sin_fecha = QCheckBox("Solo sin fecha")
+        self._chk_sin_fecha.setChecked(True)
+        self._chk_sin_fecha.setToolTip(
+            "Cuando está marcado, muestra solo las fotos sin fecha EXIF válida\n"
+            "(fecha ausente o con valor incorrecto como 01/01/2000).\n"
+            "Desmarcá para ver todas las fotos."
+        )
+        self._chk_sin_fecha.toggled.connect(self._apply_filter)
+
         # Red-border legend
         self._lbl_invalid_legend = QLabel("🔴 = fecha inválida")
         self._lbl_invalid_legend.setStyleSheet("font-size: 10px; color: #aaaaaa; padding: 0 4px;")
@@ -320,6 +331,7 @@ class ThumbnailGrid(QWidget):
 
         row1 = QHBoxLayout()
         row1.setContentsMargins(0, 0, 0, 0)
+        row1.addWidget(self._chk_sin_fecha)
         row1.addWidget(self._sort_combo)
         row1.addWidget(self._btn_sort_dir)
         row1.addStretch()
@@ -421,6 +433,30 @@ class ThumbnailGrid(QWidget):
         item.setText(f"{photo_path.name}\n{display_date}")
         item.setData(_ROLE_DATE, date_str)
         item.setData(_ROLE_INVALID, invalid)
+
+    # ── Filter ────────────────────────────────────────────────────────────
+
+    def _apply_filter(self) -> None:
+        """Show/hide items based on the 'Solo sin fecha' checkbox.
+
+        "Sin fecha" = date_str is empty OR is_invalid (e.g. 2000-01-01).
+        Items whose EXIF data hasn't loaded yet have date_str="" which reads
+        as sin fecha — they stay visible until real data arrives.
+        """
+        sin_fecha_only = self._chk_sin_fecha.isChecked()
+        visible = 0
+        for i in range(self._list.count()):
+            item = self._list.item(i)
+            if sin_fecha_only:
+                date_str = item.data(_ROLE_DATE) or ""
+                is_inv   = bool(item.data(_ROLE_INVALID))
+                show     = not date_str or is_inv   # show only invalid/missing dates
+            else:
+                show = True
+            item.setHidden(not show)
+            if show:
+                visible += 1
+        self._lbl_count.setText(f"{visible} fotos")
 
     # ── Sort controls ──────────────────────────────────────────────────────
 
@@ -642,6 +678,8 @@ class ThumbnailGrid(QWidget):
         finally:
             self._list.setUpdatesEnabled(True)
             self._list.update()
+        # Apply filter after each batch so items with valid dates hide immediately
+        self._apply_filter()
 
     def _on_load_progress(self, current: int, total: int) -> None:
         """Update progress bar and count label during Phase 2 loading."""
@@ -668,10 +706,9 @@ class ThumbnailGrid(QWidget):
         if self._sort_mode == _SORT_DATE:
             self._apply_sort()
 
-        # Finalise UI
-        n = self._list.count()
-        self._lbl_count.setText(f"{n} fotos")
+        # Finalise UI: apply filter (sets count label to visible items)
         self._progress_bar.setVisible(False)
+        self._apply_filter()
 
         # Process any folder load that arrived while we were busy
         if self._pending_folder:
@@ -875,8 +912,8 @@ class ThumbnailGrid(QWidget):
             self._pixmap_cache.pop(path_str, None)
 
         remaining = self._list.count()
-        self._lbl_count.setText(f"{remaining} fotos")
         self._btn_edit.setEnabled(remaining > 0)
+        self._apply_filter()
         if moved:
             self.photos_deleted.emit(moved)
 
@@ -944,10 +981,10 @@ class ThumbnailGrid(QWidget):
                     self._list.takeItem(row)
             self._pixmap_cache.pop(path_str, None)
 
-        # Refresh count
+        # Refresh count (respects active filter)
         remaining = self._list.count()
-        self._lbl_count.setText(f"{remaining} fotos")
         self._btn_edit.setEnabled(remaining > 0)
+        self._apply_filter()
 
         if errors:
             mb_warning(

@@ -250,6 +250,9 @@ class MainWindow(QMainWindow):
             lambda: self._center_tabs.setCurrentIndex(1)
         )
 
+        # Tab switching: update duplicate panel media type + clear stale detail panel
+        self._center_tabs.currentChanged.connect(self._on_center_tab_changed)
+
     # ── Slots ──────────────────────────────────────────────────────────────
 
     def _on_folder_selected(self, path: Path) -> None:
@@ -272,6 +275,22 @@ class MainWindow(QMainWindow):
     def _on_folder_changed_duplicates(self, path: Path) -> None:
         """Forward folder change to the duplicates tab."""
         self._duplicate_panel.on_folder_changed(path)
+
+    def _on_center_tab_changed(self, index: int) -> None:
+        """Called when the user switches between Photos / Duplicates / Videos tabs.
+
+        - Photos (0): tell duplicate panel we're in photo mode.
+        - Videos (2): tell duplicate panel we're in video mode; clear the photo
+          detail panel so the stale image doesn't remain visible.
+        - Duplicates (1): no media-type change (inherits from last Photos/Videos visit).
+        """
+        if index == 0:   # Photos tab
+            self._duplicate_panel.set_media_type("photo")
+        elif index == 2:  # Videos tab
+            self._duplicate_panel.set_media_type("video")
+            # Clear photo detail — its image would otherwise appear "stuck"
+            # while the user is browsing the Videos tab.
+            self._photo_detail.clear()
 
     def _on_files_moved_videos(self, src_folder: Path, moved: list) -> None:
         """Forward shared-tree file-move events to the video panel."""

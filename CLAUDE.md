@@ -1,6 +1,6 @@
 # EXIF Manager — CLAUDE.md
 
-**Last updated:** 2026-04-13
+**Last updated:** 2026-04-13 (session 3)
 **Repo:** github.com/emebecnc/exif-manager
 **Local:** D:\homelab\exif_manager\
 
@@ -121,3 +121,30 @@ Config: main.py, build.spec, requirements.txt, run_exif_manager.bat
 
 - Deleted: `update_claude_md.bat`
 - Deleted: `claude_code_prompt.md`
+
+## Session changes: Fix video historial operation label
+
+- `ui/video_date_editor.py` — fixed operation label in `append_historial()` call:
+  was always `"fecha_editada"`; now correctly uses `"renombrado"` when `keep_mode=True`
+  (rename-only, no date change), matching the `date_editor.py` photo behaviour.
+
+## Session changes: 4 improvements (persist green marker, sin-fecha filter, full backup, dynamic dupe button)
+
+- `core/backup_manager.py`:
+  - `has_backup()` now also checks `.video_backup.json` → green marker shows for video-processed folders
+  - `create_backup()` v2 format: `{"original_exif_dict": {...}, "timestamp": "..."}` per entry
+  - `restore_backup()` handles both v1 (flat dict) and v2 via new `_extract_fields()` helper
+  - `append_historial()` now iterates ALL keys in `original_exif` (not just 3 hardcoded fields)
+  - Added `VIDEO_BACKUP_FILENAME = ".video_backup.json"` public constant
+- `ui/thumbnail_grid.py`:
+  - Added `QCheckBox("Solo sin fecha")` (default CHECKED) to the sort/filter bar
+  - Added `_apply_filter()` — hides items with valid dates when checked; updates count label
+  - Filter applied after each thumbnail batch and after worker finishes
+- `ui/duplicate_panel.py`:
+  - Added `_media_type` state (`"photo"` default)
+  - Added `set_media_type("photo"|"video")` — updates button labels and clears stale results
+  - Buttons now read "Buscar duplicados de foto/video" instead of generic "Buscar en carpeta actual"
+- `ui/main_window.py`:
+  - Connected `_center_tabs.currentChanged` to new `_on_center_tab_changed()` slot
+  - Photos tab → `duplicate_panel.set_media_type("photo")`
+  - Videos tab → `duplicate_panel.set_media_type("video")` + `photo_detail.clear()` (fixes stuck image)

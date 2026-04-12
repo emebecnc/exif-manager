@@ -364,6 +364,9 @@ class DuplicatePanel(QWidget):
         self._root:           Optional[Path] = None
         self._current_folder: Optional[Path] = None
 
+        # "photo" or "video" — controls button labels; default to photo
+        self._media_type: str = "photo"
+
         # Scan worker / thread
         self._scan_worker: Optional[DuplicateScanWorker] = None
         self._scan_thread: Optional[QThread]             = None
@@ -403,6 +406,32 @@ class DuplicatePanel(QWidget):
     def set_current_folder(self, folder: Optional[Path]) -> None:
         self._current_folder = folder
         self._update_button_states()
+
+    def set_media_type(self, media_type: str) -> None:
+        """Switch between 'photo' and 'video' duplicate search mode.
+
+        Updates button labels to reflect the active media type and clears
+        stale results from the previous media type so the user isn't confused.
+        """
+        if media_type == self._media_type:
+            return
+        self._media_type = media_type
+
+        # Update scan button labels
+        kind = "foto" if media_type == "photo" else "video"
+        self._btn_scan_folder.setText(f"🔍 Buscar duplicados de {kind}")
+        self._btn_scan_root.setText(f"🔍 Buscar duplicados de {kind} (raíz)")
+
+        # Clear results that belonged to the previous media type
+        if self._groups:
+            self._groups.clear()
+            self._selections.clear()
+            self._groups_list.clear()
+            self._current_group_idx = -1
+            self._current_cards.clear()
+            self._right_stack.setCurrentIndex(0)
+            self._btn_dedup_all.setEnabled(False)
+            self._lbl_header.setText("No hay duplicados escaneados aún.")
 
     def start_scan(self, path: Path) -> None:
         """Begin a duplicate scan of ``path``. Emits ``scan_started`` first."""
@@ -444,15 +473,15 @@ class DuplicatePanel(QWidget):
         self._btn_cancel.clicked.connect(self._on_cancel_scan)
         left_layout.addWidget(self._btn_cancel)
 
-        self._btn_scan_folder = QPushButton("🔍 Buscar en carpeta actual")
+        self._btn_scan_folder = QPushButton("🔍 Buscar duplicados de foto")
         self._btn_scan_folder.setToolTip(
-            "Escanea solo la carpeta actualmente abierta en el visor de fotos."
+            "Escanea solo la carpeta actualmente abierta en busca de duplicados."
         )
         apply_button_style(self._btn_scan_folder)
         self._btn_scan_folder.clicked.connect(self._on_scan_folder_clicked)
         left_layout.addWidget(self._btn_scan_folder)
 
-        self._btn_scan_root = QPushButton("🔍 Buscar en carpeta raíz")
+        self._btn_scan_root = QPushButton("🔍 Buscar duplicados de foto (raíz)")
         self._btn_scan_root.setToolTip(
             "Escanea toda la colección desde la carpeta raíz.\n"
             "Puede tardar varios minutos en colecciones grandes."
