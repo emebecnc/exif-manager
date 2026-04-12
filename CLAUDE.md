@@ -1,97 +1,123 @@
-# CLAUDE.md — exif_manager project guide
+# EXIF Manager — CLAUDE.md
 
-## Architecture Summary
+**Last updated:** 2026-04-13
+**Repo:** github.com/emebecnc/exif-manager
+**Local:** D:\homelab\exif_manager\
 
-### core/ files
-| File | Purpose |
-|------|---------|
-| `backup_manager.py` | Backup and restore EXIF data to/from `.exif_backup.json` |
-| `duplicate_finder.py` | MD5-based exact duplicate detection; `DuplicateScanWorker` (QObject) for background use |
-| `exif_handler.py` | EXIF read/write via piexif + Pillow; exposes `read_exif()`, `write_exif_date()` |
-| `file_scanner.py` | Folder scanning, MD5 hashing, `scan_subfolders()`, `walk_images()`, `unique_dest()`; defines `EXCLUDED_FOLDERS` |
-| `video_handler.py` | Video metadata read/write via ffprobe+ffmpeg (hachoir fallback); `get_video_metadata()`, `write_video_date()`, `get_video_thumbnail()`, `scan_video_folder()`, backup helpers |
-| `video_duplicate_finder.py` | MD5-based duplicate detection for videos; `VideoDuplicateScanWorker` + `video_quality_score()` |
+---
 
-### ui/ files
-| File | Purpose |
-|------|---------|
-| `cleanup_dialog.py` | Modal dialog (Herramientas menu) to scan and delete temp/trash folders under a root |
-| `date_editor.py` | Date editing dialog: folder-mode, single-photo, or explicit-selection; **reference thread pattern** |
-| `duplicate_panel.py` | Permanent "Duplicados" tab: scan, side-by-side card comparison, batch dedup |
-| `duplicate_viewer.py` | Legacy duplicate dialog — superseded by `duplicate_panel.py`, kept for reference |
-| `folder_tree.py` | Left panel: lazy-loading folder tree with backup indicators |
-| `log_viewer.py` | `LogManager` (shared singleton) + `LogViewerDialog` |
-| `main_window.py` | App shell: `QTabWidget` with **Fotos** + **Duplicados** + **Videos** tabs, menu bar, signal wiring, undo stack |
-| `photo_detail.py` | Right panel: full EXIF metadata table + image preview + edit button |
-| `styles.py` | Dark-theme QSS constants shared across all widgets |
-| `thumbnail_grid.py` | Center panel: two-phase background thumbnail loader with disk cache, sort controls, two-row button bar, progress bar for large folders |
-| `video_date_editor.py` | Date editing dialog for videos (mirrors `date_editor.py`); modes: folder / single / selection; `_ApplyWorker` writes via ffmpeg |
-| `video_detail.py` | Right panel for Videos tab: metadata groups + async first-frame preview + edit button |
-| `video_grid.py` | `VideoGrid` (thumbnail list + sort + context menu) + `VideoPanel` (self-contained tab with its own `FolderTreePanel`) |
+## PROJECT
 
-### Key patterns
+EXIF Manager — Desktop Windows app (PyQt6 + Python 3.11) to manage photo/video EXIF dates.
 
-**Thread lifetime (use date_editor.py as reference):**
-```python
-self._worker = Worker(...)
-self._thread = QThread(self)
-self._worker.moveToThread(self._thread)
-self._thread.started.connect(self._worker.run)
-self._worker.finished.connect(self._on_finished)   # NOT connected to thread.quit()
-self._thread.finished.connect(self._cleanup_thread)
-self._thread.start()
+**Stack:** Python 3.11, PyQt6 6.4+, Pillow, piexif, ffmpeg-python, hachoir, pywin32
 
-def _on_finished(self, ...):
-    if self._thread and self._thread.isRunning():
-        self._thread.quit()
-        self._thread.wait()   # no terminate fallback needed; workers are cooperative
-    # now safe to touch UI
-```
-Do NOT also connect `worker.finished → thread.quit` — causes double `quit()`.
+---
 
-**Path handling:** Always store and pass `Path` objects. Use `str(path)` only for `shutil.move()` / `os` calls. Convert incoming strings with `Path(s)`, never `eval()`.
+## ARCHITECTURE (v2.0)
 
-**Lambda capture in loops:** `lambda checked, p=path: func(p)` — default-arg capture, never bare closure.
+QMainWindow
+└─ QSplitter (horizontal)
+   ├─ FolderTreePanel (220px) ← SINGLE TREE
+   └─ QTabWidget
+      ├─ 📷 Photos (grid + metadata)
+      ├─ 🎬 Videos (grid + metadata)
+      └─ 🔀 Duplicates (detection + trash)
 
-**Excluded folders:** `EXCLUDED_FOLDERS` in `file_scanner.py` = `{"_duplicados_eliminados", "_eliminados", ...}`. All scanners (`scan_subfolders`, `walk_images`, `DuplicateScanWorker`) skip these automatically.
+Signal: FolderTree folder_changed(Path) → all tabs' on_folder_changed() slots
 
-**piexif safety rules:**
-- Always call `_clean_exif_for_dump(exif_dict)` before `piexif.dump()` — never call dump() directly.
-- `_clean_exif_for_dump` strips `MakerNote` (tag `0x927C` / 37500) and all `_EXIF_UNDEFINED_TAGS` that arrived as `int` instead of `bytes` (would crash dump).
-- `_EXIF_UNDEFINED_TAGS` is defined at top of `exif_handler.py`; add any new crash-causing tags there.
+---
 
-### Video support (new in this session)
+## FEATURES
 
-**ffmpeg dependency:**
-- `FFMPEG_AVAILABLE = _check_ffmpeg()` computed in `main.py` before `QApplication`; passed to `MainWindow(ffmpeg_available=...)` → `VideoPanel(ffmpeg_available=...)`
-- If False: yellow warning banner at top of Videos tab; thumbnails show placeholder; write-date button disabled
-- Fallback metadata reading uses `hachoir` (no ffmpeg required)
-- Detection also checks for a bundled `ffmpeg.exe` in the project folder
+### ✅ Photos
+- Tree with photo+video counts
+- 2-phase thumbnail grid (placeholder → EXIF+cache)
+- LRU cache (200 items max)
+- Multi-select (Ctrl/Shift)
+- EXIF editor: independent year/month/day
+- Auto-rename with date format
+- Drag & drop to tree
+- Backup (.exif_backup.json) + history
+- Duplicates by MD5 + trash folder
+- Cleanup tool
+- Log viewer
 
-**Thread patterns for video workers:**
-- `_VideoThumbnailWorker` follows exact same thread lifetime as `_ThumbnailWorker` (see date_editor.py reference)
-- `_ApplyWorker` in `video_date_editor.py`: same finished→quit+wait pattern, never connects `finished→thread.quit`
-- `_ThumbWorker` in `video_detail.py`: lightweight single-file thumbnail loader
+### ✅ Videos
+- Grid with first-frame thumbnails
+- Metadata: duration, resolution, FPS, codec, bitrate
+- Date editing (same as photos)
+- Backup (.video_backup.json) + history
+- Duplicates by MD5 + trash folder
+- Supported: MP4, MOV, M4V, MKV, AVI, WMV
+- .3GP: skip gracefully
 
-**Video thumbnail cache:**
-- Uses same `_thumbcache` subfolder as photos (per folder)
-- Cache key = MD5(path+mtime), same as `_thumb_cache_key()` in `thumbnail_grid.py`
-- Skipped when `ffmpeg_available=False`
+### ⚠️ Optimizations
+- Batch updates every 20 items
+- LRU cache
+- setUpdatesEnabled(False) bulk load
+- Virtual scrolling: TODO
 
-**Backup for videos:**
-- `backup_video_metadata()` writes/appends to `.video_backup.json` (same atomic-write pattern as `.exif_backup.json`)
-- `restore_video_backup()` reads it back and calls `write_video_date()`
+---
 
-**VideoPanel architecture:**
-- Fully self-contained `QWidget` added as third tab — does NOT share the main window's shared `FolderTreePanel`
-- Has its own `FolderTreePanel(main_window=None, ...)` — passing `None` prevents `set_root()` calls on the shared state
-- All signal wiring is inside `VideoPanel._wire_signals()`
+## CRITICAL PATTERNS
 
-**VIDEO_EXTENSIONS** = `.mp4 .mov .avi .mkv .3gp .m4v .wmv`
+Threading (MANDATORY):
+- Create: self._thread = QThread() + self._worker = MyWorker()
+- Move worker: self._worker.moveToThread(self._thread)
+- Connect: started → worker.run, finished → _on_finished, finished → quit, thread.finished → _cleanup_thread
+- Cleanup: wait(5000), if still running → terminate() + wait(1000), then deleteLater()
 
-**Excluded folders** for video scans: reuses `EXCLUDED_FOLDERS` from `file_scanner.py`
+Lambda (always default arg): lambda checked, p=path: self._on_delete(p)
 
-### Current known bugs
-None open. Last fixed:
-- **duplicate_panel.py** — lambda capture bug in `_show_group` loop (used bare closure; fixed with `gi=group_idx` default-arg pattern).
-- **duplicate_panel.py** — double `quit()` in scan and dedup workers: `finished → thread.quit` signal connection removed; only the in-handler `quit()+wait()` remains.
+Progress (BEFORE thread.start()): setMinimumDuration(0), show(), processEvents(), THEN start()
+
+Excluded folders (EVERY os.walk): filter dirs[:] to exclude _thumbcache, _eliminados, _duplicados_eliminados, __pycache__
+
+piexif (EXACT order): read_bytes → piexif.load() → pop MakerNote → _clean_exif_for_dump() → modify date only → piexif.dump() → piexif.insert()
+
+---
+
+## FILES
+
+Core: exif_handler, video_handler, file_scanner, backup_manager, duplicate_finder, video_duplicate_finder
+
+UI: main_window, folder_tree, thumbnail_grid, photo_detail, video_grid, video_detail, duplicate_panel, date_editor, video_date_editor, cleanup_dialog, log_viewer, styles
+
+Config: main.py, build.spec, requirements.txt, run_exif_manager.bat
+
+---
+
+## BUGS FIXED (Latest)
+
+✅ Tree duplication → single tree
+✅ Video counting → V(X) displays
+✅ FFmpeg codec=copy → no recompression
+✅ Video error handling → no freeze
+✅ Video history → logging works
+✅ Video backup → _video_backup.json created
+✅ Video duplicates → _duplicados_eliminados works
+✅ Cleanup threading → no double-quit race
+✅ Drag & drop → verified OK
+✅ Conservar button → verified OK
+
+---
+
+## CRITICAL NOTES
+
+- EXCLUDED_FOLDERS in EVERY os.walk()
+- piexif.load() ALWAYS first
+- QThread + worker MANDATORY
+- Progress dialog BEFORE thread.start()
+- Batch updates every 20 items
+- Cleanup threads ALWAYS
+- Safety check _current_folder (can be None)
+- NO double-quit() on workers
+- Lambda: lambda checked, p=path: func(p)
+
+---
+
+## Session changes: Cleanup - removed unnecessary scripts and prompts
+
+- Deleted: `update_claude_md.bat`
+- Deleted: `claude_code_prompt.md`
