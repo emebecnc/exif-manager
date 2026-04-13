@@ -308,26 +308,42 @@ def has_video_backup(folder: Path) -> bool:
 
 
 def backup_video_metadata(folder: Path, filename: str, metadata: dict) -> None:
-    """Append one entry to folder/.video_backup.json (atomic write, best-effort)."""
+    """Append one entry to folder/.video_backup.json (atomic write).
+
+    Saves all recoverable fields so that restoring actually brings back the
+    original date.  Raises on I/O errors so callers can decide whether to
+    abort or proceed without a backup.
+    """
     backup_path = folder / BACKUP_FILENAME
-    try:
-        if backup_path.exists():
-            with open(backup_path, encoding="utf-8") as f:
-                data = json.load(f)
-        else:
-            data = {
-                "_meta": {
-                    "created_at": datetime.now().isoformat(timespec="seconds")
-                }
+    if backup_path.exists():
+        with open(backup_path, encoding="utf-8") as f:
+            data = json.load(f)
+    else:
+        data = {
+            "_meta": {
+                "created_at": datetime.now().isoformat(timespec="seconds")
             }
-        entry: dict = {}
-        ct = metadata.get("creation_time")
-        if ct:
-            entry["creation_time"] = ct.isoformat()
-        data[filename] = entry
-        _atomic_write_json(backup_path, data)
-    except Exception:
-        pass  # never abort the main operation
+        }
+
+    # Serialise all useful fields; convert datetime → ISO string
+    entry: dict = {}
+    for key in ("creation_time", "date_modified", "date_created"):
+        val = metadata.get(key)
+        if isinstance(val, datetime):
+            entry[key] = val.isoformat()
+        elif val:
+            entry[key] = str(val)
+    for key in (
+        "duration_seconds", "width", "height", "fps",
+        "codec_video", "codec_audio", "bitrate", "size_bytes",
+        "make", "model", "rotation", "format_name",
+    ):
+        val = metadata.get(key)
+        if val is not None and val != "" and val != 0:
+            entry[key] = val
+
+    data[filename] = entry
+    _atomic_write_json(backup_path, data)
 
 
 def restore_video_backup(folder: Path) -> dict:

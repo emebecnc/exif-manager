@@ -3,7 +3,7 @@ from collections import deque
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import Qt, QSettings, QStandardPaths, pyqtSignal
+from PyQt6.QtCore import Qt, QSettings, QStandardPaths, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QSplitter, QVBoxLayout,
     QMenuBar, QStatusBar, QMessageBox, QProgressDialog,
@@ -195,6 +195,8 @@ class MainWindow(QMainWindow):
         tools_menu.addAction(action_cleanup)
 
     def _wire_signals(self) -> None:
+        # Folder click → show "Cargando…" indicator before the tabs start loading
+        self._folder_tree.folder_loading_started.connect(self._on_folder_loading_started)
         # Folder selection → update state + broadcast to all tabs
         self._folder_tree.folder_selected.connect(self._on_folder_selected)
 
@@ -261,17 +263,33 @@ class MainWindow(QMainWindow):
             lambda: self._center_tabs.setCurrentIndex(2)
         )
 
+        # Lock folder tree while a duplicate scan is running so mid-scan folder
+        # changes can't interrupt the worker or corrupt the result state.
+        self._duplicate_panel.scan_busy_changed.connect(
+            self._folder_tree.set_scan_locked
+        )
+
         # Tab switching: update duplicate panel media type + clear stale detail panel
         self._center_tabs.currentChanged.connect(self._on_center_tab_changed)
 
     # ── Slots ──────────────────────────────────────────────────────────────
 
+    def _on_folder_loading_started(self, path: Path) -> None:
+        """Show loading feedback as soon as the user clicks a folder in the tree."""
+        self._status_bar.showMessage(f"Cargando carpeta: {path.name}…")
+        self.setCursor(Qt.CursorShape.WaitCursor)
+
     def _on_folder_selected(self, path: Path) -> None:
         """Slot connected to the shared FolderTreePanel.folder_selected signal."""
         self._current_folder = path
-        self._status_bar.showMessage(str(path))
-        # Broadcast to all tabs through the shared signal
+        # Broadcast to all tabs through the shared signal (starts background workers)
         self.folder_changed.emit(path)
+        # Restore cursor + show path after one event-loop cycle so the loading
+        # message is visible for at least one frame before the tabs take over.
+        QTimer.singleShot(0, lambda p=path: (
+            self.setCursor(Qt.CursorShape.ArrowCursor),
+            self._status_bar.showMessage(str(p)),
+        ))
 
     # ── Per-tab folder-change adapters (replaced by on_folder_changed slots) ──
 
@@ -391,6 +409,8 @@ class MainWindow(QMainWindow):
             self._thumbnail_grid.select_after_load(new_path)
             self._photo_detail.load_photo(new_path)
             self._thumbnail_grid.load_folder(new_path.parent)
+            # Refresh tree so backup indicator turns green (was missing for single mode)
+            self._folder_tree.refresh_item(new_path.parent)
             self._status_bar.showMessage(f"Fecha actualizada: {new_path.name}")
 
     def _open_date_editor_from_filename(self, photo_path: Path) -> None:
@@ -410,6 +430,8 @@ class MainWindow(QMainWindow):
             self._thumbnail_grid.select_after_load(new_path)
             self._photo_detail.load_photo(new_path)
             self._thumbnail_grid.load_folder(new_path.parent)
+            # Refresh tree so backup indicator turns green (was missing for single mode)
+            self._folder_tree.refresh_item(new_path.parent)
             self._status_bar.showMessage(f"Fecha actualizada: {new_path.name}")
 
     def _on_photo_renamed(self, old_path: Path, new_path: Path) -> None:

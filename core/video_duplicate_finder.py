@@ -1,4 +1,5 @@
 """MD5-based duplicate detection for video files."""
+import time
 import traceback
 from pathlib import Path
 from typing import List
@@ -19,14 +20,16 @@ class VideoDuplicateScanWorker(QObject):
         score = (width * height) * 0.5 + bitrate * 0.3 + duration_seconds * 0.2
     """
 
-    progress = pyqtSignal(int, int, str)   # current, total, filename
-    finished = pyqtSignal(list)            # list of groups; each group = list[Path]
-    error    = pyqtSignal(str)
+    progress        = pyqtSignal(int, int, str)   # current, total, filename
+    partial_results = pyqtSignal(list)            # groups found so far (intermediate)
+    finished        = pyqtSignal(list)            # final complete list of groups
+    error           = pyqtSignal(str)
 
     def __init__(self, root_path: Path, parent=None):
         super().__init__(parent)
-        self.root_path  = root_path
-        self._cancelled = False
+        self.root_path    = root_path
+        self._cancelled   = False
+        self.error_details: str = ""   # full traceback, readable via _on_scan_error
 
     def cancel(self) -> None:
         self._cancelled = True
@@ -39,6 +42,7 @@ class VideoDuplicateScanWorker(QObject):
             try:
                 all_files = list(iter_videos_recursive(self.root_path))
             except Exception as e_collect:
+                self.error_details = traceback.format_exc()
                 traceback.print_exc()
                 self.error.emit(f"Error collecting video list: {e_collect}")
                 return
@@ -84,12 +88,17 @@ class VideoDuplicateScanWorker(QObject):
                     skipped += 1
                     continue
 
-                # 100-file progress checkpoint
-                if (i + 1) % 100 == 0:
+                # 50-file progress checkpoint — yield to event loop so the UI
+                # progress dialog updates smoothly on large folders (1600+ files).
+                if (i + 1) % 50 == 0:
+                    time.sleep(0)   # release GIL → let Qt main thread repaint
                     print(
                         f"  [checkpoint] {i + 1}/{total} processed, "
                         f"{len(md5_map)} unique hashes, {skipped} skipped"
                     )
+                    partial = [g for g in md5_map.values() if len(g) > 1]
+                    partial.sort(key=lambda g: (-len(g), str(g[0])))
+                    self.partial_results.emit(partial)
 
             # ── Emit results ───────────────────────────────────────────────
             groups = [g for g in md5_map.values() if len(g) > 1]
@@ -103,7 +112,15 @@ class VideoDuplicateScanWorker(QObject):
             self.finished.emit(groups)
 
         except Exception as e:
+            self.error_details = traceback.format_exc()
             traceback.print_exc()
+            try:
+                log_path = Path(__file__).parent.parent / "scan_error.log"
+                with open(log_path, "w", encoding="utf-8") as f:
+                    f.write(f"VideoDuplicateScanWorker error\n{self.error_details}")
+                print(f"[VideoScan] error log written to: {log_path}")
+            except Exception:
+                pass
             self.error.emit(str(e))
 
 

@@ -23,7 +23,7 @@ from core.video_handler import (
 from core.exif_handler import parse_date_from_filename
 from core.backup_manager import append_historial
 from ui.log_viewer import LogManager
-from ui.styles import apply_button_style, apply_primary_button_style, mb_warning, mb_info
+from ui.styles import apply_button_style, apply_primary_button_style, mb_warning, mb_info, mb_question
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -121,9 +121,6 @@ class _ApplyWorker(QObject):
                     errors.append(f"{path.name}: no se pudo determinar la fecha")
                     continue
 
-                # Backup before writing (best-effort)
-                backup_video_metadata(path.parent, path.name, meta)
-
                 old_str = existing.isoformat() if existing else ""
                 if not self._keep_mode:
                     success = write_video_date(path, new_dt)
@@ -160,11 +157,16 @@ class _ApplyWorker(QObject):
                 # Operation is "fecha_editada" when the date was changed,
                 # "renombrado" when keep_mode (only a rename happened).
                 try:
-                    video_fields = {"DateTimeOriginal": old_str}
-                    operation = "renombrado" if self._keep_mode else "fecha_editada"
+                    operation    = "renombrado" if self._keep_mode else "fecha_editada"
+                    exif_before  = {"DateTimeOriginal": old_str}
+                    exif_after_v: Optional[dict] = None
+                    if not self._keep_mode and new_dt is not None:
+                        exif_after_v = {
+                            "DateTimeOriginal": new_dt.strftime("%Y:%m:%d %H:%M:%S")
+                        }
                     append_historial(
-                        path.parent, path.name, applied_new_name,
-                        video_fields, operation,
+                        path.parent, path.name, operation,
+                        exif_before, exif_after_v, applied_new_name,
                     )
                 except Exception:
                     pass
@@ -511,6 +513,30 @@ class VideoDateEditorDialog(QDialog):
         if not self._paths:
             self.accept()
             return
+
+        # ── Pre-apply backup ───────────────────────────────────────────────────
+        # Back up metadata for every file BEFORE any changes are written.
+        # Only needed in Cambiar mode (keep_mode = rename-only, no date changes).
+        if not self._radio_keep.isChecked():
+            backup_failures: list[str] = []
+            for path in self._paths:
+                try:
+                    meta = get_video_metadata(path)
+                    backup_video_metadata(path.parent, path.name, meta)
+                except Exception as e:
+                    backup_failures.append(f"{path.name}: {e}")
+            if backup_failures:
+                reply = mb_question(
+                    self, "Error en backup",
+                    "No se pudo crear backup para "
+                    f"{len(backup_failures)} archivo(s):\n\n"
+                    + "\n".join(backup_failures[:5])
+                    + ("\n…" if len(backup_failures) > 5 else "")
+                    + "\n\n¿Continuar de todas formas?",
+                )
+                from PyQt6.QtWidgets import QMessageBox
+                if reply != QMessageBox.StandardButton.Yes:
+                    return
 
         progress = QProgressDialog(
             "Procesando videos…", "Cancelar", 0, len(self._paths), self

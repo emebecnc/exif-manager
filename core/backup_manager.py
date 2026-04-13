@@ -15,35 +15,66 @@ HISTORIAL_FILENAME    = "_historial_original.txt"
 _HISTORIAL_HEADER     = "# Historial de cambios — generado por ExifManager\n"
 
 
-def create_backup(folder_path: Path) -> int:
-    """Backup current EXIF fields for all JPGs in folder_path.
+def create_backup(folder: Path, files_data: dict) -> int:
+    """Create or update .exif_backup.json by merging new entries with existing ones.
 
-    Returns the number of files backed up.
-    Writes .exif_backup.json atomically using tempfile + os.replace.
+    Args:
+        folder:     Directory that contains (or will contain) .exif_backup.json.
+        files_data: Mapping of ``{filename: exif_fields_dict}`` for the files
+                    about to be edited, e.g.::
 
-    Entry format (v2):
-        {"filename.jpg": {"original_exif_dict": {fields}, "timestamp": "ISO"}, ...}
-    restore_backup() handles both v1 (flat fields dict) and v2 transparently.
+                        {
+                            "photo.jpg": {
+                                "DateTimeOriginal": "2020:01:01 12:00:00",
+                                ...
+                            }
+                        }
+
+    Merge rules:
+      * If ``.exif_backup.json`` already exists its contents are loaded first so
+        entries for *other* files are preserved.
+      * Entries for the same filename are updated (new values replace old).
+      * ``_meta`` is created on first write and its ``last_updated`` stamp is
+        refreshed on every subsequent write.
+
+    Returns the number of file entries written (``len(files_data)``).
+    Raises on I/O error — callers should catch and ask the user whether to
+    proceed without a backup.
     """
-    images = scan_folder(folder_path)
-    now_iso = datetime.now().isoformat(timespec="seconds")
-    backup = {
-        "_meta": {
+    backup_path = folder / BACKUP_FILENAME
+    now_iso     = datetime.now().isoformat(timespec="seconds")
+
+    # Load existing backup so we can merge without losing other entries
+    if backup_path.exists():
+        try:
+            with open(backup_path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            data = {}   # corrupt / unreadable — start fresh
+    else:
+        data = {}
+
+    # Ensure _meta block exists and is up-to-date
+    if "_meta" not in data:
+        data["_meta"] = {
             "created_at": now_iso,
-            "file_count": len(images),
-            "folder": str(folder_path),
+            "folder":     str(folder),
         }
-    }
+    data["_meta"]["last_updated"] = now_iso
+    data["_meta"]["folder"]       = str(folder)
 
-    for img_path in images:
-        exif = read_exif(img_path)
-        backup[img_path.name] = {
-            "original_exif_dict": exif["fields"],   # full fields dict
-            "timestamp": now_iso,
+    # Merge: each entry uses v2 format {"original_exif_dict": {...}, "timestamp": "ISO"}
+    for filename, fields in files_data.items():
+        data[filename] = {
+            "original_exif_dict": fields,
+            "timestamp":          now_iso,
         }
 
-    _atomic_write_json(folder_path / BACKUP_FILENAME, backup)
-    return len(images)
+    print(f"[BACKUP] Writing {len(files_data)} entries → {backup_path}")
+    _atomic_write_json(backup_path, data)
+    exists_after = backup_path.exists()
+    print(f"[BACKUP] File exists after write: {exists_after}  ({backup_path})")
+    return len(files_data)
 
 
 def restore_backup(folder_path: Path) -> dict:
@@ -150,38 +181,67 @@ def get_backup_info(folder_path: Path) -> dict:
 
 def append_historial(
     folder: Path,
-    original_name: str,
-    new_name: Optional[str],    # None → no rename happened
-    original_exif: dict,        # fields dict before any changes
+    filename: str,
     operation: str,             # "fecha_editada" | "renombrado" | "movido" | "eliminado"
+    exif_before: dict,          # EXIF fields dict captured before any changes
+    exif_after: Optional[dict] = None,  # EXIF fields dict after changes; None → not applicable
+    new_name: Optional[str] = None,     # renamed-to filename; None → no rename
 ) -> None:
-    """Append one human-readable record to _historial_original.txt in folder.
+    """Append one multi-line record to _historial_original.txt in folder.
 
-    The file is created with a header on first write; subsequent calls append.
-    Failures are silently swallowed — the historial must never abort the main
-    operation that called it.
+    Format::
+
+        [2026-04-13 10:05:22]
+        Archivo: foto.jpg → nueva.jpg
+        Operación: fecha_editada
+        EXIF ANTERIOR:
+          DateTimeOriginal: 2010:10:19 23:35:24
+          DateTimeDigitized: 2010:10:19 23:35:24
+        EXIF NUEVO:
+          DateTimeOriginal: 2026:04:13 08:58:56
+          DateTimeDigitized: 2026:04:13 08:58:56
+        ---
+
+    When ``exif_after`` is ``None`` (rename / move / delete) the "EXIF NUEVO"
+    section is omitted.  The file is created with a header on first write;
+    subsequent calls append.  Failures are silently swallowed — the historial
+    must never abort the main operation that called it.
     """
     hist_path = folder / HISTORIAL_FILENAME
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    nombre_nuevo = new_name if new_name is not None else "sin cambio"
 
-    lines: list = [
+    # ── Archivo line (with optional rename arrow) ─────────────────────────────
+    archivo_line = filename
+    if new_name is not None:
+        archivo_line = f"{filename} → {new_name}"
+
+    # ── Build record lines ────────────────────────────────────────────────────
+    lines: list[str] = [
         f"[{now}]",
-        f"Archivo original: {original_name}",
-        f"Nombre nuevo:     {nombre_nuevo}",
-        "EXIF original:",
+        f"Archivo: {archivo_line}",
+        f"Operación: {operation}",
+        "EXIF ANTERIOR:",
     ]
-    has_any = False
-    # Show all fields present in the dict, sorted for consistent output
-    for field, val in sorted(original_exif.items()):
+    has_before = False
+    for field, val in sorted(exif_before.items()):
         if val:
-            lines.append(f"  {field}:  {val}")
-            has_any = True
-    if not has_any:
+            lines.append(f"  {field}: {val}")
+            has_before = True
+    if not has_before:
         lines.append("  (sin datos EXIF)")
-    lines.append(f"Operación: {operation}")
+
+    if exif_after is not None:
+        lines.append("EXIF NUEVO:")
+        has_after = False
+        for field, val in sorted(exif_after.items()):
+            if val:
+                lines.append(f"  {field}: {val}")
+                has_after = True
+        if not has_after:
+            lines.append("  (sin datos EXIF)")
+
     lines.append("---")
-    lines.append("")          # blank line between records
+    lines.append("")   # blank separator between records
 
     try:
         write_header = not hist_path.exists()

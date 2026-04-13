@@ -4,6 +4,17 @@ import sys
 import traceback
 from pathlib import Path
 
+# ── Version diagnostics (crash audit) ─────────────────────────────────────────
+import PIL
+print(f"Pillow version: {PIL.__version__}")
+
+import piexif
+_piexif_ver = getattr(piexif, "__version__", None) or getattr(piexif, "VERSION", "unknown")
+print(f"piexif version: {_piexif_ver}")
+
+print(f"Python version: {sys.version}")
+# ──────────────────────────────────────────────────────────────────────────────
+
 from PyQt6.QtWidgets import QApplication, QMessageBox
 from PyQt6.QtGui import QIcon, QPalette, QColor
 from PyQt6.QtCore import Qt

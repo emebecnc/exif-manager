@@ -1,4 +1,5 @@
 """DuplicatePanel — permanent tab for scanning and resolving duplicate images."""
+import gc
 import os
 import shutil
 from io import BytesIO
@@ -14,7 +15,9 @@ from PyQt6.QtWidgets import (
     QStackedWidget, QVBoxLayout, QWidget,
 )
 
-from core.duplicate_finder import DuplicateScanWorker
+from core.duplicate_finder import (
+    DuplicateScanWorker, SimilarImageScanWorker, IMAGEHASH_AVAILABLE,
+)
 from core.exif_handler import get_all_metadata, read_exif
 from core.file_scanner import unique_dest, EXCLUDED_FOLDERS
 from core.video_duplicate_finder import VideoDuplicateScanWorker
@@ -29,6 +32,7 @@ _TRASH_DIRNAME   = "_duplicados_eliminados"
 _THUMB_SIZE      = 200   # photo card thumbnail (px)
 _LIST_THUMB_SIZE = 60    # group list thumbnail (px)
 _CARD_WIDTH      = 280   # fixed width of each photo card (px)
+_BATCH_SIZE      = 20    # max groups added to list per QTimer tick (prevents UI freeze)
 
 # ── Button stylesheets with hover/pressed states ──────────────────────────────
 
@@ -576,7 +580,8 @@ class _VideoCard(QFrame):
 class DuplicatePanel(QWidget):
     """Permanent panel for scanning and resolving duplicate photos."""
 
-    scan_started = pyqtSignal()   # emitted when a scan begins → main window switches tab
+    scan_started      = pyqtSignal()        # emitted when a scan begins → main window switches tab
+    scan_busy_changed = pyqtSignal(bool)   # True = scan running, False = idle → lock folder tree
 
     def __init__(self, log_manager: LogManager, parent=None) -> None:
         super().__init__(parent)
@@ -589,10 +594,18 @@ class DuplicatePanel(QWidget):
         # "photo" or "video" — controls button labels; default to photo
         self._media_type: str = "photo"
 
+        # "exact" (MD5) or "similar" (perceptual hash)
+        self._scan_mode: str = "exact"
+
+        # Path that was passed to the most recent _begin_scan() call
+        self._scanned_path: Optional[Path] = None
+
         # Scan worker / thread (type is DuplicateScanWorker or VideoDuplicateScanWorker)
         self._scan_worker = None
         self._scan_thread: Optional[QThread] = None
         self._scanning:    bool = False
+        self._scan_progress_dlg:  Optional[QProgressDialog] = None
+        self._group_progress_dlg: Optional[QProgressDialog] = None  # phase-2 loading
 
         # Dedup worker / thread
         self._dedup_worker:       Optional[_DeduplicateWorker] = None
@@ -656,6 +669,12 @@ class DuplicatePanel(QWidget):
     def set_current_folder(self, folder: Optional[Path]) -> None:
         self._current_folder = folder
         self._update_button_states()
+        if folder is not None:
+            self._lbl_folder.setText(str(folder))
+            self._lbl_folder.setToolTip(str(folder))
+        else:
+            self._lbl_folder.setText("Sin carpeta seleccionada")
+            self._lbl_folder.setToolTip("")
 
     def set_media_type(self, media_type: str) -> None:
         """Switch between 'photo', 'video', or 'both' duplicate search mode.
@@ -718,12 +737,50 @@ class DuplicatePanel(QWidget):
         self._btn_toggle_video.setChecked(self._media_type == "video")
         self._btn_toggle_all.setChecked(self._media_type == "both")
 
+    def _set_scan_mode(self, mode: str) -> None:
+        """Switch between 'exact' (MD5) and 'similar' (pHash) scan modes."""
+        if mode == self._scan_mode:
+            return
+        self._scan_mode = mode
+        self._update_mode_style()
+
+    def _update_mode_style(self) -> None:
+        """Apply ON/OFF stylesheet to the scan-mode toggle buttons."""
+        _ON  = ("QPushButton { background-color: #5a3d99; border: 1px solid #7c59c9;"
+                " border-radius: 10px; color: white; padding: 4px 10px;"
+                " font-weight: bold; font-size: 10pt; }"
+                "QPushButton:hover { background-color: #7c59c9; }"
+                "QPushButton:pressed { background-color: #3d2a6e; }")
+        _OFF = ("QPushButton { background-color: #252525; border: 1px solid #404040;"
+                " border-radius: 10px; color: #777777; padding: 4px 10px;"
+                " font-size: 10pt; }"
+                "QPushButton:hover { background-color: #303030; border-color: #5a5a5a;"
+                " color: #aaaaaa; }")
+        _DIS = ("QPushButton { background-color: #1e1e1e; border: 1px solid #333333;"
+                " border-radius: 10px; color: #444444; padding: 4px 10px;"
+                " font-size: 10pt; }")
+        exact_on   = self._scan_mode == "exact"
+        similar_on = self._scan_mode == "similar"
+        self._btn_mode_exact.setStyleSheet(_ON if exact_on else _OFF)
+        self._btn_mode_exact.setChecked(exact_on)
+        if IMAGEHASH_AVAILABLE:
+            self._btn_mode_similar.setStyleSheet(_ON if similar_on else _OFF)
+            self._btn_mode_similar.setChecked(similar_on)
+        else:
+            self._btn_mode_similar.setStyleSheet(_DIS)
+            self._btn_mode_similar.setChecked(False)
+
     def _restore_groups_display(
         self,
         groups: List[List[Path]],
         selections: Dict[int, Dict[Path, str]],
     ) -> None:
-        """Repopulate the groups list and right panel from cached result data."""
+        """Repopulate the groups list and right panel from cached result data.
+
+        Uses the same _batch_add_groups mechanism as _on_scan_finished so that
+        restoring a large cached result set (e.g. after switching tabs) also
+        never freezes the UI.
+        """
         self._groups     = list(groups)
         self._selections = {k: dict(v) for k, v in selections.items()}
         self._current_group_idx = -1
@@ -736,22 +793,9 @@ class DuplicatePanel(QWidget):
             self._btn_dedup_all.setEnabled(False)
             return
 
-        for i, group in enumerate(self._groups):
-            best       = self._get_best(group)
-            group_size = sum(_safe_size(p) for p in group)
-            item = QListWidgetItem(
-                f"Grupo {i + 1} — {len(group)} archivos · {_fmt_bytes(group_size)}\n"
-                f"{best.name}"
-            )
-            item.setSizeHint(QSize(250, _LIST_THUMB_SIZE + 14))
-            pix = _load_pixmap(best, _LIST_THUMB_SIZE)
-            if pix is not None:
-                item.setIcon(QIcon(pix))
-            self._groups_list.addItem(item)
-
-        self._groups_list.setCurrentRow(0)
         self._btn_dedup_all.setEnabled(True)
-        self._update_header_label()
+        self._lbl_header.setText(f"Cargando {len(self._groups)} grupos…")
+        self._batch_add_groups(0)
 
     def start_scan(self, path: Path) -> None:
         """Begin a duplicate scan of ``path``. Emits ``scan_started`` first."""
@@ -776,6 +820,15 @@ class DuplicatePanel(QWidget):
         left_layout.setContentsMargins(6, 6, 6, 6)
         left_layout.setSpacing(4)
 
+        # ── Current folder path ───────────────────────────────────────────
+        self._lbl_folder = QLabel("Sin carpeta seleccionada")
+        self._lbl_folder.setWordWrap(True)
+        self._lbl_folder.setStyleSheet(
+            "font-size: 9pt; color: #888888;"
+            " padding: 3px 2px; border-bottom: 1px solid #333333;"
+        )
+        left_layout.addWidget(self._lbl_folder)
+
         # ── Media type toggle ─────────────────────────────────────────────
         toggle_row = QHBoxLayout()
         toggle_row.setSpacing(2)
@@ -797,6 +850,35 @@ class DuplicatePanel(QWidget):
         toggle_row.addWidget(self._btn_toggle_video)
         toggle_row.addWidget(self._btn_toggle_all)
         left_layout.addLayout(toggle_row)
+
+        # ── Scan-mode row (Exactos / Similares) ───────────────────────────
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(2)
+        self._btn_mode_exact   = QPushButton("Exactos")
+        self._btn_mode_similar = QPushButton("Similares")
+        self._btn_mode_exact.setCheckable(True)
+        self._btn_mode_exact.setChecked(True)
+        self._btn_mode_similar.setCheckable(True)
+        self._btn_mode_exact.setToolTip(
+            "Detecta duplicados byte a byte (MD5).\n"
+            "Rápido y sin falsos positivos."
+        )
+        _similar_tip = (
+            "Detecta copias redimensionadas o re-comprimidas\n"
+            "usando hash perceptual (pHash).\n"
+            "Requiere:  pip install imagehash"
+        )
+        if not IMAGEHASH_AVAILABLE:
+            _similar_tip = "imagehash no instalado.\n" + _similar_tip
+        self._btn_mode_similar.setToolTip(_similar_tip)
+        if not IMAGEHASH_AVAILABLE:
+            self._btn_mode_similar.setEnabled(False)
+        self._btn_mode_exact.clicked.connect(lambda: self._set_scan_mode("exact"))
+        self._btn_mode_similar.clicked.connect(lambda: self._set_scan_mode("similar"))
+        mode_row.addWidget(self._btn_mode_exact)
+        mode_row.addWidget(self._btn_mode_similar)
+        left_layout.addLayout(mode_row)
+        self._update_mode_style()
 
         self._lbl_header = QLabel("No hay duplicados escaneados aún.")
         self._lbl_header.setStyleSheet("font-size: 10px; color: #aaaaaa;")
@@ -906,7 +988,12 @@ class DuplicatePanel(QWidget):
         self._btn_dedup_all.setEnabled(False)
 
         self._scanning = True
-        self._lbl_header.setText(f"Escaneando {path.name}…")
+        self.scan_busy_changed.emit(True)
+        self._scanned_path = path
+        mode_label = "similares" if self._scan_mode == "similar" else "exactos"
+        self._lbl_header.setText(
+            f"Buscando {mode_label} en:\n{path}"
+        )
         self._btn_cancel.setVisible(True)
         self._btn_scan_folder.setEnabled(False)
         self._btn_scan_root.setEnabled(False)
@@ -922,6 +1009,8 @@ class DuplicatePanel(QWidget):
 
         if effective_type == "video":
             self._scan_worker = VideoDuplicateScanWorker(path)
+        elif self._scan_mode == "similar":
+            self._scan_worker = SimilarImageScanWorker(path)
         else:
             self._scan_worker = DuplicateScanWorker(path)
         self._scan_thread = QThread(self)
@@ -931,51 +1020,221 @@ class DuplicatePanel(QWidget):
         # here — _on_scan_finished calls quit()+wait() directly to avoid double-quit.
         self._scan_thread.started.connect(self._scan_worker.run)
         self._scan_worker.progress.connect(self._on_scan_progress)
+        # partial_results: SimilarImageScanWorker doesn't have this signal
+        if hasattr(self._scan_worker, 'partial_results'):
+            self._scan_worker.partial_results.connect(self._on_partial_results)
         self._scan_worker.finished.connect(self._on_scan_finished)
         self._scan_worker.error.connect(self._on_scan_error)
         self._scan_thread.finished.connect(self._cleanup_scan_thread)
 
+        # ── Modal progress dialog (BEFORE thread.start() per CLAUDE.md) ───────
+        # None = no Cancel button → the UI's _btn_cancel handles cancellation.
+        # Without a Cancel button the QProgressDialog never emits canceled(), which
+        # eliminates the re-entrancy crash: setValue() can call processEvents()
+        # internally; if canceled() were connected it could null _scan_progress_dlg
+        # mid-execution of _on_scan_progress (after the is-not-None guard, before
+        # setLabelText), causing AttributeError on NoneType.
+        self._scan_progress_dlg = QProgressDialog(
+            "Escaneando…", None, 0, 0, self
+        )
+        self._scan_progress_dlg.setWindowTitle("Buscando duplicados")
+        self._scan_progress_dlg.setModal(True)           # ApplicationModal
+        self._scan_progress_dlg.setMinimumDuration(0)   # show immediately
+        self._scan_progress_dlg.setValue(0)
+        self._scan_progress_dlg.show()
+        QApplication.processEvents()
+
         self._scan_thread.start()
 
     def _on_cancel_scan(self) -> None:
+        """Cancel a running scan: signal worker, reset UI, clean up thread.
+
+        Must perform a full quit → wait → terminate sequence here because
+        the worker may be in a long-running Python computation (e.g. pHash
+        comparison) that doesn't process Qt events, so quit() alone won't
+        interrupt it.  After this method returns the thread is gone; any
+        late ``finished`` or ``error`` signal is ignored by the early-return
+        guards in ``_on_scan_finished`` / ``_on_scan_error``.
+        """
+        # Tell the worker to exit its run-loop at the next cancellation check
         if self._scan_worker is not None:
             self._scan_worker.cancel()
 
+        # Reset scanning state immediately so the UI reflects the cancellation
+        self._scanning = False
+        self.scan_busy_changed.emit(False)
+        self._btn_cancel.setVisible(False)
+        self._lbl_header.setText("⏹ Escaneo cancelado.")
+        self._update_button_states()
+        if self._scan_progress_dlg is not None:
+            self._scan_progress_dlg.close()
+            self._scan_progress_dlg = None
+
+        # Stop and wait for the OS thread.
+        # quit()  → asks the thread's Qt event loop to stop (helpful when the
+        #           worker is waiting for Qt events; no-op for pure Python loops)
+        # wait()  → blocks until the OS thread exits (worker returns from run())
+        # terminate() → last resort: force-kills the OS thread
+        if self._scan_thread is not None and self._scan_thread.isRunning():
+            self._scan_thread.quit()
+            if not self._scan_thread.wait(5000):          # 5 s cooperative wait
+                print("[Cancel] scan thread did not stop — terminating")
+                self._scan_thread.terminate()
+                self._scan_thread.wait(1000)
+
+        # Schedule deferred deletion; _cleanup_scan_thread may also queue
+        # deleteLater but that's safe — Qt ignores duplicate deferred deletes.
+        if self._scan_worker:
+            self._scan_worker.deleteLater()
+            self._scan_worker = None
+        if self._scan_thread:
+            self._scan_thread.deleteLater()
+            self._scan_thread = None
+
     def _on_scan_progress(self, current: int, total: int, fname: str) -> None:
         self._lbl_header.setText(f"Escaneando… {current}/{total}\n{fname}")
+        # Capture a local reference BEFORE calling any Qt methods.
+        # setValue() can trigger internal processEvents(); a local variable keeps
+        # the object alive even if re-entrant code nulls self._scan_progress_dlg.
+        dlg = self._scan_progress_dlg
+        if dlg is not None:
+            dlg.setMaximum(total)
+            dlg.setValue(current)
+            dlg.setLabelText(f"Escaneando… {current}/{total}")
+            # Force repaint even if window is not active (e.g. user switched windows)
+            dlg.repaint()
+            QApplication.processEvents()
 
-    def _on_scan_finished(self, groups: list) -> None:
-        print(f"DEBUG: _on_scan_finished called with {len(groups)} groups")
-        # Quit+wait before any UI changes to prevent 'QThread destroyed while running'
-        if self._scan_thread and self._scan_thread.isRunning():
-            self._scan_thread.quit()
-            self._scan_thread.wait()
+    def _on_partial_results(self, groups: list) -> None:
+        """Called during scanning with all groups found so far.
 
-        self._scanning = False
-        self._btn_cancel.setVisible(False)
-        self._update_button_states()
+        Appends any newly discovered groups (beyond what's already in the list)
+        so the user can start reviewing duplicates before the scan completes.
+        Groups are added one at a time — no batching needed here because
+        partial_results fires at most every 100 files, so increments are small.
+        """
+        if not self._scanning:
+            return
 
-        # Normalise to Path objects — worker may emit str or Path depending on version
-        self._groups = [
+        norm_groups = [
             [p if isinstance(p, Path) else Path(p) for p in g]
             for g in groups
         ]
 
-        if not self._groups:
-            self._lbl_header.setText("✓ No se encontraron duplicados.")
-            # Persist empty result to cache for this media type
-            if self._media_type == "photo":
-                self._photo_groups = []
-                self._photo_selections = {}
-            elif self._media_type == "video":
-                self._video_groups = []
-                self._video_selections = {}
-            else:
-                self._all_groups = []
-                self._all_selections = {}
+        already = len(self._groups)
+        new_groups = norm_groups[already:]
+        if not new_groups:
             return
 
-        # Initialise per-group selections: best → keep, rest → delete
+        for offset, g in enumerate(new_groups):
+            idx = already + offset
+            self._groups.append(g)
+            best = self._get_best(g)
+            best_str = str(best)
+            self._selections[idx] = {
+                p: ("keep" if str(p) == best_str else "delete") for p in g
+            }
+            group_size = sum(_safe_size(p) for p in g)
+            item = QListWidgetItem(
+                f"Grupo {idx + 1} — {len(g)} archivos · {_fmt_bytes(group_size)}\n"
+                f"{best.name}"
+            )
+            item.setSizeHint(QSize(250, _LIST_THUMB_SIZE + 14))
+            pix = _load_pixmap(best, _LIST_THUMB_SIZE)
+            if pix is not None:
+                item.setIcon(QIcon(pix))
+            self._groups_list.addItem(item)
+
+        # On first groups found: select row 0 and enable the dedup button
+        if already == 0 and new_groups:
+            self._groups_list.setCurrentRow(0)
+            self._btn_dedup_all.setEnabled(True)
+
+    def _on_scan_finished(self, groups: list) -> None:
+        try:
+            self._on_scan_finished_inner(groups)
+        except Exception:
+            import traceback as _tb
+            msg = _tb.format_exc()
+            print(f"[on_scan_finished] CRASH:\n{msg}")
+            try:
+                from pathlib import Path as _Path
+                log = _Path(__file__).parent.parent / "scan_error.log"
+                log.write_text(f"_on_scan_finished crash\n{msg}", encoding="utf-8")
+            except Exception:
+                pass
+            # Reset UI so app stays usable
+            self._scanning = False
+            self.scan_busy_changed.emit(False)
+            self._btn_cancel.setVisible(False)
+            if self._scan_progress_dlg is not None:
+                self._scan_progress_dlg.close()
+                self._scan_progress_dlg = None
+            if self._group_progress_dlg is not None:
+                self._group_progress_dlg.close()
+                self._group_progress_dlg = None
+            self._update_button_states()
+            self._lbl_header.setText(f"⚠ Error al cargar grupos.\nVer scan_error.log")
+
+    def _on_scan_finished_inner(self, groups: list) -> None:
+        # Cancel was already handled by _on_cancel_scan — ignore this late signal
+        if not self._scanning:
+            return
+
+        # ── 1. Close scan-phase progress dialog ───────────────────────────────
+        if self._scan_progress_dlg is not None:
+            self._scan_progress_dlg.close()
+            self._scan_progress_dlg = None
+
+        # ── 2. Normalise paths (needed for count before thread cleanup) ────────
+        norm_groups = [
+            [p if isinstance(p, Path) else Path(p) for p in g]
+            for g in groups
+        ]
+
+        # ── 3. Show group-loading dialog immediately — gives visual feedback
+        #       while quit()+wait() runs in the cleanup below.
+        if norm_groups:
+            self._group_progress_dlg = QProgressDialog(
+                "Cargando grupos…", None, 0, len(norm_groups), self
+            )
+            self._group_progress_dlg.setWindowTitle("Procesando resultados")
+            self._group_progress_dlg.setModal(True)
+            self._group_progress_dlg.setMinimumDuration(0)
+            self._group_progress_dlg.setValue(0)
+            self._group_progress_dlg.show()
+            QApplication.processEvents()
+
+        # ── 4. Full thread cleanup (disconnect signals, quit+wait, deleteLater) ─
+        self._cleanup_scan_thread()
+
+        self._scanning = False
+        self.scan_busy_changed.emit(False)
+        self._btn_cancel.setVisible(False)
+        self._update_button_states()
+
+        if not norm_groups:
+            no_dup_msg = "✓ No se encontraron duplicados."
+            if self._scanned_path is not None:
+                no_dup_msg += f"\nen: {self._scanned_path}"
+            self._lbl_header.setText(no_dup_msg)
+            if self._media_type == "photo":
+                self._photo_groups = [];  self._photo_selections = {}
+            elif self._media_type == "video":
+                self._video_groups = [];  self._video_selections = {}
+            else:
+                self._all_groups = [];    self._all_selections = {}
+            return
+
+        # ── 5. Reset display state ─────────────────────────────────────────────
+        self._groups = norm_groups
+        self._selections = {}
+        self._current_group_idx = -1
+        self._current_cards.clear()
+        self._groups_list.clear()
+        self._right_stack.setCurrentIndex(0)
+
+        # ── 6. Initialise per-group selections: best → keep, rest → delete ─────
         for i, group in enumerate(self._groups):
             best = self._get_best(group)
             best_str = str(best)
@@ -984,27 +1243,10 @@ class DuplicatePanel(QWidget):
             }
 
         self._btn_dedup_all.setEnabled(True)
-        self._update_header_label()
+        n = len(self._groups)
+        self._lbl_header.setText(f"Cargando {n} grupos…")
 
-        # Populate group list with thumbnails
-        for i, group in enumerate(self._groups):
-            best       = self._get_best(group)
-            group_size = sum(_safe_size(p) for p in group)
-            item = QListWidgetItem(
-                f"Grupo {i + 1} — {len(group)} archivos · {_fmt_bytes(group_size)}\n"
-                f"{best.name}"
-            )
-            item.setSizeHint(QSize(250, _LIST_THUMB_SIZE + 14))
-
-            pix = _load_pixmap(best, _LIST_THUMB_SIZE)
-            if pix is not None:
-                item.setIcon(QIcon(pix))
-
-            self._groups_list.addItem(item)
-
-        self._groups_list.setCurrentRow(0)
-
-        # Cache scan results so switching tabs doesn't lose them
+        # ── 7. Cache results for tab switching ────────────────────────────────
         if self._media_type == "photo":
             self._photo_groups     = list(self._groups)
             self._photo_selections = {k: dict(v) for k, v in self._selections.items()}
@@ -1015,7 +1257,108 @@ class DuplicatePanel(QWidget):
             self._all_groups     = list(self._groups)
             self._all_selections = {k: dict(v) for k, v in self._selections.items()}
 
+        # ── 8. Free worker memory + flush any remaining queued events ──────────
+        gc.collect()
+        QApplication.processEvents()
+
+        # ── 9. Populate list with simple loop ────────────────────────────────
+        self._groups_list.clear()
+        for i, _group in enumerate(self._groups):
+            try:
+                self._add_group_item(i)
+                if self._group_progress_dlg is not None:
+                    self._group_progress_dlg.setValue(i + 1)
+                QApplication.processEvents()
+            except Exception as e:
+                print(f"Error loading group {i}: {e}")
+                continue
+
+        if self._group_progress_dlg is not None:
+            self._group_progress_dlg.close()
+            self._group_progress_dlg = None
+
+        if self._groups_list.count() > 0:
+            self._groups_list.setCurrentRow(0)
+        self._update_header_label()
+
+    def _add_group_item(self, idx: int) -> None:
+        """Build and append one QListWidgetItem for groups[idx].
+
+        Intentionally text-only (no thumbnail icon) so list population is
+        near-instant even for 600+ groups.  The full-size thumbnail is loaded
+        on demand inside _show_group() when the user clicks a row.
+        """
+        if idx >= len(self._groups):
+            return
+        try:
+            group      = self._groups[idx]
+            if not group:
+                print(f"  [skip] group {idx} is empty")
+                return
+            best       = self._get_best(group)
+            group_size = sum(_safe_size(p) for p in group)
+            item = QListWidgetItem(
+                f"Grupo {idx + 1} — {len(group)} archivos · {_fmt_bytes(group_size)}\n"
+                f"{best.name}"
+            )
+            item.setSizeHint(QSize(250, 46))   # fixed height: no icon space needed
+            self._groups_list.addItem(item)
+        except Exception as e:
+            print(f"  [skip] _add_group_item({idx}) failed: {e}")
+
+    # ── Legacy batch loader — still used by _restore_groups_display ───────────
+
+    def _batch_add_groups(self, start: int) -> None:
+        """Add up to _BATCH_SIZE group items to the list starting at *start*.
+
+        After each batch the method re-schedules itself via QTimer.singleShot(0)
+        so Qt can process pending events (repaints, user input) between chunks.
+        This prevents the main thread from blocking when there are hundreds of
+        groups to display.
+        """
+        if start >= len(self._groups):
+            # All groups are in the list — finalise.
+            self._update_header_label()
+            if self._groups_list.count() > 0 and self._groups_list.currentRow() < 0:
+                self._groups_list.setCurrentRow(0)
+            return
+
+        end = min(start + _BATCH_SIZE, len(self._groups))
+
+        self._groups_list.setUpdatesEnabled(False)
+        for i in range(start, end):
+            group      = self._groups[i]
+            best       = self._get_best(group)
+            group_size = sum(_safe_size(p) for p in group)
+            item = QListWidgetItem(
+                f"Grupo {i + 1} — {len(group)} archivos · {_fmt_bytes(group_size)}\n"
+                f"{best.name}"
+            )
+            item.setSizeHint(QSize(250, _LIST_THUMB_SIZE + 14))
+            pix = _load_pixmap(best, _LIST_THUMB_SIZE)
+            if pix is not None:
+                item.setIcon(QIcon(pix))
+            self._groups_list.addItem(item)
+        self._groups_list.setUpdatesEnabled(True)
+
+        # Select first row once it exists
+        if start == 0 and self._groups_list.count() > 0:
+            self._groups_list.setCurrentRow(0)
+
+        remaining = len(self._groups) - end
+        if remaining > 0:
+            self._lbl_header.setText(
+                f"Cargando grupos… {end}/{len(self._groups)}"
+            )
+            QTimer.singleShot(0, lambda: self._batch_add_groups(end))
+        else:
+            self._update_header_label()
+
     def _on_scan_error(self, msg: str) -> None:
+        # Cancel was already handled by _on_cancel_scan — ignore this late signal
+        if not self._scanning:
+            return
+
         # Quit+wait the thread FIRST — same pattern as _on_scan_finished.
         # Without this, the QThread is destroyed while still running → crash -805306369.
         if self._scan_thread and self._scan_thread.isRunning():
@@ -1025,17 +1368,71 @@ class DuplicatePanel(QWidget):
                 self._scan_thread.terminate()
                 self._scan_thread.wait(1000)
 
-        self._scanning = False
-        self._btn_cancel.setVisible(False)
-        self._update_button_states()
-        self._lbl_header.setText(f"⚠ Error al escanear:\n{msg}")
-        print(f"ERROR in scan: {msg}")
+        # Grab full traceback BEFORE deleteLater wipes the worker object
+        details = getattr(self._scan_worker, "error_details", "") or msg
 
-    def _cleanup_scan_thread(self) -> None:
+        # Explicit cleanup (same as _on_scan_finished)
         if self._scan_worker:
             self._scan_worker.deleteLater()
             self._scan_worker = None
         if self._scan_thread:
+            self._scan_thread.deleteLater()
+            self._scan_thread = None
+
+        self._scanning = False
+        self.scan_busy_changed.emit(False)
+        self._btn_cancel.setVisible(False)
+        self._update_button_states()
+        if self._scan_progress_dlg is not None:
+            self._scan_progress_dlg.close()
+            self._scan_progress_dlg = None
+
+        self._lbl_header.setText(f"⚠ Error al escanear:\n{msg}")
+        print(f"ERROR in scan: {msg}")
+
+        # Show a dialog with the full traceback accessible via "Show Details"
+        dlg = QMessageBox(self)
+        dlg.setIcon(QMessageBox.Icon.Critical)
+        dlg.setWindowTitle("Error al escanear")
+        dlg.setText("Se produjo un error inesperado durante el escaneo.")
+        dlg.setInformativeText(str(msg))
+        dlg.setDetailedText(details)   # "Show Details" button reveals full traceback
+        dlg.exec()
+
+    def _cleanup_scan_thread(self) -> None:
+        """Stop scan thread and free all objects.  Safe to call from
+        _on_scan_finished (thread running) AND as the thread.finished slot
+        (thread already stopped).  The None-guards prevent double-deleteLater.
+        """
+        if self._scan_thread is None and self._scan_worker is None:
+            return
+
+        # Disconnect worker signals so no stale callbacks fire after cleanup
+        for obj, sig_name in [
+            (self._scan_thread, "started"),
+            (self._scan_worker, "progress"),
+            (self._scan_worker, "finished"),
+            (self._scan_worker, "error"),
+        ]:
+            if obj is None:
+                continue
+            try:
+                getattr(obj, sig_name).disconnect()
+            except Exception:
+                pass
+
+        # Stop thread — no-op when already stopped (isRunning() == False)
+        if self._scan_thread is not None and self._scan_thread.isRunning():
+            self._scan_thread.quit()
+            if not self._scan_thread.wait(5000):
+                print("[cleanup] scan thread still running — terminating")
+                self._scan_thread.terminate()
+                self._scan_thread.wait(1000)
+
+        if self._scan_worker is not None:
+            self._scan_worker.deleteLater()
+            self._scan_worker = None
+        if self._scan_thread is not None:
             self._scan_thread.deleteLater()
             self._scan_thread = None
 
@@ -1297,10 +1694,13 @@ class DuplicatePanel(QWidget):
             for p, action in self._selections.get(i, {}).items()
             if action == "delete"
         )
-        self._lbl_header.setText(
+        summary = (
             f"{n_groups} grupo{'s' if n_groups != 1 else ''}"
             f" · {n_files} archivos · {_fmt_bytes(dup_bytes)} duplicados"
         )
+        if self._scanned_path is not None:
+            summary += f"\nen: {self._scanned_path}"
+        self._lbl_header.setText(summary)
 
     # ── Batch deduplication ────────────────────────────────────────────────
 

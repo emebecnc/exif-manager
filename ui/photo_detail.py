@@ -450,7 +450,7 @@ class PhotoDetailPanel(QWidget):
 
         self._log.log(str(path.parent), path.name, "rename", path.name, new_name)
         from core.backup_manager import rename_backup_entry, append_historial
-        append_historial(path.parent, path.name, new_name, original_exif, "renombrado")
+        append_historial(path.parent, path.name, "renombrado", original_exif, new_name=new_name)
         rename_backup_entry(path.parent, path.name, new_name)
         self._current_path = new_path
         self.photo_renamed.emit(path, new_path)

@@ -863,7 +863,7 @@ class ThumbnailGrid(QWidget):
             try:
                 dst_file = unique_dest(path, dest)
                 original_exif = read_exif(path)["fields"]
-                append_historial(path.parent, path.name, None, original_exif, "movido")
+                append_historial(path.parent, path.name, "movido", original_exif)
                 shutil.move(str(path), str(dst_file))
                 self._log.log(str(path.parent), path.name, "move", str(path), str(dst_file))
                 moved.append(path)
@@ -935,7 +935,7 @@ class ThumbnailGrid(QWidget):
                 dest = unique_dest(path, trash_dir)
                 # Log before moving — captures current state
                 original_exif = read_exif(path)["fields"]
-                append_historial(path.parent, path.name, None, original_exif, "eliminado")
+                append_historial(path.parent, path.name, "eliminado", original_exif)
                 shutil.move(str(path), str(dest))
                 self._log.log(str(path.parent), path.name, "delete", str(path), str(dest))
                 moved.append(path)

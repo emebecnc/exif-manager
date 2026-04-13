@@ -10,7 +10,7 @@ from PyQt6.QtGui import QAction, QColor, QBrush
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QTreeWidget, QTreeWidgetItem, QAbstractItemView, QFileDialog,
-    QInputDialog, QLabel, QMenu, QApplication, QMessageBox, QStyle,
+    QInputDialog, QLabel, QMenu, QApplication, QMessageBox, QStyle, QToolTip,
 )
 
 from core.backup_manager import has_backup, append_historial
@@ -20,7 +20,6 @@ from core.file_scanner import (
     EXCLUDED_FOLDERS as _EXCLUDED_FOLDERS,
     list_subdirs, root_is_available, unique_dest,
 )
-from core.video_handler import VIDEO_EXTENSIONS as _VIDEO_EXTENSIONS
 from ui.styles import mb_warning, mb_question
 
 _PLACEHOLDER = "__loading__"
@@ -81,7 +80,7 @@ class _DropTree(QTreeWidget):
                 dst_file = unique_dest(src, dst_folder)
                 # Log before moving — captures current state in source folder
                 original_exif = read_exif(src)["fields"]
-                append_historial(src.parent, src.name, None, original_exif, "movido")
+                append_historial(src.parent, src.name, "movido", original_exif)
                 shutil.move(str(src), str(dst_file))
                 moved.append(dst_file)
                 if self._panel._log:
@@ -105,14 +104,16 @@ class _DropTree(QTreeWidget):
 
 
 class FolderTreePanel(QWidget):
-    folder_selected = pyqtSignal(Path)
-    files_moved = pyqtSignal(Path, list)   # (source_folder, [new_dst_paths])
+    folder_selected        = pyqtSignal(Path)
+    folder_loading_started = pyqtSignal(Path)   # emitted just before folder_selected
+    files_moved            = pyqtSignal(Path, list)   # (source_folder, [new_dst_paths])
 
     def __init__(self, main_window=None, log_manager=None, parent=None):
         super().__init__(parent)
         self._main_window = main_window
         self._log = log_manager
         self._root: Optional[Path] = None
+        self._scan_locked: bool = False
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -141,14 +142,20 @@ class FolderTreePanel(QWidget):
         self._tree = _DropTree(self)
         self._tree.setHeaderLabel("Carpetas")
         self._tree.setAnimated(True)
+        self._tree.setExpandsOnDoubleClick(False)   # we handle it in _on_item_double_clicked
         self._tree.itemExpanded.connect(self._on_item_expanded)
         self._tree.itemClicked.connect(self._on_item_clicked)
+        self._tree.itemDoubleClicked.connect(self._on_item_double_clicked)
         self._tree.files_moved.connect(self.files_moved)   # re-emit on panel
         self._tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._tree.customContextMenuRequested.connect(self._on_folder_context_menu)
         layout.addWidget(self._tree)
 
     # ── Public API ─────────────────────────────────────────────────────────
+
+    def set_scan_locked(self, locked: bool) -> None:
+        """Block folder selection while a duplicate scan is running."""
+        self._scan_locked = locked
 
     def open_root_dialog(self) -> None:
         path = QFileDialog.getExistingDirectory(
@@ -210,32 +217,9 @@ class FolderTreePanel(QWidget):
 
     # ── Tree building ──────────────────────────────────────────────────────
 
-    def _count_photos(self, path: Path) -> int:
-        """Count image files in *path* (non-recursive, best-effort)."""
-        try:
-            return sum(
-                1 for f in path.glob("*")
-                if f.is_file() and f.suffix.lower() in _IMAGE_EXTENSIONS
-            )
-        except (PermissionError, OSError):
-            return 0
-
-    def _count_videos(self, path: Path) -> int:
-        """Count video files in *path* (non-recursive, best-effort)."""
-        try:
-            return sum(
-                1 for f in path.glob("*")
-                if f.is_file() and f.suffix.lower() in _VIDEO_EXTENSIONS
-            )
-        except (PermissionError, OSError):
-            return 0
-
     def _update_item_label(self, item: QTreeWidgetItem, path: Path) -> None:
-        """Refresh the display label for *item* by re-counting files on disk."""
-        photos = self._count_photos(path)
-        videos = self._count_videos(path)
-        label = f"{path.name}  ({photos}) V({videos})"
-        item.setText(0, label)
+        """Refresh the display label for *item*."""
+        item.setText(0, path.name)
 
     def _make_item(self, path: Path) -> QTreeWidgetItem:
         # No file counting or backup check here — kept lazy so startup is instant.
@@ -284,12 +268,30 @@ class FolderTreePanel(QWidget):
     def _on_item_clicked(self, item: QTreeWidgetItem, column: int) -> None:
         if item.text(0) == _PLACEHOLDER:
             return
+        if self._scan_locked:
+            QToolTip.showText(
+                self._tree.viewport().mapToGlobal(
+                    self._tree.visualItemRect(item).center()
+                ),
+                "Escaneo en progreso — esperá que termine antes de cambiar de carpeta.",
+                self._tree,
+            )
+            return
         path_str = item.data(0, Qt.ItemDataRole.UserRole)
         if path_str:
             path = Path(path_str)
+            self.folder_loading_started.emit(path)   # show loading indicator first
             self._update_item_label(item, path)
             self._apply_backup_indicator(item, path)
             self.folder_selected.emit(path)
+
+    def _on_item_double_clicked(self, item: QTreeWidgetItem, column: int) -> None:
+        if item.text(0) == _PLACEHOLDER:
+            return
+        if item.isExpanded():
+            self._tree.collapseItem(item)
+        else:
+            self._tree.expandItem(item)  # triggers _on_item_expanded for lazy loading
 
     def _on_folder_context_menu(self, pos) -> None:
         item = self._tree.itemAt(pos)

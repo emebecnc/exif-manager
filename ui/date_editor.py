@@ -305,8 +305,14 @@ class _ApplyWorker(QObject):
             # ── Historial ───────────────────────────────────────────────────
             operation = "fecha_editada" if self._write_exif else "renombrado"
             try:
+                # Build exif_after from the target datetime we just wrote
+                exif_after: Optional[dict] = None
+                if self._write_exif and exif_ok and new_dt is not None:
+                    new_val  = new_dt.strftime("%Y:%m:%d %H:%M:%S")
+                    exif_after = {field: new_val for field in self._fields}
                 append_historial(
-                    path.parent, path.name, new_name_for_log, original_fields, operation
+                    path.parent, path.name, operation,
+                    original_fields, exif_after, new_name_for_log,
                 )
             except Exception:
                 pass
@@ -1052,11 +1058,25 @@ class DateEditorDialog(QDialog):
                 mb_warning(self, "Sin campos", "Selecciona al menos un campo EXIF.")
                 return
 
-        # Backup before writing (folder/selection mode; single-file undo by main_window)
-        if not keep_mode and self._mode in ("folder", "selection"):
+        # Backup before writing (all modes; single-file → backup parent folder)
+        if not keep_mode:
+            backup_folder = (
+                self._target
+                if self._mode in ("folder", "selection")
+                else self._target.parent
+            )
             try:
-                create_backup(self._target)
-                self._log.log(str(self._target), "", "create_backup", "", "")
+                # Collect current EXIF for the files about to be modified.
+                # Reuse `paths` (already computed above) — avoids a second
+                # scan_folder() call for folder mode.
+                files_data: Dict[str, dict] = {}
+                for p in paths:
+                    try:
+                        files_data[p.name] = read_exif(p)["fields"]
+                    except Exception:
+                        pass  # unreadable files are skipped; not catastrophic
+                n = create_backup(backup_folder, files_data)
+                self._log.log(str(backup_folder), "", "create_backup", "", f"{n} archivos")
             except Exception as e:
                 reply = mb_question(
                     self, "Error en backup",
