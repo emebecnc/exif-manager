@@ -1261,25 +1261,20 @@ class DuplicatePanel(QWidget):
         gc.collect()
         QApplication.processEvents()
 
-        # ── 9. Populate list with simple loop ────────────────────────────────
-        self._groups_list.clear()
-        for i, _group in enumerate(self._groups):
-            try:
-                self._add_group_item(i)
-                if self._group_progress_dlg is not None:
-                    self._group_progress_dlg.setValue(i + 1)
-                QApplication.processEvents()
-            except Exception as e:
-                print(f"Error loading group {i}: {e}")
-                continue
-
+        # ── 9. Close modal dialog BEFORE batch loading ────────────────────────
+        # A modal QProgressDialog blocks Qt's event loop, which prevents
+        # QTimer.singleShot from firing.  Close it now and let _batch_add_groups
+        # show incremental progress via the header label instead.
         if self._group_progress_dlg is not None:
             self._group_progress_dlg.close()
             self._group_progress_dlg = None
 
-        if self._groups_list.count() > 0:
-            self._groups_list.setCurrentRow(0)
-        self._update_header_label()
+        # ── 10. Populate list in non-blocking batches ─────────────────────────
+        # _batch_add_groups uses QTimer.singleShot(0) between chunks so Qt can
+        # repaint and handle input between each batch — no UI freeze on 600+ groups.
+        self._groups_list.clear()
+        self._lbl_header.setText(f"Cargando {len(self._groups)} grupos…")
+        self._batch_add_groups(0)
 
     def _add_group_item(self, idx: int) -> None:
         """Build and append one QListWidgetItem for groups[idx].
@@ -1306,7 +1301,7 @@ class DuplicatePanel(QWidget):
         except Exception as e:
             print(f"  [skip] _add_group_item({idx}) failed: {e}")
 
-    # ── Legacy batch loader — still used by _restore_groups_display ───────────
+    # ── Non-blocking group loader — used by _on_scan_finished_inner + _restore_groups_display ──
 
     def _batch_add_groups(self, start: int) -> None:
         """Add up to _BATCH_SIZE group items to the list starting at *start*.
@@ -1314,7 +1309,8 @@ class DuplicatePanel(QWidget):
         After each batch the method re-schedules itself via QTimer.singleShot(0)
         so Qt can process pending events (repaints, user input) between chunks.
         This prevents the main thread from blocking when there are hundreds of
-        groups to display.
+        groups to display.  Must NOT be called while a modal QProgressDialog is
+        open — the modal blocks the event loop, preventing the timer from firing.
         """
         if start >= len(self._groups):
             # All groups are in the list — finalise.

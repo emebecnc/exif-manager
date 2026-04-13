@@ -1,6 +1,6 @@
 # EXIF Manager — CLAUDE.md
 
-**Last updated:** 2026-04-13 (session 45)
+**Last updated:** 2026-04-13 (session 46)
 **Repo:** github.com/emebecnc/exif-manager
 **Local:** D:\homelab\exif_manager\
 
@@ -137,6 +137,7 @@ Config: main.py, build.spec, requirements.txt, run_exif_manager.bat
 ✅ UX FIX: FolderTreePanel.set_scan_locked(bool) blocks folder clicks during scan → shows tooltip; DuplicatePanel.scan_busy_changed signal wired in main_window._wire_signals()
 ✅ CRASH FIX: SimilarImageScanWorker — with Image.open() as img → guarantees PIL buffer release; gc.collect() tightened to every 20 files (was 50) → no memory crash on 1600+ files
 ✅ CRASH FIX: DuplicateScanWorker — removed partial_results.emit() mid-scan; groups now rendered ONLY after finished.emit() → eliminates UI/memory conflict during scan
+✅ UX FIX: _on_scan_finished_inner now closes modal QProgressDialog BEFORE calling _batch_add_groups → modal was blocking QTimer.singleShot from firing; header label shows "Cargando N grupos…" progress instead; folder tree loading indicator was already working via folder_loading_started signal
 
 ---
 
