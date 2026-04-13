@@ -246,10 +246,12 @@ class SimilarImageScanWorker(QObject):
     error    = pyqtSignal(str)
 
     # Default Hamming-distance threshold (0–64 bits).
-    # ≤ 5  → very strict  (near-identical images only)
-    #    8  → balanced    (catches most resizes / light re-saves)
-    # ≥ 12 → permissive  (may group obviously different photos)
-    DEFAULT_THRESHOLD = 8
+    # ≤ 2  → extremely strict  (pixel-perfect or near-lossless re-saves only)
+    # ≤ 3  → strict            (same image, different resolution/compression) ← default
+    # ≤ 5  → moderate          (catches most resizes / light edits)
+    #    8  → loose             (was default; caused false positives on different scenes)
+    # ≥ 12 → very permissive   (groups visually dissimilar images)
+    DEFAULT_THRESHOLD = 3
 
     def __init__(
         self,

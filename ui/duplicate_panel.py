@@ -4,13 +4,13 @@ import os
 import shutil
 from io import BytesIO
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from PIL import Image, ImageOps
 from PyQt6.QtCore import Qt, QObject, QSize, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QIcon, QPixmap
 from PyQt6.QtWidgets import (
-    QApplication, QFrame, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
+    QApplication, QCheckBox, QFrame, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
     QMessageBox, QProgressDialog, QPushButton, QScrollArea, QSplitter,
     QStackedWidget, QVBoxLayout, QWidget,
 )
@@ -216,8 +216,9 @@ class _PhotoCard(QFrame):
     """
 
     # pyqtSignal(object) — emitted value is always a pathlib.Path
-    keep_clicked = pyqtSignal(object)   # user clicked "✓ Conservar"
-    delete_now   = pyqtSignal(object)   # user clicked "🗑 Eliminar"
+    keep_clicked       = pyqtSignal(object)        # user clicked "✓ Conservar"
+    delete_now         = pyqtSignal(object)        # user clicked "🗑 Eliminar"
+    force_keep_toggled = pyqtSignal(object, bool)  # path, checked — "Conservar también"
 
     def __init__(self, path: Path, is_best: bool, action: str, parent=None):
         super().__init__(parent)
@@ -262,6 +263,17 @@ class _PhotoCard(QFrame):
 
         self._btn_keep.clicked.connect(self._on_keep)
         self._btn_delete.clicked.connect(self._on_delete)
+
+        # "Conservar también" checkbox — visible only on non-best (delete) cards
+        self._chk_force_keep = QCheckBox("Conservar también")
+        self._chk_force_keep.setStyleSheet("color: #aaaaaa; font-size: 9pt; border: none;")
+        self._chk_force_keep.setVisible(action == "delete")
+        self._chk_force_keep.stateChanged.connect(
+            lambda state: self.force_keep_toggled.emit(
+                self._path, state == Qt.CheckState.Checked.value
+            )
+        )
+        layout.addWidget(self._chk_force_keep)
 
         layout.addStretch()
 
@@ -390,9 +402,14 @@ class _PhotoCard(QFrame):
     def set_action(self, action: str) -> None:
         self._action = action
         self._apply_visual()
+        self._chk_force_keep.setVisible(action == "delete")
 
     def get_action(self) -> str:
         return self._action
+
+    def is_force_kept(self) -> bool:
+        """True when the user checked 'Conservar también' on this card."""
+        return self._chk_force_keep.isChecked()
 
 
 # ── _VideoCard ──────────────────────────────────────────────────────────────────
@@ -405,8 +422,9 @@ class _VideoCard(QFrame):
     Eliminar buttons as _PhotoCard.
     """
 
-    keep_clicked = pyqtSignal(object)
-    delete_now   = pyqtSignal(object)
+    keep_clicked       = pyqtSignal(object)
+    delete_now         = pyqtSignal(object)
+    force_keep_toggled = pyqtSignal(object, bool)  # path, checked — "Conservar también"
 
     def __init__(self, path: Path, is_best: bool, action: str, parent=None):
         super().__init__(parent)
@@ -449,6 +467,17 @@ class _VideoCard(QFrame):
 
         self._btn_keep.clicked.connect(self._on_keep)
         self._btn_delete.clicked.connect(self._on_delete)
+
+        # "Conservar también" checkbox — visible only on non-best (delete) cards
+        self._chk_force_keep = QCheckBox("Conservar también")
+        self._chk_force_keep.setStyleSheet("color: #aaaaaa; font-size: 9pt; border: none;")
+        self._chk_force_keep.setVisible(action == "delete")
+        self._chk_force_keep.stateChanged.connect(
+            lambda state: self.force_keep_toggled.emit(
+                self._path, state == Qt.CheckState.Checked.value
+            )
+        )
+        layout.addWidget(self._chk_force_keep)
 
         layout.addStretch()
 
@@ -570,9 +599,14 @@ class _VideoCard(QFrame):
     def set_action(self, action: str) -> None:
         self._action = action
         self._apply_visual()
+        self._chk_force_keep.setVisible(action == "delete")
 
     def get_action(self) -> str:
         return self._action
+
+    def is_force_kept(self) -> bool:
+        """True when the user checked 'Conservar también' on this card."""
+        return self._chk_force_keep.isChecked()
 
 
 # ── DuplicatePanel ─────────────────────────────────────────────────────────────
@@ -607,6 +641,9 @@ class DuplicatePanel(QWidget):
         self._scan_progress_dlg:  Optional[QProgressDialog] = None
         self._group_progress_dlg: Optional[QProgressDialog] = None  # phase-2 loading
         self._groups_loaded:      int                       = 0     # counter for _load_next_batch
+        self._thumb_progress_dlg: Optional[QProgressDialog] = None  # phase-3 thumbnail loading
+        self._thumbs_loaded:      int                       = 0     # counter for _load_next_thumbnail
+        self._force_keeps:        Dict[int, Set[str]]       = {}    # group_idx → forced-keep paths
 
         # Dedup worker / thread
         self._dedup_worker:       Optional[_DeduplicateWorker] = None
@@ -970,6 +1007,10 @@ class DuplicatePanel(QWidget):
         self._current_cards.clear()
         self._right_stack.setCurrentIndex(0)
         self._btn_dedup_all.setEnabled(False)
+        self._force_keeps.clear()
+        if self._thumb_progress_dlg is not None:
+            self._thumb_progress_dlg.close()
+            self._thumb_progress_dlg = None
 
         self._scanning = True
         self.scan_busy_changed.emit(True)
@@ -1293,11 +1334,61 @@ class DuplicatePanel(QWidget):
 
             QTimer.singleShot(0, self._load_next_batch)   # yield, then continue
         else:
-            # All groups loaded — close dialog and finalise header
+            # All groups loaded — close dialog, finalise header, start thumbnail phase
             if self._group_progress_dlg is not None:
                 self._group_progress_dlg.close()
                 self._group_progress_dlg = None
             self._update_header_label()
+            QTimer.singleShot(0, self._load_thumbnails_batched)
+
+    def _load_thumbnails_batched(self) -> None:
+        """Start the thumbnail phase — one list-item icon per timer tick.
+
+        Called automatically by _load_next_batch when all text rows are in place.
+        Shows a non-modal progress dialog so the user can already start clicking
+        groups while thumbnails load in the background.
+        """
+        n = self._groups_list.count()
+        if n == 0:
+            return
+        self._thumbs_loaded = 0
+        self._thumb_progress_dlg = QProgressDialog(
+            f"Cargando miniaturas… 0/{n}", None, 0, n, self
+        )
+        self._thumb_progress_dlg.setWindowTitle("Cargando miniaturas")
+        self._thumb_progress_dlg.setModal(False)
+        self._thumb_progress_dlg.setMinimumDuration(0)
+        self._thumb_progress_dlg.setValue(0)
+        self._thumb_progress_dlg.show()
+        QTimer.singleShot(0, self._load_next_thumbnail)
+
+    def _load_next_thumbnail(self) -> None:
+        """Load one group-list icon per timer tick."""
+        n = self._groups_list.count()
+        if self._thumbs_loaded < n and self._thumbs_loaded < len(self._groups):
+            idx = self._thumbs_loaded
+            try:
+                item = self._groups_list.item(idx)
+                if item is not None:
+                    best = self._get_best(self._groups[idx])
+                    pix  = _load_pixmap(best, _LIST_THUMB_SIZE)
+                    if pix is not None:
+                        item.setIcon(QIcon(pix))
+            except Exception as e:
+                print(f"  [thumb] group {idx}: {e}")
+
+            self._thumbs_loaded += 1
+            dlg = self._thumb_progress_dlg
+            if dlg is not None:
+                dlg.setValue(self._thumbs_loaded)
+                dlg.setLabelText(f"Cargando miniaturas… {self._thumbs_loaded}/{n}")
+                dlg.repaint()
+
+            QTimer.singleShot(0, self._load_next_thumbnail)
+        else:
+            if self._thumb_progress_dlg is not None:
+                self._thumb_progress_dlg.close()
+                self._thumb_progress_dlg = None
 
     def _add_group_item(self, idx: int) -> None:
         """Build and append one QListWidgetItem for groups[idx].
@@ -1319,7 +1410,7 @@ class DuplicatePanel(QWidget):
                 f"Grupo {idx + 1} — {len(group)} archivos · {_fmt_bytes(group_size)}\n"
                 f"{best.name}"
             )
-            item.setSizeHint(QSize(250, 46))   # fixed height: no icon space needed
+            item.setSizeHint(QSize(250, _LIST_THUMB_SIZE + 14))  # reserves icon row height
             self._groups_list.addItem(item)
         except Exception as e:
             print(f"  [skip] _add_group_item({idx}) failed: {e}")
@@ -1504,6 +1595,8 @@ class DuplicatePanel(QWidget):
         else:
             CardClass = _PhotoCard
 
+        force_keeps = self._force_keeps.get(group_idx, set())
+
         for p in sorted_group:
             action = sels.get(p, "keep" if str(p) == str(best) else "delete")
             card   = CardClass(p, is_best=(str(p) == str(best)), action=action)
@@ -1516,6 +1609,13 @@ class DuplicatePanel(QWidget):
             card.delete_now.connect(
                 lambda emitted, gi=group_idx: self._on_card_delete_now(emitted, gi)
             )
+            card.force_keep_toggled.connect(
+                lambda emitted, checked, gi=group_idx: self._on_force_keep_toggled(emitted, checked, gi)
+            )
+
+            # Restore "Conservar también" state if user already checked it
+            if str(p) in force_keeps:
+                card._chk_force_keep.setChecked(True)
 
             self._current_cards[p] = card
             layout.addWidget(card)
@@ -1633,6 +1733,16 @@ class DuplicatePanel(QWidget):
 
         self._remove_path_from_group(group_idx, path)
 
+    def _on_force_keep_toggled(self, path_obj: object, checked: bool, group_idx: int) -> None:
+        """User toggled 'Conservar también' on a card — persist in _force_keeps."""
+        path = path_obj if isinstance(path_obj, Path) else Path(path_obj)
+        if group_idx not in self._force_keeps:
+            self._force_keeps[group_idx] = set()
+        if checked:
+            self._force_keeps[group_idx].add(str(path))
+        else:
+            self._force_keeps[group_idx].discard(str(path))
+
     def _remove_path_from_group(self, group_idx: int, path: Path) -> None:
         """Remove ``path`` from group and selections, update cards and list."""
         group = self._groups[group_idx]
@@ -1732,10 +1842,11 @@ class DuplicatePanel(QWidget):
         keep_photos = keep_videos = 0
 
         for i, group in enumerate(self._groups):
-            sels = self._selections.get(i, {})
+            sels        = self._selections.get(i, {})
+            force_keeps = self._force_keeps.get(i, set())
             for p in group:
                 is_video = p.suffix.lower() in VIDEO_EXTENSIONS
-                if sels.get(p) == "delete":
+                if sels.get(p) == "delete" and str(p) not in force_keeps:
                     sz = _safe_size(p)
                     to_delete.append((str(p), sz))
                     if is_video:
