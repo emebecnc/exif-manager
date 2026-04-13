@@ -1,6 +1,6 @@
 # EXIF Manager — CLAUDE.md
 
-**Last updated:** 2026-04-13 (session 46)
+**Last updated:** 2026-04-13 (session 54)
 **Repo:** github.com/emebecnc/exif-manager
 **Local:** D:\homelab\exif_manager\
 
@@ -138,6 +138,14 @@ Config: main.py, build.spec, requirements.txt, run_exif_manager.bat
 ✅ CRASH FIX: SimilarImageScanWorker — with Image.open() as img → guarantees PIL buffer release; gc.collect() tightened to every 20 files (was 50) → no memory crash on 1600+ files
 ✅ CRASH FIX: DuplicateScanWorker — removed partial_results.emit() mid-scan; groups now rendered ONLY after finished.emit() → eliminates UI/memory conflict during scan
 ✅ UX FIX: _on_scan_finished_inner now closes modal QProgressDialog BEFORE calling _batch_add_groups → modal was blocking QTimer.singleShot from firing; header label shows "Cargando N grupos…" progress instead; folder tree loading indicator was already working via folder_loading_started signal
+✅ AUDIT (session 47): SimilarImageScanWorker progress bar already fully implemented — progress = pyqtSignal(int, int, str) defined, self.progress.emit(file_num, total, path.name) called every file, _begin_scan unconditionally connects worker.progress → _on_scan_progress for all worker types. No code changes needed.
+✅ AUDIT (session 48): _on_scan_progress already had setMaximum/setValue/setLabelText/repaint()/processEvents(). One real gap fixed: dialog label now shows filename ("Escaneando… X/N\nfilename.jpg") matching what header label already showed.
+✅ COMPLETE (session 49): Crash audit closed. Fuzzy scan stable on 1600+ files. All workers have per-file logging, GC, proper resource cleanup, and progress signals.
+✅ UX (session 50): Scan progress dialog label/title now reflects active worker — "Escaneando exactos (MD5)…" / "Escaneando similares (pHash)…" / "Escaneando videos…". Three concurrent bars not possible — exact/fuzzy/video scans are mutually exclusive (one worker at a time).
+✅ UX (session 51): Group-loading QProgressDialog changed setModal(True) → setModal(False) — app stays interactive during thread cleanup and group rendering; scan buttons + folder tree already locked by _scanning flag so re-entrancy is safe.
+✅ SAFETY (session 52): Removed "Buscar duplicados (raíz)" button and all related code (_btn_scan_root, _on_scan_root_clicked, 5 touch-points) — prevents accidental multi-TB scans; self._root + set_root() retained (called from main_window).
+✅ AUDIT (session 53): Confirmed zero remaining "(raíz)" references in duplicate_panel.py — all root scan variants fully removed in session 52. No code changes needed.
+✅ UX (session 54): Added _load_next_batch() — 1 group per QTimer tick, live dialog updates. Session 46's "close dialog before batch" removed (reason was modal+QTimer conflict, fixed in session 51). _batch_add_groups unchanged (still used by _restore_groups_display).
 
 ---
 

@@ -606,6 +606,7 @@ class DuplicatePanel(QWidget):
         self._scanning:    bool = False
         self._scan_progress_dlg:  Optional[QProgressDialog] = None
         self._group_progress_dlg: Optional[QProgressDialog] = None  # phase-2 loading
+        self._groups_loaded:      int                       = 0     # counter for _load_next_batch
 
         # Dedup worker / thread
         self._dedup_worker:       Optional[_DeduplicateWorker] = None
@@ -706,7 +707,6 @@ class DuplicatePanel(QWidget):
         else:
             kind = "auto"
         self._btn_scan_folder.setText(f"🔍 Buscar duplicados de {kind}")
-        self._btn_scan_root.setText(f"🔍 Buscar duplicados de {kind} (raíz)")
 
         # Update toggle button visual state
         self._update_toggle_style()
@@ -905,15 +905,6 @@ class DuplicatePanel(QWidget):
         self._btn_scan_folder.clicked.connect(self._on_scan_folder_clicked)
         left_layout.addWidget(self._btn_scan_folder)
 
-        self._btn_scan_root = QPushButton("🔍 Buscar duplicados de foto (raíz)")
-        self._btn_scan_root.setToolTip(
-            "Escanea toda la colección desde la carpeta raíz.\n"
-            "Puede tardar varios minutos en colecciones grandes."
-        )
-        apply_button_style(self._btn_scan_root)
-        self._btn_scan_root.clicked.connect(self._on_scan_root_clicked)
-        left_layout.addWidget(self._btn_scan_root)
-
         self._btn_dedup_all = QPushButton("🗑 Deduplicar todo")
         self._btn_dedup_all.setToolTip(
             "Mueve automáticamente todos los duplicados a _duplicados_eliminados,\n"
@@ -960,9 +951,6 @@ class DuplicatePanel(QWidget):
         self._btn_scan_folder.setEnabled(
             not busy and self._current_folder is not None
         )
-        self._btn_scan_root.setEnabled(
-            not busy and self._root is not None
-        )
         self._btn_dedup_all.setEnabled(
             not busy and bool(self._groups)
         )
@@ -972,10 +960,6 @@ class DuplicatePanel(QWidget):
     def _on_scan_folder_clicked(self) -> None:
         if self._current_folder:
             self.start_scan(self._current_folder)
-
-    def _on_scan_root_clicked(self) -> None:
-        if self._root:
-            self.start_scan(self._root)
 
     def _begin_scan(self, path: Path) -> None:
         # Reset all previous results
@@ -996,7 +980,6 @@ class DuplicatePanel(QWidget):
         )
         self._btn_cancel.setVisible(True)
         self._btn_scan_folder.setEnabled(False)
-        self._btn_scan_root.setEnabled(False)
 
         # Use the appropriate worker based on the active media type.
         # In "both" mode, auto-detect the dominant type from the folder.
@@ -1034,10 +1017,20 @@ class DuplicatePanel(QWidget):
         # internally; if canceled() were connected it could null _scan_progress_dlg
         # mid-execution of _on_scan_progress (after the is-not-None guard, before
         # setLabelText), causing AttributeError on NoneType.
+        if effective_type == "video":
+            _scan_label = "Escaneando videos…"
+            _scan_title = "Buscando duplicados de video"
+        elif self._scan_mode == "similar":
+            _scan_label = "Escaneando similares (pHash)…"
+            _scan_title = "Buscando duplicados similares"
+        else:
+            _scan_label = "Escaneando exactos (MD5)…"
+            _scan_title = "Buscando duplicados exactos"
+
         self._scan_progress_dlg = QProgressDialog(
-            "Escaneando…", None, 0, 0, self
+            _scan_label, None, 0, 0, self
         )
-        self._scan_progress_dlg.setWindowTitle("Buscando duplicados")
+        self._scan_progress_dlg.setWindowTitle(_scan_title)
         self._scan_progress_dlg.setModal(True)           # ApplicationModal
         self._scan_progress_dlg.setMinimumDuration(0)   # show immediately
         self._scan_progress_dlg.setValue(0)
@@ -1100,7 +1093,7 @@ class DuplicatePanel(QWidget):
         if dlg is not None:
             dlg.setMaximum(total)
             dlg.setValue(current)
-            dlg.setLabelText(f"Escaneando… {current}/{total}")
+            dlg.setLabelText(f"Escaneando… {current}/{total}\n{fname}")
             # Force repaint even if window is not active (e.g. user switched windows)
             dlg.repaint()
             QApplication.processEvents()
@@ -1199,7 +1192,7 @@ class DuplicatePanel(QWidget):
                 "Cargando grupos…", None, 0, len(norm_groups), self
             )
             self._group_progress_dlg.setWindowTitle("Procesando resultados")
-            self._group_progress_dlg.setModal(True)
+            self._group_progress_dlg.setModal(False)
             self._group_progress_dlg.setMinimumDuration(0)
             self._group_progress_dlg.setValue(0)
             self._group_progress_dlg.show()
@@ -1261,20 +1254,50 @@ class DuplicatePanel(QWidget):
         gc.collect()
         QApplication.processEvents()
 
-        # ── 9. Close modal dialog BEFORE batch loading ────────────────────────
-        # A modal QProgressDialog blocks Qt's event loop, which prevents
-        # QTimer.singleShot from firing.  Close it now and let _batch_add_groups
-        # show incremental progress via the header label instead.
-        if self._group_progress_dlg is not None:
-            self._group_progress_dlg.close()
-            self._group_progress_dlg = None
-
-        # ── 10. Populate list in non-blocking batches ─────────────────────────
-        # _batch_add_groups uses QTimer.singleShot(0) between chunks so Qt can
-        # repaint and handle input between each batch — no UI freeze on 600+ groups.
+        # ── 9. Load groups one per timer tick — dialog stays open and updates live.
+        # _group_progress_dlg is non-modal (session 51) so QTimer.singleShot fires
+        # freely; no need to close it first.  _load_next_batch closes it when done.
         self._groups_list.clear()
+        self._groups_loaded = 0
         self._lbl_header.setText(f"Cargando {len(self._groups)} grupos…")
-        self._batch_add_groups(0)
+        QTimer.singleShot(0, self._load_next_batch)
+
+    def _load_next_batch(self) -> None:
+        """Load exactly one group item per QTimer tick.
+
+        Called by QTimer.singleShot(0) from _on_scan_finished_inner and
+        re-schedules itself until all groups are loaded.  Processing one item
+        per tick gives Qt a full event-loop cycle between each addition, so
+        the UI stays responsive and _group_progress_dlg updates smoothly.
+        _batch_add_groups (used by _restore_groups_display) is unchanged.
+        """
+        total = len(self._groups)
+        if self._groups_loaded < total:
+            try:
+                self._add_group_item(self._groups_loaded)
+            except Exception as e:
+                print(f"  [skip] _load_next_batch group {self._groups_loaded}: {e}")
+
+            self._groups_loaded += 1
+
+            # Update progress dialog (non-modal — safe to repaint here)
+            dlg = self._group_progress_dlg
+            if dlg is not None:
+                dlg.setValue(self._groups_loaded)
+                dlg.setLabelText(f"Cargando grupos… {self._groups_loaded}/{total}")
+                dlg.repaint()
+
+            # Select the first row as soon as it appears
+            if self._groups_loaded == 1 and self._groups_list.count() > 0:
+                self._groups_list.setCurrentRow(0)
+
+            QTimer.singleShot(0, self._load_next_batch)   # yield, then continue
+        else:
+            # All groups loaded — close dialog and finalise header
+            if self._group_progress_dlg is not None:
+                self._group_progress_dlg.close()
+                self._group_progress_dlg = None
+            self._update_header_label()
 
     def _add_group_item(self, idx: int) -> None:
         """Build and append one QListWidgetItem for groups[idx].
