@@ -10,11 +10,6 @@ from core.video_handler import (
     compute_md5, get_video_metadata, iter_videos_recursive,
 )
 
-# Maximum timestamp difference (seconds) to annotate with ⏱️ in the comparison UI.
-# Change this single constant to tune the tolerance globally.
-TIMESTAMP_TOLERANCE: int = 4
-
-
 def _file_timestamp(path: Path) -> Optional[float]:
     """Return file timestamp as POSIX seconds.
 

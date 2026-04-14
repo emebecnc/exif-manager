@@ -16,9 +16,6 @@ from core.exif_handler import (
 )
 from core.file_scanner import compute_md5, iter_images_recursive
 
-# Maximum timestamp difference (seconds) to annotate with ⏱️ in the comparison UI.
-TIMESTAMP_TOLERANCE: int = 4
-
 # Maximum timestamp spread (seconds) within an MD5 group that is treated as a
 # "burst" (same photo shot/copied within 3 minutes) — burst groups are NOT shown
 # as duplicates.  Files copied more than BURST_WINDOW seconds apart are true
@@ -55,14 +52,18 @@ def is_burst(files_in_group: List[Path], tolerance_seconds: int = BURST_WINDOW) 
     window.  When True, the group is excluded from the duplicates list so the
     user doesn't accidentally delete copies made in the same session.
 
-    Returns False (show as duplicate) when timestamps cannot be read for most
-    files, since it is safer to show the group than to silently hide it.
+    Returns False conservatively:
+    - fewer than 2 files
+    - ANY file's timestamp cannot be read (insufficient data → show as duplicate)
+    - spread exceeds tolerance_seconds
     """
-    ts = [_file_timestamp(p) for p in files_in_group]
-    valid = [t for t in ts if t is not None]
-    if len(valid) < 2:
-        return False  # can't determine — default to showing as duplicate
-    return (max(valid) - min(valid)) <= tolerance_seconds
+    if len(files_in_group) < 2:
+        return False
+    timestamps = [_file_timestamp(p) for p in files_in_group]
+    if None in timestamps:
+        return False  # any unreadable timestamp → show group (safer than hiding)
+    max_diff = max(timestamps) - min(timestamps)  # both are float POSIX seconds
+    return max_diff <= tolerance_seconds
 
 
 def extract_date_from_filename(filename: str) -> Optional[date]:

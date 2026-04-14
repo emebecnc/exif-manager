@@ -1,6 +1,6 @@
 # EXIF Manager — CLAUDE.md
 
-**Last updated:** 2026-04-14 (session 61)
+**Last updated:** 2026-04-14 (session 62)
 **Repo:** github.com/emebecnc/exif-manager
 **Local:** D:\homelab\exif_manager\
 
@@ -137,6 +137,15 @@ Config: main.py, build.spec, requirements.txt, run_exif_manager.bat
 ✅ UX FIX: FolderTreePanel.set_scan_locked(bool) blocks folder clicks during scan → shows tooltip; DuplicatePanel.scan_busy_changed signal wired in main_window._wire_signals()
 ✅ CRASH FIX: SimilarImageScanWorker — with Image.open() as img → guarantees PIL buffer release; gc.collect() tightened to every 20 files (was 50) → no memory crash on 1600+ files
 ✅ CRASH FIX: DuplicateScanWorker — removed partial_results.emit() mid-scan; groups now rendered ONLY after finished.emit() → eliminates UI/memory conflict during scan
+✅ Burst protection audit and fix (2026-04-14, session 62)
+  - Removed stale TIMESTAMP_TOLERANCE = 4 constant from duplicate_finder.py (unused, misleading)
+  - Removed stale TIMESTAMP_TOLERANCE = 4 constant from video_duplicate_finder.py
+  - BURST_WINDOW = 180 is now the sole source of truth for burst detection
+  - is_burst() hardened: any unreadable timestamp → return False (show as duplicate, safer)
+  - is_burst() logic: if ANY timestamps[i] is None → False; max-min ≤ 180 → True (burst)
+  - DuplicateScanWorker: burst groups excluded → not shown to user ✓
+  - SimilarImageScanWorker: burst groups excluded → not shown to user ✓
+  - Test case: identical files with same EXIF timestamp (0s diff) → correctly excluded as burst
 ✅ Similar duplicates: burst protection applied (2026-04-14, session 61)
   - SimilarImageScanWorker now filters burst groups after _phash_groups()
   - Similar hash + timestamp < 3 min = burst (excluded); > 3 min = duplicate (shown)
