@@ -179,6 +179,7 @@ class _DeduplicateWorker(QObject):
         """``items`` is a list of (absolute_path_str, file_size_bytes)."""
         super().__init__()
         self._items = items
+        self.stop_requested = False
 
     def run(self) -> None:
         total         = len(self._items)
@@ -187,6 +188,10 @@ class _DeduplicateWorker(QObject):
         errors: List[str] = []
 
         for i, (path_str, file_size) in enumerate(self._items):
+            if self.stop_requested:
+                self.finished.emit(deleted_count, bytes_freed, errors)
+                return
+            
             path = Path(path_str)
             self.progress.emit(i + 1, total, path.name)   # 1-based for display
 
@@ -1020,6 +1025,7 @@ class DuplicatePanel(QWidget):
             f"Buscando {mode_label} en:\n{path}"
         )
         self._btn_cancel.setVisible(True)
+        self._btn_cancel.setEnabled(True)
         self._btn_scan_folder.setEnabled(False)
 
         # Use the appropriate worker based on the active media type.
@@ -1098,6 +1104,7 @@ class DuplicatePanel(QWidget):
         self._scanning = False
         self.scan_busy_changed.emit(False)
         self._btn_cancel.setVisible(False)
+        self._btn_cancel.setEnabled(False)
         self._lbl_header.setText("⏹ Escaneo cancelado.")
         self._update_button_states()
         if self._scan_progress_dlg is not None:
@@ -1124,6 +1131,20 @@ class DuplicatePanel(QWidget):
         if self._scan_thread:
             self._scan_thread.deleteLater()
             self._scan_thread = None
+
+    def _on_cancel_group_loading(self) -> None:
+        """Cancel group loading operation."""
+        if self._group_progress_dlg is not None:
+            self._group_progress_dlg.close()
+            self._group_progress_dlg = None
+        self._groups_loading = False
+
+    def _on_cancel_thumb_loading(self) -> None:
+        """Cancel thumbnail loading operation."""
+        if self._thumb_progress_dlg is not None:
+            self._thumb_progress_dlg.close()
+            self._thumb_progress_dlg = None
+        self._thumbs_loaded = 0
 
     def _on_scan_progress(self, current: int, total: int, fname: str) -> None:
         self._lbl_header.setText(f"Escaneando… {current}/{total}\n{fname}")
@@ -1201,6 +1222,7 @@ class DuplicatePanel(QWidget):
             self._scanning = False
             self.scan_busy_changed.emit(False)
             self._btn_cancel.setVisible(False)
+            self._btn_cancel.setEnabled(False)
             if self._scan_progress_dlg is not None:
                 self._scan_progress_dlg.close()
                 self._scan_progress_dlg = None
@@ -1230,12 +1252,13 @@ class DuplicatePanel(QWidget):
         #       while quit()+wait() runs in the cleanup below.
         if norm_groups:
             self._group_progress_dlg = QProgressDialog(
-                "Cargando grupos…", None, 0, len(norm_groups), self
+                "Cargando grupos…", "Cancelar", 0, len(norm_groups), self
             )
             self._group_progress_dlg.setWindowTitle("Procesando resultados")
             self._group_progress_dlg.setModal(False)
             self._group_progress_dlg.setMinimumDuration(0)
             self._group_progress_dlg.setValue(0)
+            self._group_progress_dlg.canceled.connect(self._on_cancel_group_loading)
             self._group_progress_dlg.show()
             QApplication.processEvents()
 
@@ -1245,6 +1268,7 @@ class DuplicatePanel(QWidget):
         self._scanning = False
         self.scan_busy_changed.emit(False)
         self._btn_cancel.setVisible(False)
+        self._btn_cancel.setEnabled(False)
         self._update_button_states()
 
         if not norm_groups:
@@ -1353,12 +1377,13 @@ class DuplicatePanel(QWidget):
             return
         self._thumbs_loaded = 0
         self._thumb_progress_dlg = QProgressDialog(
-            f"Cargando miniaturas… 0/{n}", None, 0, n, self
+            f"Cargando miniaturas… 0/{n}", "Cancelar", 0, n, self
         )
         self._thumb_progress_dlg.setWindowTitle("Cargando miniaturas")
         self._thumb_progress_dlg.setModal(False)
         self._thumb_progress_dlg.setMinimumDuration(0)
         self._thumb_progress_dlg.setValue(0)
+        self._thumb_progress_dlg.canceled.connect(self._on_cancel_thumb_loading)
         self._thumb_progress_dlg.show()
         QTimer.singleShot(0, self._load_next_thumbnail)
 
@@ -1492,6 +1517,7 @@ class DuplicatePanel(QWidget):
         self._scanning = False
         self.scan_busy_changed.emit(False)
         self._btn_cancel.setVisible(False)
+        self._btn_cancel.setEnabled(False)
         self._update_button_states()
         if self._scan_progress_dlg is not None:
             self._scan_progress_dlg.close()
@@ -1915,7 +1941,7 @@ class DuplicatePanel(QWidget):
         self._deduplicating = True
         self._update_button_states()
 
-        # Progress dialog (no cancel button — operation is not interruptible)
+        # Progress dialog with cancel button
         self._dedup_total = total_del
         self._dedup_progress_dlg = QProgressDialog(self)
         self._dedup_progress_dlg.setWindowTitle("Deduplicando…")
@@ -1925,6 +1951,7 @@ class DuplicatePanel(QWidget):
         self._dedup_progress_dlg.setWindowModality(Qt.WindowModality.WindowModal)
         self._dedup_progress_dlg.setCancelButton(None)
         self._dedup_progress_dlg.setMinimumDuration(0)
+        self._dedup_progress_dlg.canceled.connect(self._on_cancel_dedup)
         self._dedup_progress_dlg.show()
         self.setEnabled(False)
         QApplication.processEvents()   # force paint before thread starts
@@ -1949,6 +1976,17 @@ class DuplicatePanel(QWidget):
             self._dedup_progress_dlg.setLabelText(
                 f"Moviendo: {filename}\n{current} de {total}"
             )
+
+    def _on_cancel_dedup(self) -> None:
+        """Cancel dedup operation."""
+        if self._dedup_worker is not None:
+            self._dedup_worker.stop_requested = True
+        if self._dedup_progress_dlg:
+            self._dedup_progress_dlg.close()
+            self._dedup_progress_dlg = None
+        self.setEnabled(True)
+        self._deduplicating = False
+        self._update_button_states()
 
     def _on_dedup_finished(
         self, deleted_count: int, bytes_freed: int, errors: List[str]

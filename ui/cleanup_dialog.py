@@ -664,6 +664,7 @@ class CleanupDialog(QDialog):
         self._delete_progress_dlg.setWindowModality(Qt.WindowModality.WindowModal)
         self._delete_progress_dlg.setCancelButton(None)
         self._delete_progress_dlg.setMinimumDuration(0)
+        self._delete_progress_dlg.canceled.connect(self._on_cancel_delete)
         self._delete_progress_dlg.show()
 
         # ── Spin up worker thread ─────────────────────────────────────────
@@ -687,6 +688,17 @@ class CleanupDialog(QDialog):
             self._delete_progress_dlg.setLabelText(
                 f"Eliminando: {filename}\n{current + 1} de {total}"
             )
+
+    def _on_cancel_delete(self) -> None:
+        """Cancel delete operation."""
+        if self._delete_worker is not None:
+            self._delete_worker.stop_requested = True
+        if self._delete_progress_dlg:
+            self._delete_progress_dlg.close()
+            self._delete_progress_dlg = None
+        self._btn_scan.setEnabled(True)
+        self._btn_delete.setEnabled(True)
+        self._btn_close.setEnabled(True)
 
     def _on_delete_finished(
         self, deleted_count: int, bytes_freed: float, errors: List[str]

@@ -1,6 +1,6 @@
 # EXIF Manager — CLAUDE.md
 
-**Last updated:** 2026-04-13 (session 56)
+**Last updated:** 2026-04-13 (session 58)
 **Repo:** github.com/emebecnc/exif-manager
 **Local:** D:\homelab\exif_manager\
 
@@ -148,6 +148,8 @@ Config: main.py, build.spec, requirements.txt, run_exif_manager.bat
 ✅ UX (session 54): Added _load_next_batch() — 1 group per QTimer tick, live dialog updates. Session 46's "close dialog before batch" removed (reason was modal+QTimer conflict, fixed in session 51). _batch_add_groups unchanged (still used by _restore_groups_display).
 ✅ UX (session 55): THREE-PHASE loading: (1) text rows via _load_next_batch, (2) list icons via _load_next_thumbnail + non-modal "Cargando miniaturas…" dialog, (3) groups already interactable during both phases. "Conservar también" QCheckBox on delete cards — state stored in _force_keeps{group_idx→set(path_str)}, persists across group navigation, respected in _on_dedup_all. QCheckBox added to both _PhotoCard and _VideoCard.
 ✅ QUALITY (session 56): SimilarImageScanWorker.DEFAULT_THRESHOLD 8→3 — pHash Hamming distance ≤3 (~4.7% of 64 bits); eliminates false positives on different scenes while still catching same-image re-saves and resolution changes. No _group_similar_hashes() exists; the real entry point is _phash_groups().
+✅ UX (session 57): Added cancel support to ALL 6 non-scan progress dialogs (duplicate_panel.py ×3, cleanup_dialog.py ×1, date_editor.py ×2). Group/thumbnail dialogs show actual "Cancelar" button; dedup/delete/preview/apply use setCancelButton(None) so X closes and fires canceled(). Workers get public stop_requested = False; cancel handlers set it directly and immediately close dialog + re-enable UI. _load_next_batch checks _groups_loading flag; _load_next_thumbnail guards on _thumb_progress_dlg is None. _on_*_progress() use local dialog ref guard. _scan_progress_dlg unchanged (no canceled() connection — re-entrancy crash risk, session 37).
+✅ FIX (session 58): duplicate_panel.py — _btn_cancel now calls setEnabled(True) when scan starts and setEnabled(False) at all 4 exit points (cancel, normal finish, exception path, error path). Previously only setVisible was toggled so button could appear enabled/disabled inconsistently.
 
 ---
 

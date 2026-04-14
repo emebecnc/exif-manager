@@ -80,6 +80,7 @@ class _PreviewWorker(QObject):
         self._second = second
         self._rename = rename
         self._rename_fmt = rename_fmt
+        self.stop_requested = False
 
     def _resolve_dt(self, path: Path) -> Optional[datetime]:
         if self._keep_mode:
@@ -117,6 +118,10 @@ class _PreviewWorker(QObject):
         used: set = set()
         total = len(self._paths)
         for i, path in enumerate(self._paths):
+            if self.stop_requested:
+                self.result.emit(rows)
+                return
+            
             self.progress.emit(i + 1, total)
             exif = read_exif(path)
             current = get_best_date_str(exif["fields"]) or "Sin fecha"
@@ -189,9 +194,11 @@ class _ApplyWorker(QObject):
         self._rename_fmt     = rename_fmt
         self._write_exif     = write_exif
         self._cancelled      = False
+        self.stop_requested  = False
 
     def cancel(self) -> None:
         self._cancelled = True
+        self.stop_requested = True
 
     def _resolve_dt(self, existing_fields: dict) -> Optional[datetime]:
         """Compute the target datetime using already-read EXIF fields (no extra disk I/O)."""
@@ -238,7 +245,7 @@ class _ApplyWorker(QObject):
         used_names: set = set()
 
         for path in self._paths:
-            if self._cancelled:
+            if self._cancelled or self.stop_requested:
                 break
 
             # Single EXIF read per file — supplies both date resolution and historial
@@ -976,6 +983,7 @@ class DateEditorDialog(QDialog):
             self._preview_progress_dlg.setWindowModality(Qt.WindowModality.WindowModal)
             self._preview_progress_dlg.setMinimumDuration(0)
             self._preview_progress_dlg.setCancelButton(None)
+            self._preview_progress_dlg.canceled.connect(self._on_cancel_preview)
             self._preview_progress_dlg.show()
             self.setEnabled(False)
             QApplication.processEvents()   # force paint before thread starts
@@ -1015,6 +1023,15 @@ class DateEditorDialog(QDialog):
             self._preview_progress_dlg.setLabelText(
                 f"Generando vista previa…\n{current} de {total} fotos"
             )
+
+    def _on_cancel_preview(self) -> None:
+        """Cancel preview generation."""
+        if self._preview_worker is not None:
+            self._preview_worker.stop_requested = True
+        if self._preview_progress_dlg:
+            self._preview_progress_dlg.close()
+            self._preview_progress_dlg = None
+        self.setEnabled(True)
 
     def _on_preview_result(self, rows: list) -> None:
         """Receive completed rows, stop the thread, populate the table.
@@ -1109,7 +1126,7 @@ class DateEditorDialog(QDialog):
         self._apply_total_steps  = len(paths) * 2 if has_two_phases else len(paths)
 
         # ── Show progress dialog BEFORE thread starts ──────────────────────
-        # No cancel button: half-applied EXIF edits are unrecoverable.
+        # With cancel button to allow cancellation even mid-apply
         self._progress_dlg = QProgressDialog(self)
         self._progress_dlg.setWindowTitle("Aplicando cambios…")
         self._progress_dlg.setLabelText("Iniciando…")
@@ -1121,6 +1138,7 @@ class DateEditorDialog(QDialog):
         self._progress_dlg.setAutoReset(False)
         self._progress_dlg.setAutoClose(False)
         self._progress_dlg.setCancelButton(None)
+        self._progress_dlg.canceled.connect(self._on_cancel_apply)
         self._progress_dlg.show()
         QApplication.processEvents()   # force paint before thread starts
 
@@ -1165,6 +1183,15 @@ class DateEditorDialog(QDialog):
             self._progress_dlg.setLabelText(
                 f"{phase}: {fname}\n{step} de {steps} pasos"
             )
+
+    def _on_cancel_apply(self) -> None:
+        """Cancel apply operation."""
+        if self._apply_worker is not None:
+            self._apply_worker.stop_requested = True
+        if self._progress_dlg:
+            self._progress_dlg.close()
+            self._progress_dlg = None
+        self.setEnabled(True)
 
     def _on_apply_finished(self, ok: int, failed: int, errors: list, renames_dict: object) -> None:
         """Handle apply completion: close progress, log, show result, accept dialog.
