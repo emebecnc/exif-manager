@@ -4,13 +4,86 @@ import sys
 import time
 import traceback
 from collections import defaultdict
+from datetime import date
 from pathlib import Path
 from typing import Any, Callable, List, Optional, Tuple
 
 from PyQt6.QtCore import QObject, pyqtSignal
 from PIL import Image
 
+from core.exif_handler import (
+    get_best_date_str, parse_date_from_filename, parse_exif_dt, read_exif,
+)
 from core.file_scanner import compute_md5, iter_images_recursive
+
+# Maximum timestamp difference (seconds) to annotate with ⏱️ in the comparison UI.
+TIMESTAMP_TOLERANCE: int = 4
+
+# Maximum timestamp spread (seconds) within an MD5 group that is treated as a
+# "burst" (same photo shot/copied within 3 minutes) — burst groups are NOT shown
+# as duplicates.  Files copied more than BURST_WINDOW seconds apart are true
+# duplicates and will appear in the dedup UI.
+BURST_WINDOW: int = 180  # 3 minutes
+
+
+def _file_timestamp(path: Path) -> Optional[float]:
+    """Return file timestamp as POSIX seconds.
+
+    Priority: EXIF DateTimeOriginal / DateTimeDigitized / DateTime → filesystem mtime.
+    Returns None only if both reads fail.
+    """
+    try:
+        info = read_exif(path)
+        date_str = get_best_date_str(info.get("fields", {}))
+        if date_str:
+            dt = parse_exif_dt(date_str)
+            if dt is not None:
+                return dt.timestamp()
+    except Exception:
+        pass
+    # Fallback: filesystem mtime
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
+
+
+def is_burst(files_in_group: List[Path], tolerance_seconds: int = BURST_WINDOW) -> bool:
+    """Return True if all files in the group have timestamps within *tolerance_seconds*.
+
+    A burst group means the same photo was copied/backed-up within a short time
+    window.  When True, the group is excluded from the duplicates list so the
+    user doesn't accidentally delete copies made in the same session.
+
+    Returns False (show as duplicate) when timestamps cannot be read for most
+    files, since it is safer to show the group than to silently hide it.
+    """
+    ts = [_file_timestamp(p) for p in files_in_group]
+    valid = [t for t in ts if t is not None]
+    if len(valid) < 2:
+        return False  # can't determine — default to showing as duplicate
+    return (max(valid) - min(valid)) <= tolerance_seconds
+
+
+def extract_date_from_filename(filename: str) -> Optional[date]:
+    """Return the calendar date encoded in *filename* (stem only), or None.
+
+    Delegates to :func:`core.exif_handler.parse_date_from_filename` which
+    recognises six common patterns (e.g. ``20111224_154046``, ``2011-12-24``).
+    """
+    stem = Path(filename).stem
+    dt = parse_date_from_filename(stem)
+    return dt.date() if dt is not None else None
+
+
+def dates_match(filename_date: date, exif_date) -> bool:  # exif_date: datetime
+    """Return True if *filename_date* and *exif_date* share the same year-month-day."""
+    return (
+        filename_date.year  == exif_date.year
+        and filename_date.month == exif_date.month
+        and filename_date.day   == exif_date.day
+    )
+
 
 # ── Optional imagehash dependency ─────────────────────────────────────────────
 # Loaded lazily so the app works fine without it; only SimilarImageScanWorker
@@ -33,9 +106,11 @@ class DuplicateScanWorker(QObject):
 
     def __init__(self, root_path: Path, parent=None):
         super().__init__(parent)
-        self.root_path    = root_path
-        self._cancelled   = False
+        self.root_path      = root_path
+        self._cancelled     = False
         self.error_details: str = ""   # full traceback, readable via _on_scan_error
+        # Populated in run() — mtime diff (seconds) per group, parallel to finished groups
+        self.group_ts_diffs: list[float] = []
 
     def cancel(self) -> None:
         self._cancelled = True
@@ -132,14 +207,40 @@ class DuplicateScanWorker(QObject):
                     sys.stdout.flush()
 
             # ── Emit results ───────────────────────────────────────────────
-            groups = [p for p in md5_map.values() if len(p) > 1]
+            # Burst filtering: groups where ALL files have timestamps within
+            # BURST_WINDOW seconds are NOT treated as duplicates.  They're
+            # identical copies made in the same session; keep them all.
+            groups = []
+            burst_count = 0
+            for paths in md5_map.values():
+                if len(paths) <= 1:
+                    continue
+                if is_burst(paths):
+                    burst_count += 1
+                    print(
+                        f"  [burst] {len(paths)} files within {BURST_WINDOW}s "
+                        f"— excluded: {[p.name for p in paths]}"
+                    )
+                else:
+                    groups.append(paths)
+
             groups.sort(key=lambda g: (-len(g), str(g[0])))
             print(
                 f"[PhotoScan] done — {total} files, {skipped} skipped, "
-                f"{len(groups)} duplicate groups"
+                f"{len(groups)} duplicate groups, {burst_count} burst groups excluded"
             )
             for idx, paths in enumerate(groups):
                 print(f"  group {idx + 1}: {len(paths)} files — {[p.name for p in paths]}")
+
+            # ── Compute timestamp diffs per group (for ⏱️ UI annotation) ──
+            # Uses EXIF datetime when available; falls back to filesystem mtime.
+            self.group_ts_diffs = []
+            for grp in groups:
+                ts    = [_file_timestamp(p) for p in grp]
+                valid = [t for t in ts if t is not None]
+                diff  = (max(valid) - min(valid)) if len(valid) >= 2 else 0.0
+                self.group_ts_diffs.append(diff)
+
             self.finished.emit(groups)
 
         except Exception as e:
@@ -383,9 +484,26 @@ class SimilarImageScanWorker(QObject):
                 self.finished.emit([])
                 return
 
+            # ── Burst filtering ────────────────────────────────────────────
+            # Similar-hash groups where all files are within BURST_WINDOW seconds
+            # of each other are burst copies (same moment, different re-saves),
+            # not duplicates — exclude them so the user isn't asked to delete them.
+            filtered = []
+            burst_count = 0
+            for grp in groups:
+                if is_burst(grp):
+                    burst_count += 1
+                    print(
+                        f"  [burst] {len(grp)} similar files within {BURST_WINDOW}s "
+                        f"— excluded: {[p.name for p in grp]}"
+                    )
+                else:
+                    filtered.append(grp)
+            groups = filtered
+
             print(
                 f"[SimilarScan] done — {len(groups)} similar groups "
-                f"(threshold={self.threshold})"
+                f"(threshold={self.threshold}), {burst_count} burst groups excluded"
             )
             for idx, grp in enumerate(groups):
                 print(f"  group {idx + 1}: {len(grp)} files — {[p.name for p in grp]}")

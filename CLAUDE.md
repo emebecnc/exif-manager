@@ -1,6 +1,6 @@
 # EXIF Manager — CLAUDE.md
 
-**Last updated:** 2026-04-14 (session 58)
+**Last updated:** 2026-04-14 (session 61)
 **Repo:** github.com/emebecnc/exif-manager
 **Local:** D:\homelab\exif_manager\
 
@@ -137,6 +137,25 @@ Config: main.py, build.spec, requirements.txt, run_exif_manager.bat
 ✅ UX FIX: FolderTreePanel.set_scan_locked(bool) blocks folder clicks during scan → shows tooltip; DuplicatePanel.scan_busy_changed signal wired in main_window._wire_signals()
 ✅ CRASH FIX: SimilarImageScanWorker — with Image.open() as img → guarantees PIL buffer release; gc.collect() tightened to every 20 files (was 50) → no memory crash on 1600+ files
 ✅ CRASH FIX: DuplicateScanWorker — removed partial_results.emit() mid-scan; groups now rendered ONLY after finished.emit() → eliminates UI/memory conflict during scan
+✅ Similar duplicates: burst protection applied (2026-04-14, session 61)
+  - SimilarImageScanWorker now filters burst groups after _phash_groups()
+  - Similar hash + timestamp < 3 min = burst (excluded); > 3 min = duplicate (shown)
+  - Reuses is_burst() + BURST_WINDOW = 180 from DuplicateScanWorker — no new code
+  - Logged as [burst] with file names for debugging
+✅ Smart duplicate detection with burst protection (2026-04-14)
+  - Photos: MD5 match + timestamp > 3 minutes apart = duplicates (shown for dedup)
+  - Photos: MD5 match + timestamp < 3 minutes apart = burst (keep all, excluded from UI)
+  - Videos: MD5 match only = duplicates (no burst window)
+  - Smart scoring: filename date matching EXIF DateTimeOriginal gives +1000 bonus
+  - Automatically conserves file with matching name+EXIF (camera originals preferred)
+  - BURST_WINDOW = 180 constant in duplicate_finder.py for easy tuning
+  - Helpers: is_burst(), extract_date_from_filename(), dates_match() in duplicate_finder.py
+✅ Duplicate detection expanded (2026-04-14)
+  - TIMESTAMP_TOLERANCE = 4 constant (single source of truth) in duplicate_finder.py and video_duplicate_finder.py
+  - Photos: _file_timestamp() reads EXIF DateTimeOriginal/Digitized/DateTime first; falls back to mtime
+  - Videos: _file_timestamp() reads get_video_metadata()['creation_time'] first; falls back to mtime
+  - ⏱️ icon shown on cards when 0 < diff <= 4 seconds (was 6, mtime-only)
+  - Grouping still MD5-based; ⏱️ is annotation only (same file, copied at slightly different times)
 ✅ UX FIX: _on_scan_finished_inner now closes modal QProgressDialog BEFORE calling _batch_add_groups → modal was blocking QTimer.singleShot from firing; header label shows "Cargando N grupos…" progress instead; folder tree loading indicator was already working via folder_loading_started signal
 ✅ AUDIT (session 47): SimilarImageScanWorker progress bar already fully implemented — progress = pyqtSignal(int, int, str) defined, self.progress.emit(file_num, total, path.name) called every file, _begin_scan unconditionally connects worker.progress → _on_scan_progress for all worker types. No code changes needed.
 ✅ AUDIT (session 48): _on_scan_progress already had setMaximum/setValue/setLabelText/repaint()/processEvents(). One real gap fixed: dialog label now shows filename ("Escaneando… X/N\nfilename.jpg") matching what header label already showed.
@@ -165,6 +184,20 @@ Config: main.py, build.spec, requirements.txt, run_exif_manager.bat
 - Updated README.md with complete feature list and usage guide
 - All progress dialogs fully cancellable
 - Ready for GitHub public release
+
+## SESSION 59 — DUPLICATE COPY-TIME ANNOTATION
+
+- Duplicate cards now show ⏱️ when two identical files (same MD5) have slightly different timestamps
+- TIMESTAMP_TOLERANCE = 4 seconds — single constant in duplicate_finder.py and video_duplicate_finder.py
+- Photos: _file_timestamp() reads EXIF DateTimeOriginal/Digitized/DateTime → falls back to filesystem mtime
+- Videos: _file_timestamp() reads get_video_metadata()['creation_time'] → falls back to filesystem mtime
+- DuplicateScanWorker and VideoDuplicateScanWorker: compute group_ts_diffs (parallel list to emitted groups) after MD5 scan
+- ui/duplicate_panel.py:
+  - _TS_TOLERANCE_S = 4.0 module constant (mirrors TIMESTAMP_TOLERANCE)
+  - _group_ts_diffs: list[float] state on DuplicatePanel, read from worker in _on_scan_finished_inner before _cleanup_scan_thread()
+  - _show_group() passes ts_diff to card constructors
+  - _PhotoCard and _VideoCard: ts_diff: float = 0.0 parameter; if 0 < ts_diff <= 4.0: shows ⏱️ "+Xs diferencia de copia" row (amber text, tooltip explaining timestamp diff)
+- Grouping logic unchanged (still MD5-only); ⏱️ is annotation only, not a new detection criterion
 
 ---
 

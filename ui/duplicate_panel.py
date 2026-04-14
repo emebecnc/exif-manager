@@ -17,8 +17,11 @@ from PyQt6.QtWidgets import (
 
 from core.duplicate_finder import (
     DuplicateScanWorker, SimilarImageScanWorker, IMAGEHASH_AVAILABLE,
+    dates_match, extract_date_from_filename,
 )
-from core.exif_handler import get_all_metadata, read_exif
+from core.exif_handler import (
+    get_all_metadata, get_best_date_str, parse_exif_dt, read_exif,
+)
 from core.file_scanner import unique_dest, EXCLUDED_FOLDERS
 from core.video_duplicate_finder import VideoDuplicateScanWorker
 from core.video_handler import (
@@ -32,6 +35,7 @@ _TRASH_DIRNAME   = "_duplicados_eliminados"
 _THUMB_SIZE      = 200   # photo card thumbnail (px)
 _LIST_THUMB_SIZE = 60    # group list thumbnail (px)
 _CARD_WIDTH      = 280   # fixed width of each photo card (px)
+_TS_TOLERANCE_S  = 4.0   # timestamp diff (s) threshold for ⏱️ copy-time annotation
 _BATCH_SIZE      = 20    # max groups added to list per QTimer tick (prevents UI freeze)
 
 # ── Button stylesheets with hover/pressed states ──────────────────────────────
@@ -121,7 +125,14 @@ def _load_pixmap(path: Path, size: int) -> Optional[QPixmap]:
 
 
 def _quality_score(path: Path) -> float:
-    """Higher = better quality. Pixel count × 0.6 + file size × 0.4."""
+    """Higher = better quality.
+
+    Base score  : (width × height) × 0.6 + file_size × 0.4
+    Name bonus  : +1000 when the filename encodes a date that matches the
+                  EXIF DateTimeOriginal (year-month-day).  This biases
+                  selection toward files whose name is directly derived from
+                  the capture date, which are typically the camera originals.
+    """
     w = h = 0
     try:
         with Image.open(path) as img:
@@ -132,7 +143,23 @@ def _quality_score(path: Path) -> float:
         size = path.stat().st_size
     except OSError:
         size = 0
-    return (w * h) * 0.6 + size * 0.4
+    base = (w * h) * 0.6 + size * 0.4
+
+    # Filename-EXIF date matching bonus
+    bonus = 0.0
+    try:
+        fn_date = extract_date_from_filename(path.stem)
+        if fn_date is not None:
+            info = read_exif(path)
+            exif_str = get_best_date_str(info.get("fields", {}))
+            if exif_str:
+                exif_dt = parse_exif_dt(exif_str)
+                if exif_dt is not None and dates_match(fn_date, exif_dt):
+                    bonus = 1000.0
+    except Exception:
+        pass
+
+    return base + bonus
 
 
 def _best_in_group(group: List[Path]) -> Path:
@@ -225,7 +252,8 @@ class _PhotoCard(QFrame):
     delete_now         = pyqtSignal(object)        # user clicked "🗑 Eliminar"
     force_keep_toggled = pyqtSignal(object, bool)  # path, checked — "Conservar también"
 
-    def __init__(self, path: Path, is_best: bool, action: str, parent=None):
+    def __init__(self, path: Path, is_best: bool, action: str,
+                 ts_diff: float = 0.0, parent=None):
         super().__init__(parent)
         self._path    = path
         self._is_best = is_best
@@ -281,6 +309,21 @@ class _PhotoCard(QFrame):
         layout.addWidget(self._chk_force_keep)
 
         layout.addStretch()
+
+        # ⏱️ Copy-time annotation — shown when mtime of copies differs within tolerance
+        if 0 < ts_diff <= _TS_TOLERANCE_S:
+            secs = int(round(ts_diff))
+            ts_row = QHBoxLayout()
+            ts_icon  = QLabel("⏱️")
+            ts_icon.setStyleSheet("font-size: 13pt; border: none;")
+            ts_lbl   = QLabel(f"+{secs}s diferencia de copia")
+            ts_lbl.setStyleSheet("color: #f0b060; font-size: 10pt; border: none;")
+            ts_lbl.setToolTip(
+                f"Mismo archivo — las copias tienen {secs}s de diferencia en modificación"
+            )
+            ts_row.addWidget(ts_icon)
+            ts_row.addWidget(ts_lbl, 1)
+            layout.addLayout(ts_row)
 
         # 4. Info rows
         def _info_row(key: str, value: str) -> QHBoxLayout:
@@ -431,7 +474,8 @@ class _VideoCard(QFrame):
     delete_now         = pyqtSignal(object)
     force_keep_toggled = pyqtSignal(object, bool)  # path, checked — "Conservar también"
 
-    def __init__(self, path: Path, is_best: bool, action: str, parent=None):
+    def __init__(self, path: Path, is_best: bool, action: str,
+                 ts_diff: float = 0.0, parent=None):
         super().__init__(parent)
         self._path   = path
         self._action = action
@@ -485,6 +529,21 @@ class _VideoCard(QFrame):
         layout.addWidget(self._chk_force_keep)
 
         layout.addStretch()
+
+        # ⏱️ Copy-time annotation — shown when mtime of copies differs within tolerance
+        if 0 < ts_diff <= _TS_TOLERANCE_S:
+            secs = int(round(ts_diff))
+            ts_row = QHBoxLayout()
+            ts_icon  = QLabel("⏱️")
+            ts_icon.setStyleSheet("font-size: 13pt; border: none;")
+            ts_lbl   = QLabel(f"+{secs}s diferencia de copia")
+            ts_lbl.setStyleSheet("color: #f0b060; font-size: 10pt; border: none;")
+            ts_lbl.setToolTip(
+                f"Mismo archivo — las copias tienen {secs}s de diferencia en modificación"
+            )
+            ts_row.addWidget(ts_icon)
+            ts_row.addWidget(ts_lbl, 1)
+            layout.addLayout(ts_row)
 
         # Info rows helper (same style as _PhotoCard)
         def _info_row(key: str, value: str) -> QHBoxLayout:
@@ -648,6 +707,7 @@ class DuplicatePanel(QWidget):
         self._groups_loaded:      int                       = 0     # counter for _load_next_batch
         self._thumb_progress_dlg: Optional[QProgressDialog] = None  # phase-3 thumbnail loading
         self._thumbs_loaded:      int                       = 0     # counter for _load_next_thumbnail
+        self._group_ts_diffs:     list[float]               = []    # mtime diff (s) per group index
         self._force_keeps:        Dict[int, Set[str]]       = {}    # group_idx → forced-keep paths
 
         # Dedup worker / thread
@@ -1262,7 +1322,12 @@ class DuplicatePanel(QWidget):
             self._group_progress_dlg.show()
             QApplication.processEvents()
 
-        # ── 4. Full thread cleanup (disconnect signals, quit+wait, deleteLater) ─
+        # ── 4. Grab per-group mtime diffs BEFORE worker is deleted ────────────
+        raw_ts_diffs: list[float] = list(
+            getattr(self._scan_worker, 'group_ts_diffs', []) or []
+        )
+
+        # ── 5. Full thread cleanup (disconnect signals, quit+wait, deleteLater) ─
         self._cleanup_scan_thread()
 
         self._scanning = False
@@ -1276,6 +1341,7 @@ class DuplicatePanel(QWidget):
             if self._scanned_path is not None:
                 no_dup_msg += f"\nen: {self._scanned_path}"
             self._lbl_header.setText(no_dup_msg)
+            self._group_ts_diffs = []
             if self._media_type == "photo":
                 self._photo_groups = [];  self._photo_selections = {}
             elif self._media_type == "video":
@@ -1284,15 +1350,19 @@ class DuplicatePanel(QWidget):
                 self._all_groups = [];    self._all_selections = {}
             return
 
-        # ── 5. Reset display state ─────────────────────────────────────────────
+        # ── 6. Reset display state ─────────────────────────────────────────────
         self._groups = norm_groups
+        # Align timestamp-diff list with groups; pad/trim defensively
+        self._group_ts_diffs = raw_ts_diffs[:len(self._groups)]
+        while len(self._group_ts_diffs) < len(self._groups):
+            self._group_ts_diffs.append(0.0)
         self._selections = {}
         self._current_group_idx = -1
         self._current_cards.clear()
         self._groups_list.clear()
         self._right_stack.setCurrentIndex(0)
 
-        # ── 6. Initialise per-group selections: best → keep, rest → delete ─────
+        # ── 7. Initialise per-group selections: best → keep, rest → delete ─────
         for i, group in enumerate(self._groups):
             best = self._get_best(group)
             best_str = str(best)
@@ -1622,10 +1692,15 @@ class DuplicatePanel(QWidget):
             CardClass = _PhotoCard
 
         force_keeps = self._force_keeps.get(group_idx, set())
+        ts_diff = (
+            self._group_ts_diffs[group_idx]
+            if group_idx < len(self._group_ts_diffs) else 0.0
+        )
 
         for p in sorted_group:
             action = sels.get(p, "keep" if str(p) == str(best) else "delete")
-            card   = CardClass(p, is_best=(str(p) == str(best)), action=action)
+            card   = CardClass(p, is_best=(str(p) == str(best)), action=action,
+                               ts_diff=ts_diff)
 
             # Default-argument capture avoids the classic loop-closure bug:
             # each lambda captures the value of gi and emitted at definition time.

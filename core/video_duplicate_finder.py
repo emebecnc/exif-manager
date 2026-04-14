@@ -2,13 +2,37 @@
 import time
 import traceback
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
 from core.video_handler import (
     compute_md5, get_video_metadata, iter_videos_recursive,
 )
+
+# Maximum timestamp difference (seconds) to annotate with ⏱️ in the comparison UI.
+# Change this single constant to tune the tolerance globally.
+TIMESTAMP_TOLERANCE: int = 4
+
+
+def _file_timestamp(path: Path) -> Optional[float]:
+    """Return file timestamp as POSIX seconds.
+
+    Priority: video container creation_time → filesystem mtime.
+    Returns None only if both reads fail.
+    """
+    try:
+        meta = get_video_metadata(path)
+        ct = meta.get("creation_time")
+        if ct is not None:
+            return ct.timestamp()
+    except Exception:
+        pass
+    # Fallback: filesystem mtime
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
 
 
 class VideoDuplicateScanWorker(QObject):
@@ -27,9 +51,11 @@ class VideoDuplicateScanWorker(QObject):
 
     def __init__(self, root_path: Path, parent=None):
         super().__init__(parent)
-        self.root_path    = root_path
-        self._cancelled   = False
+        self.root_path      = root_path
+        self._cancelled     = False
         self.error_details: str = ""   # full traceback, readable via _on_scan_error
+        # Populated in run() — mtime diff (seconds) per group, parallel to finished groups
+        self.group_ts_diffs: list[float] = []
 
     def cancel(self) -> None:
         self._cancelled = True
@@ -109,6 +135,16 @@ class VideoDuplicateScanWorker(QObject):
             )
             for idx, paths in enumerate(groups):
                 print(f"  group {idx + 1}: {len(paths)} files — {[p.name for p in paths]}")
+
+            # ── Compute timestamp diffs per group (for ⏱️ UI annotation) ──
+            # Uses video container creation_time when available; falls back to mtime.
+            self.group_ts_diffs = []
+            for grp in groups:
+                ts    = [_file_timestamp(p) for p in grp]
+                valid = [t for t in ts if t is not None]
+                diff  = (max(valid) - min(valid)) if len(valid) >= 2 else 0.0
+                self.group_ts_diffs.append(diff)
+
             self.finished.emit(groups)
 
         except Exception as e:
