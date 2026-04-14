@@ -1,6 +1,6 @@
 # EXIF Manager — CLAUDE.md
 
-**Last updated:** 2026-04-14 (session 62)
+**Last updated:** 2026-04-14 (session 63)
 **Repo:** github.com/emebecnc/exif-manager
 **Local:** D:\homelab\exif_manager\
 
@@ -137,6 +137,12 @@ Config: main.py, build.spec, requirements.txt, run_exif_manager.bat
 ✅ UX FIX: FolderTreePanel.set_scan_locked(bool) blocks folder clicks during scan → shows tooltip; DuplicatePanel.scan_busy_changed signal wired in main_window._wire_signals()
 ✅ CRASH FIX: SimilarImageScanWorker — with Image.open() as img → guarantees PIL buffer release; gc.collect() tightened to every 20 files (was 50) → no memory crash on 1600+ files
 ✅ CRASH FIX: DuplicateScanWorker — removed partial_results.emit() mid-scan; groups now rendered ONLY after finished.emit() → eliminates UI/memory conflict during scan
+✅ Burst window logic separated: Exactos vs Similares (2026-04-14, session 63)
+  - Exactos (MD5): burst window REMOVED — MD5 identical = always a duplicate, no timestamp check
+  - Similares (fuzzy): burst window KEPT but changed 180s → 5s (same shot, different processing)
+  - BURST_WINDOW = 5 is now fuzzy-only; comment clarifies it does NOT apply to MD5 scan
+  - DuplicateScanWorker.run(): simple groups = [g for g in md5_map.values() if len(g) > 1]
+  - SimilarImageScanWorker.run(): unchanged filter logic, now uses 5-second window
 ✅ Burst protection audit and fix (2026-04-14, session 62)
   - Removed stale TIMESTAMP_TOLERANCE = 4 constant from duplicate_finder.py (unused, misleading)
   - Removed stale TIMESTAMP_TOLERANCE = 4 constant from video_duplicate_finder.py

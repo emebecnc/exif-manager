@@ -16,11 +16,11 @@ from core.exif_handler import (
 )
 from core.file_scanner import compute_md5, iter_images_recursive
 
-# Maximum timestamp spread (seconds) within an MD5 group that is treated as a
-# "burst" (same photo shot/copied within 3 minutes) — burst groups are NOT shown
-# as duplicates.  Files copied more than BURST_WINDOW seconds apart are true
-# duplicates and will appear in the dedup UI.
-BURST_WINDOW: int = 180  # 3 minutes
+# Maximum timestamp spread (seconds) within a FUZZY (perceptual-hash) group that
+# is treated as a "burst" — photos taken within 5 seconds of each other are the
+# same shot processed differently, not independent duplicates.
+# NOTE: Exact (MD5) duplicates are shown unconditionally — no burst window applied.
+BURST_WINDOW: int = 5  # 5 seconds for fuzzy/similar duplicate detection
 
 
 def _file_timestamp(path: Path) -> Optional[float]:
@@ -208,27 +208,13 @@ class DuplicateScanWorker(QObject):
                     sys.stdout.flush()
 
             # ── Emit results ───────────────────────────────────────────────
-            # Burst filtering: groups where ALL files have timestamps within
-            # BURST_WINDOW seconds are NOT treated as duplicates.  They're
-            # identical copies made in the same session; keep them all.
-            groups = []
-            burst_count = 0
-            for paths in md5_map.values():
-                if len(paths) <= 1:
-                    continue
-                if is_burst(paths):
-                    burst_count += 1
-                    print(
-                        f"  [burst] {len(paths)} files within {BURST_WINDOW}s "
-                        f"— excluded: {[p.name for p in paths]}"
-                    )
-                else:
-                    groups.append(paths)
-
+            # Exact (MD5) duplicates: show ALL groups regardless of timestamp.
+            # MD5 identical = byte-for-byte identical → always a duplicate.
+            groups = [p for p in md5_map.values() if len(p) > 1]
             groups.sort(key=lambda g: (-len(g), str(g[0])))
             print(
                 f"[PhotoScan] done — {total} files, {skipped} skipped, "
-                f"{len(groups)} duplicate groups, {burst_count} burst groups excluded"
+                f"{len(groups)} duplicate groups"
             )
             for idx, paths in enumerate(groups):
                 print(f"  group {idx + 1}: {len(paths)} files — {[p.name for p in paths]}")
