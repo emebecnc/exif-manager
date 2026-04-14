@@ -1,6 +1,6 @@
-# 📷 EXIF Manager
+# 📷 Exif Manager & Duplicate Finder
 
-Aplicación de escritorio Windows para gestionar y corregir fechas EXIF de colecciones de fotos y videos familiares.
+Aplicación de escritorio Windows para gestionar y corregir fechas EXIF de colecciones de fotos y videos familiares, con detección inteligente de duplicados.
 
 ---
 
@@ -8,7 +8,10 @@ Aplicación de escritorio Windows para gestionar y corregir fechas EXIF de colec
 
 Muchas fotos y videos de cámaras digitales tienen fechas incorrectas — ya sea porque la batería de la cámara se agotó y la fecha se reseteó, porque la cámara nunca fue configurada, o porque los archivos fueron renombrados o copiados en algún momento. Esto hace que gestores de fotos como **Immich**, Google Photos o cualquier visor cronológico las ubiquen en el lugar equivocado.
 
-EXIF Manager permite corregir esas fechas de forma masiva, inteligente y con total trazabilidad — sin perder ningún dato original.
+EXIF Manager & Duplicate Finder permite:
+- ✅ Corregir esas fechas de forma masiva e inteligente
+- ✅ Detectar y eliminar archivos duplicados
+- ✅ Mantener total trazabilidad sin perder datos originales
 
 ---
 
@@ -67,7 +70,7 @@ Manejo automático de colisiones (`_1`, `_2`, etc.)
 ### 🔁 Duplicados (fotos + videos)
 Pestaña dedicada para detectar y resolver archivos duplicados.
 
-- **Tres modos de búsqueda**: 📷 Fotos / 🎬 Videos / 🔀 Duplicados (auto-detecta tipo dominante)
+- **Tres modos de búsqueda**: 📷 Fotos / 🎬 Videos / 🔀 Duplicados
 - Auto-detección del tipo de media según la carpeta abierta
 - Detección por hash MD5 exacto — 100% preciso
 - Vista comparativa lado a lado con todos los metadatos
@@ -76,7 +79,15 @@ Pestaña dedicada para detectar y resolver archivos duplicados.
 - Conservar uno a uno: mueve los demás a `_duplicados_eliminados` inmediatamente
 - **Deduplicar todo**: procesa todos los grupos de una vez con confirmación detallada
 - Los archivos eliminados **nunca se borran permanentemente** — siempre van a `_duplicados_eliminados`
-- Escaneo robusto: cada archivo se procesa en try/except individual, con checkpoints cada 100 archivos
+
+### 🎯 Operaciones cancellables
+- **Todos los diálogos de progreso tienen botón "Cancelar"**
+- Escaneado de duplicados: cancelable en cualquier momento
+- Carga de grupos: cancelable sin esperar
+- Carga de thumbnails: cancelable
+- Deduplicación: cancelable incluso durante el movimiento de archivos
+- Limpieza: cancelable
+- Edición de fechas: cancelable en preview y apply
 
 ### 🗑 Drag & Drop
 - Seleccioná fotos en el grid y arrastralas a cualquier carpeta del árbol
@@ -104,26 +115,25 @@ Pestaña dedicada para detectar y resolver archivos duplicados.
 
 | Componente | Tecnología |
 |---|---|
-| Interfaz | PyQt6 |
-| Procesamiento de imágenes | Pillow |
-| Lectura/escritura EXIF fotos | piexif |
-| Lectura/escritura metadatos video | ffmpeg + hachoir |
-| Timestamps Windows | pywin32 |
+| Interfaz | PyQt6 6.4+ |
+| Procesamiento de imágenes | Pillow 10+ |
+| Lectura/escritura EXIF fotos | piexif 1.1.3 |
+| Lectura metadatos video | ffmpeg + hachoir |
+| Timestamps Windows | pywin32 306+ |
 | Paths y filesystem | pathlib |
-| Distribución | PyInstaller |
 
 ---
 
 ## 🚀 Instalación
 
 ### Requisitos previos
-- Python 3.11+
-- [ffmpeg](https://ffmpeg.org/download.html) en el PATH (o `ffmpeg.exe` junto al programa)
+- **Python 3.11+**
+- **[ffmpeg](https://ffmpeg.org/download.html)** en el PATH (o `ffmpeg.exe` junto al programa)
 
 ### Instalar dependencias
 
 ```bash
-pip install PyQt6 Pillow piexif pywin32 hachoir ffmpeg-python
+pip install PyQt6>=6.4.0 Pillow>=10.0.0 piexif>=1.1.3 pywin32>=306 platformdirs>=3.0.0 ffmpeg-python>=0.2.0 hachoir>=3.1.3
 ```
 
 ### Ejecutar
@@ -139,6 +149,7 @@ O doble click en `run_exif_manager.bat`
 ## 📦 Compilar a .exe
 
 ```bash
+pip install pyinstaller
 pyinstaller build.spec
 ```
 
@@ -177,6 +188,20 @@ Genera `dist/ExifManager/ExifManager.exe` — standalone, no requiere Python ins
 - ✅ Log de operaciones con exportación CSV
 - ✅ Soporte rutas UNC (red local / NAS)
 - ✅ Tema oscuro profesional con bordes redondeados
+- ✅ **NUEVO:** Botones "Cancelar" en todos los diálogos de progreso
+- ✅ **NUEVO:** Workers cancellables con early return + stop flag
+
+---
+
+## 🐛 Issues conocidos
+
+- Barra "Cargando grupos..." puede freezear 1-2 segundos al empezar (cosmético, no crítico)
+
+---
+
+## 🙋 Soporte
+
+Para reportar bugs o sugerir features, abre un issue en GitHub.
 
 ---
 

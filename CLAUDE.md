@@ -1,6 +1,6 @@
 # EXIF Manager — CLAUDE.md
 
-**Last updated:** 2026-04-13 (session 58)
+**Last updated:** 2026-04-14 (session 58)
 **Repo:** github.com/emebecnc/exif-manager
 **Local:** D:\homelab\exif_manager\
 
@@ -150,6 +150,21 @@ Config: main.py, build.spec, requirements.txt, run_exif_manager.bat
 ✅ QUALITY (session 56): SimilarImageScanWorker.DEFAULT_THRESHOLD 8→3 — pHash Hamming distance ≤3 (~4.7% of 64 bits); eliminates false positives on different scenes while still catching same-image re-saves and resolution changes. No _group_similar_hashes() exists; the real entry point is _phash_groups().
 ✅ UX (session 57): Added cancel support to ALL 6 non-scan progress dialogs (duplicate_panel.py ×3, cleanup_dialog.py ×1, date_editor.py ×2). Group/thumbnail dialogs show actual "Cancelar" button; dedup/delete/preview/apply use setCancelButton(None) so X closes and fires canceled(). Workers get public stop_requested = False; cancel handlers set it directly and immediately close dialog + re-enable UI. _load_next_batch checks _groups_loading flag; _load_next_thumbnail guards on _thumb_progress_dlg is None. _on_*_progress() use local dialog ref guard. _scan_progress_dlg unchanged (no canceled() connection — re-entrancy crash risk, session 37).
 ✅ FIX (session 58): duplicate_panel.py — _btn_cancel now calls setEnabled(True) when scan starts and setEnabled(False) at all 4 exit points (cancel, normal finish, exception path, error path). Previously only setVisible was toggled so button could appear enabled/disabled inconsistently.
+✅ Cancel button added to all 6 progress dialogs (2026-04-13)
+  - duplicate_panel.py: group loading, thumbnail loading, dedup
+  - cleanup_dialog.py: delete operation
+  - date_editor.py: preview, apply
+  - All workers: stop_requested flag + polling + early return on cancel
+  - UI re-enables immediately when user cancels
+
+---
+
+## SESSION 58 — FINAL RELEASE PREP
+
+- Renamed app: "EXIF Date Manager" → "Exif Manager & Duplicate Finder" (ui/main_window.py)
+- Updated README.md with complete feature list and usage guide
+- All progress dialogs fully cancellable
+- Ready for GitHub public release
 
 ---
 

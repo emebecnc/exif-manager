@@ -28,7 +28,7 @@ class MainWindow(QMainWindow):
     def __init__(self, ffmpeg_available: bool = True):
         super().__init__()
         self._ffmpeg_available = ffmpeg_available
-        self.setWindowTitle("EXIF Date Manager")
+        self.setWindowTitle("Exif Manager & Duplicate Finder")
         self.resize(1400, 800)
 
         # Shared state
