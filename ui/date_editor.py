@@ -442,15 +442,27 @@ class DateEditorDialog(QDialog):
         date_row = QHBoxLayout(self._date_grp)
         date_row.setSpacing(12)
 
-        # Hidden checkboxes (off-layout) — kept alive so _apply_exif_mode_state()
-        # can enable/disable spinboxes via toggled signals, and so _ApplyWorker /
-        # _PreviewWorker can query isChecked() at runtime (always True in Cambiar mode).
-        self._chk_year = QCheckBox()
+        # Checkboxes inline with spinboxes — allow selecting which date components
+        # to modify (e.g. change only the year, keep month/day from each file's EXIF).
+        # _apply_exif_mode_state() and _ApplyWorker/_PreviewWorker all read isChecked().
+        self._chk_year = QCheckBox("Año:")
         self._chk_year.setChecked(True)
-        self._chk_month = QCheckBox()
+        self._chk_year.setToolTip(
+            "Marcado: reemplaza el año de cada foto con el valor del spinbox.\n"
+            "Desmarcado: conserva el año original de cada foto."
+        )
+        self._chk_month = QCheckBox("Mes:")
         self._chk_month.setChecked(True)
-        self._chk_day = QCheckBox()
+        self._chk_month.setToolTip(
+            "Marcado: reemplaza el mes.\n"
+            "Desmarcado: conserva el mes original de cada foto."
+        )
+        self._chk_day = QCheckBox("Día:")
         self._chk_day.setChecked(True)
+        self._chk_day.setToolTip(
+            "Marcado: reemplaza el día.\n"
+            "Desmarcado: conserva el día original de cada foto."
+        )
 
         self._spin_year = QSpinBox()
         self._spin_year.setRange(1900, 2099)
@@ -458,6 +470,7 @@ class DateEditorDialog(QDialog):
         self._spin_year.setFixedWidth(70)
         self._spin_year.setToolTip("Nuevo año (1900–2099).")
         self._chk_year.toggled.connect(self._spin_year.setEnabled)
+        self._chk_year.toggled.connect(lambda _: self._on_date_component_toggled())
 
         self._spin_month = QSpinBox()
         self._spin_month.setRange(1, 12)
@@ -465,6 +478,7 @@ class DateEditorDialog(QDialog):
         self._spin_month.setFixedWidth(55)
         self._spin_month.setToolTip("Nuevo mes (1–12).")
         self._chk_month.toggled.connect(self._spin_month.setEnabled)
+        self._chk_month.toggled.connect(lambda _: self._on_date_component_toggled())
 
         self._spin_day = QSpinBox()
         self._spin_day.setRange(1, 31)
@@ -472,12 +486,13 @@ class DateEditorDialog(QDialog):
         self._spin_day.setFixedWidth(55)
         self._spin_day.setToolTip("Nuevo día (1–31). Se recorta al último día válido del mes si es necesario.")
         self._chk_day.toggled.connect(self._spin_day.setEnabled)
+        self._chk_day.toggled.connect(lambda _: self._on_date_component_toggled())
 
-        date_row.addWidget(QLabel("Año:"))
+        date_row.addWidget(self._chk_year)
         date_row.addWidget(self._spin_year)
-        date_row.addWidget(QLabel("Mes:"))
+        date_row.addWidget(self._chk_month)
         date_row.addWidget(self._spin_month)
-        date_row.addWidget(QLabel("Día:"))
+        date_row.addWidget(self._chk_day)
         date_row.addWidget(self._spin_day)
         date_row.addStretch()
 

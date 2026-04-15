@@ -1,6 +1,6 @@
 # EXIF Manager — CLAUDE.md
 
-**Last updated:** 2026-04-15 (session 69 final)
+**Last updated:** 2026-04-15 (session 71)
 **Repo:** github.com/emebecnc/exif-manager
 **Local:** D:\homelab\exif_manager\
 
@@ -52,6 +52,54 @@ Signal: FolderTree folder_changed(Path) → all tabs' on_folder_changed() slots
 - Duplicates by MD5 + trash folder
 - Supported: MP4, MOV, M4V, MKV, AVI, WMV, MPG, MPEG, TS, M2TS, MTS
 - .3GP: skip gracefully
+
+### ✅ Video grid toolbar unified with photo grid toolbar (session 71)
+- ui/video_grid.py — VideoGrid:
+  * Added QCheckBox "Solo sin fecha" (filter, default OFF) — identical to photo grid
+  * Renamed sort combo first item "Fecha" → "Fecha EXIF" to match photo grid label
+  * Added "Restaurar EXIF" button (hidden, shown when .video_backup.json exists)
+  * Button order now identical: Nueva carpeta | Restaurar EXIF | Editar carpeta | Editar selección
+  * Added restore_backup_requested = pyqtSignal(Path) on VideoGrid
+  * Added _apply_filter() method — shows/hides items + updates count label
+  * _apply_filter() called after each batch in _on_items_batch_ready() and in _on_worker_finished()
+  * Added _on_restore_backup() → emits restore_backup_requested signal
+  * Imports: added QCheckBox, has_video_backup, restore_video_backup, mb_info, mb_question
+- ui/video_grid.py — VideoPanel:
+  * _wire_signals(): connected grid.restore_backup_requested → _on_restore_video_backup
+  * Added _on_restore_video_backup(folder_path): calls restore_video_backup(), shows result dialog, reloads grid
+  * restore_video_backup() was already implemented in core/video_handler.py
+
+### ✅ Selective date field checkboxes restored (session 71)
+- Both date editors: _chk_year/_chk_month/_chk_day are now VISIBLE in the layout (were hidden)
+- Layout: [☐ Año:] [spinbox] [☐ Mes:] [spinbox] [☐ Día:] [spinbox] — all horizontal
+- Checkboxes have descriptive tooltips explaining preserve vs replace behaviour
+- ui/date_editor.py:
+  * QCheckBox("Año:") etc. replace the old QCheckBox() + QLabel("Año:") pair
+  * Added _on_date_component_toggled() connections so preview/apply state refresh on checkbox change
+  * All backend logic (_ApplyWorker, _PreviewWorker, _apply_exif_mode_state, _update_apply_state) unchanged — already used isChecked()
+- ui/video_date_editor.py:
+  * Same change: QCheckBox("Año:") etc. added to layout instead of QLabel
+  * Added _populate_table() connections to checkbox toggled signals
+  * spinbox enable/disable connections unchanged (still gate on radio_change.isChecked() AND chk.isChecked())
+
+### ✅ Orange border for non-standard filenames (session 71)
+- ui/thumbnail_grid.py:
+  * Added _ROLE_STD_NAME (UserRole+3) and _STANDARD_NAME_RE regex
+  * _make_skeleton_item() sets _ROLE_STD_NAME via regex match at item creation time
+  * _ThumbnailDelegate.paint(): RED border (invalid date) takes priority; ORANGE border (255,165,0) when is_std is False
+  * Legend updated: "🔴 = fecha inválida   🟠 = nombre no estándar"
+- ui/video_grid.py:
+  * Same pattern: _ROLE_STD_NAME (UserRole+5), _STANDARD_NAME_RE, _make_skeleton_item, _VideoDelegate.paint()
+  * Legend updated with same text + tooltip on both grids
+- Standard pattern: YYYY-MM-DD-HHhMMmSSs.ext (e.g. 2011-12-24-15h40m46s.jpg)
+- Files named IMG_xxxx.jpg, VID_xxxx.mp4, etc. get orange border immediately at skeleton phase (no background worker needed)
+
+### ✅ Startup optimized (session 70)
+- Startup time reduced from ~15s to <5s (three fixes)
+- ui/log_viewer.py: LogManager._load_from_disk() deferred — _logs_loaded flag + ensure_loaded() pattern
+  ensure_loaded() called lazily in entries property, export_txt(), export_csv() (saves 0.9s / 45k strptime calls)
+- main.py: apply_dark_theme(app) moved to after window.show() (saves 0.5-1s theme/style load)
+- ui/folder_tree.py: removed self._tree.expandItem(root_item) from load_root() (saves 0.4s auto-expand)
 
 ### ⚠️ Optimizations
 - Batch updates every 20 items

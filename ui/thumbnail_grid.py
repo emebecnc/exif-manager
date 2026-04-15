@@ -1,6 +1,7 @@
 """Center panel: thumbnail grid with two-phase background loading and disk cache."""
 import hashlib
 import os
+import re
 import shutil
 from collections import OrderedDict
 from datetime import datetime
@@ -29,6 +30,13 @@ from ui.styles import apply_button_style, mb_warning
 _ROLE_PATH    = Qt.ItemDataRole.UserRole
 _ROLE_DATE    = Qt.ItemDataRole.UserRole + 1
 _ROLE_INVALID = Qt.ItemDataRole.UserRole + 2
+_ROLE_STD_NAME = Qt.ItemDataRole.UserRole + 3  # True=standard name, False=non-standard
+
+# Standard filename pattern: YYYY-MM-DD-HHhMMmSSs.ext  (e.g. 2011-12-24-15h40m46s.jpg)
+_STANDARD_NAME_RE = re.compile(
+    r'^\d{4}-\d{2}-\d{2}-\d{2}h\d{2}m\d{2}s(_\d+)?\..+$',
+    re.IGNORECASE,
+)
 
 # Sort mode constants
 _SORT_DATE = 0   # by EXIF date (DateTimeOriginal → Digitized → DateTime → mtime)
@@ -179,15 +187,25 @@ class _ThumbnailWorker(QObject):
 
 
 class _ThumbnailDelegate(QStyledItemDelegate):
-    """Custom delegate that draws a red border on invalid-date items."""
+    """Custom delegate that draws coloured borders on flagged items.
+
+    Priority (highest wins):
+      RED    — invalid / missing EXIF date
+      ORANGE — filename does not match YYYY-MM-DD-HHhMMmSSs.ext
+    """
 
     def paint(self, painter, option: QStyleOptionViewItem, index: QModelIndex) -> None:
         super().paint(painter, option, index)
         is_inv = index.data(_ROLE_INVALID)
+        is_std = index.data(_ROLE_STD_NAME)  # True=standard, False=non-standard
         if is_inv:
             painter.save()
-            pen = QPen(QColor(220, 60, 60), 3)
-            painter.setPen(pen)
+            painter.setPen(QPen(QColor(220, 60, 60), 3))
+            painter.drawRect(option.rect.adjusted(2, 2, -2, -2))
+            painter.restore()
+        elif is_std is False:
+            painter.save()
+            painter.setPen(QPen(QColor(255, 165, 0), 3))
             painter.drawRect(option.rect.adjusted(2, 2, -2, -2))
             painter.restore()
 
@@ -286,13 +304,15 @@ class ThumbnailGrid(QWidget):
         )
         self._chk_sin_fecha.toggled.connect(self._apply_filter)
 
-        # Red-border legend
-        self._lbl_invalid_legend = QLabel("🔴 = fecha inválida")
+        # Border legend
+        self._lbl_invalid_legend = QLabel("🔴 = fecha inválida   🟠 = nombre no estándar")
         self._lbl_invalid_legend.setStyleSheet("font-size: 10px; color: #aaaaaa; padding: 0 4px;")
         self._lbl_invalid_legend.setToolTip(
-            "Las fotos con borde rojo tienen fecha EXIF ausente o incorrecta\n"
-            "(ej: 01/01/2000 o 01/01/2005). Estas fotos aparecerán en el lugar\n"
-            "equivocado en Immich y Google Photos."
+            "🔴 Borde rojo: fecha EXIF ausente o incorrecta\n"
+            "   (ej: 01/01/2000). La foto aparecerá mal ordenada en Immich.\n\n"
+            "🟠 Borde naranja: el nombre no sigue el formato estándar\n"
+            "   YYYY-MM-DD-HHhMMmSSs.ext (ej: 2011-12-24-15h40m46s.jpg).\n"
+            "   Usá 'Renombrar archivos' en el editor de fecha para corregirlo."
         )
 
         row1 = QHBoxLayout()
@@ -604,6 +624,7 @@ class ThumbnailGrid(QWidget):
         item.setData(_ROLE_PATH, str(path))
         item.setData(_ROLE_DATE, "")
         item.setData(_ROLE_INVALID, False)
+        item.setData(_ROLE_STD_NAME, bool(_STANDARD_NAME_RE.match(path.name)))
         item.setSizeHint(QSize(_ITEM_W, _ITEM_H))
         return item
 

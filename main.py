@@ -100,7 +100,6 @@ def main():
     app.setOrganizationName("homelab")
     app.setApplicationName("ExifManager")
     app.setApplicationVersion("1.0.0")
-    apply_dark_theme(app)
 
     _ico = Path(__file__).parent / "icon.ico"
     if _ico.exists():
@@ -130,6 +129,7 @@ def main():
     from ui.main_window import MainWindow
     window = MainWindow(ffmpeg_available=ffmpeg_ok)
     window.show()
+    apply_dark_theme(app)  # deferred — window already visible, theme applied after first paint
     sys.exit(app.exec())
 
 

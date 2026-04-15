@@ -177,7 +177,6 @@ class FolderTreePanel(QWidget):
         self._tree.clear()
         root_item = self._make_item(root)
         self._tree.addTopLevelItem(root_item)
-        self._tree.expandItem(root_item)
 
     def refresh_item(self, folder_path: Path) -> None:
         """Refresh backup indicator and file counts for an item matching folder_path."""

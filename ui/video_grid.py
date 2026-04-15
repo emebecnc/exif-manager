@@ -1,6 +1,7 @@
 """Video tab: grid + detail panel driven by MainWindow's shared folder tree."""
 import hashlib
 import os
+import re
 import shutil
 from collections import OrderedDict
 from datetime import datetime
@@ -17,7 +18,7 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QPushButton,
-    QLabel, QComboBox, QListWidget, QListWidgetItem, QAbstractItemView,
+    QLabel, QComboBox, QCheckBox, QListWidget, QListWidgetItem, QAbstractItemView,
     QStyledItemDelegate, QStyleOptionViewItem, QApplication,
     QFileDialog, QMenu, QMessageBox, QInputDialog, QProgressBar,
     QLayout, QFrame,
@@ -28,11 +29,12 @@ from core.video_handler import (
     get_video_metadata, get_best_date, is_invalid_date,
     get_video_thumbnail, scan_video_folder, format_duration, format_size,
     make_dated_filename, compute_md5, VIDEO_EXTENSIONS,
+    has_video_backup, restore_video_backup,
 )
 from core.file_scanner import unique_dest, EXCLUDED_FOLDERS
 from core.backup_manager import append_historial
 from ui.log_viewer import LogManager
-from ui.styles import apply_button_style, apply_primary_button_style, mb_warning
+from ui.styles import apply_button_style, apply_primary_button_style, mb_warning, mb_info, mb_question
 from ui.video_detail import VideoDetailPanel
 
 # ── Item data roles ───────────────────────────────────────────────────────────
@@ -41,6 +43,13 @@ _ROLE_DATE     = Qt.ItemDataRole.UserRole + 1
 _ROLE_INVALID  = Qt.ItemDataRole.UserRole + 2
 _ROLE_DURATION = Qt.ItemDataRole.UserRole + 3
 _ROLE_SIZE     = Qt.ItemDataRole.UserRole + 4
+_ROLE_STD_NAME = Qt.ItemDataRole.UserRole + 5  # True=standard name, False=non-standard
+
+# Standard filename pattern: YYYY-MM-DD-HHhMMmSSs.ext  (e.g. 2007-09-29-02h47m07s.mp4)
+_STANDARD_NAME_RE = re.compile(
+    r'^\d{4}-\d{2}-\d{2}-\d{2}h\d{2}m\d{2}s(_\d+)?\..+$',
+    re.IGNORECASE,
+)
 
 # Sort modes
 _SORT_DATE     = 0
@@ -174,17 +183,29 @@ class _VideoThumbnailWorker(QObject):
 # ── Item delegate ─────────────────────────────────────────────────────────────
 
 class _VideoDelegate(QStyledItemDelegate):
-    """Draws red border on invalid-date items + 🎬 badge + duration badge."""
+    """Draws coloured borders on flagged items + 🎬 badge + duration badge.
+
+    Priority (highest wins):
+      RED    — invalid / missing metadata date
+      ORANGE — filename does not match YYYY-MM-DD-HHhMMmSSs.ext
+    """
 
     def paint(self, painter: QPainter, option: QStyleOptionViewItem,
               index: QModelIndex) -> None:
         super().paint(painter, option, index)
         rect = option.rect
 
-        # Red border for invalid / missing dates
-        if index.data(_ROLE_INVALID):
+        # Coloured border: red (invalid date) takes priority over orange (non-standard name)
+        is_inv = index.data(_ROLE_INVALID)
+        is_std = index.data(_ROLE_STD_NAME)  # True=standard, False=non-standard
+        if is_inv:
             painter.save()
             painter.setPen(QPen(QColor(220, 60, 60), 3))
+            painter.drawRect(rect.adjusted(2, 2, -2, -2))
+            painter.restore()
+        elif is_std is False:
+            painter.save()
+            painter.setPen(QPen(QColor(255, 165, 0), 3))
             painter.drawRect(rect.adjusted(2, 2, -2, -2))
             painter.restore()
 
@@ -265,6 +286,7 @@ class VideoGrid(QWidget):
     folder_created               = pyqtSignal(Path)
     folder_loaded                = pyqtSignal(int)
     read_filename_date_requested = pyqtSignal(Path)
+    restore_backup_requested     = pyqtSignal(Path)   # folder to restore video backup for
 
     def __init__(self, log_manager: LogManager, ffmpeg_available: bool = True,
                  parent=None):
@@ -322,8 +344,17 @@ class VideoGrid(QWidget):
         self._progress_bar.setTextVisible(False)
         self._progress_bar.setVisible(False)
 
+        # "Solo sin fecha" filter — default OFF so all videos are visible
+        self._chk_sin_fecha = QCheckBox("Solo sin fecha")
+        self._chk_sin_fecha.setChecked(False)
+        self._chk_sin_fecha.setToolTip(
+            "Cuando está marcado, muestra solo los videos sin fecha de metadata válida.\n"
+            "Desmarcá para ver todos los videos."
+        )
+        self._chk_sin_fecha.toggled.connect(self._apply_filter)
+
         self._sort_combo = QComboBox()
-        self._sort_combo.addItems(["Fecha", "Nombre", "Duración", "Tamaño"])
+        self._sort_combo.addItems(["Fecha EXIF", "Nombre", "Duración", "Tamaño"])
         self._sort_combo.setToolTip("Criterio de ordenamiento de los videos")
         self._sort_combo.currentIndexChanged.connect(self._on_sort_changed)
 
@@ -331,13 +362,20 @@ class VideoGrid(QWidget):
         self._btn_sort_dir.clicked.connect(self._on_sort_dir_toggled)
         apply_button_style(self._btn_sort_dir)
 
-        self._lbl_invalid_legend = QLabel("🔴 = fecha inválida")
+        self._lbl_invalid_legend = QLabel("🔴 = fecha inválida   🟠 = nombre no estándar")
         self._lbl_invalid_legend.setStyleSheet(
             "font-size: 10px; color: #aaaaaa; padding: 0 4px;"
+        )
+        self._lbl_invalid_legend.setToolTip(
+            "🔴 Borde rojo: fecha de metadata ausente o incorrecta.\n\n"
+            "🟠 Borde naranja: el nombre no sigue el formato estándar\n"
+            "   YYYY-MM-DD-HHhMMmSSs.ext (ej: 2007-09-29-02h47m07s.mp4).\n"
+            "   Usá 'Renombrar archivos' en el editor de fecha para corregirlo."
         )
 
         row1 = QHBoxLayout()
         row1.setContentsMargins(0, 0, 0, 0)
+        row1.addWidget(self._chk_sin_fecha)
         row1.addWidget(self._sort_combo)
         row1.addWidget(self._btn_sort_dir)
         row1.addStretch()
@@ -345,7 +383,7 @@ class VideoGrid(QWidget):
         row1.addWidget(self._progress_bar)
         row1.addWidget(self._lbl_count)
 
-        # Row 2: action buttons
+        # Row 2: action buttons — identical order to photo grid
         self._btn_edit_selection = QPushButton("Editar selección")
         self._btn_edit_selection.setVisible(False)
         self._btn_edit_selection.clicked.connect(self._on_edit_selection)
@@ -353,8 +391,20 @@ class VideoGrid(QWidget):
 
         self._btn_new_folder = QPushButton("📁 Nueva carpeta")
         self._btn_new_folder.setEnabled(False)
+        self._btn_new_folder.setToolTip(
+            "Crea una nueva subcarpeta dentro de la carpeta actual."
+        )
         self._btn_new_folder.clicked.connect(self._on_new_folder)
         apply_button_style(self._btn_new_folder)
+
+        self._btn_restore = QPushButton("Restaurar EXIF")
+        self._btn_restore.setVisible(False)
+        self._btn_restore.setToolTip(
+            "Revierte todos los cambios de fecha realizados en esta carpeta\n"
+            "usando el backup automático creado antes de la última edición."
+        )
+        self._btn_restore.clicked.connect(self._on_restore_backup)
+        apply_button_style(self._btn_restore)
 
         self._btn_edit = QPushButton("Editar carpeta")
         self._btn_edit.setEnabled(False)
@@ -368,6 +418,7 @@ class VideoGrid(QWidget):
         row2.setContentsMargins(0, 0, 0, 0)
         row2.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
         row2.addWidget(self._btn_new_folder)
+        row2.addWidget(self._btn_restore)
         row2.addWidget(self._btn_edit)
         row2.addWidget(self._btn_edit_selection)
         row2.addStretch()
@@ -488,6 +539,7 @@ class VideoGrid(QWidget):
         self.folder_loaded.emit(count)
         self._btn_new_folder.setEnabled(True)
         self._btn_edit.setEnabled(count > 0)
+        self._btn_restore.setVisible(has_video_backup(folder_path))
 
         if not videos:
             self._pending_select = None
@@ -542,6 +594,7 @@ class VideoGrid(QWidget):
         item.setData(_ROLE_INVALID,  False)
         item.setData(_ROLE_DURATION, 0.0)
         item.setData(_ROLE_SIZE,     0)
+        item.setData(_ROLE_STD_NAME, bool(_STANDARD_NAME_RE.match(path.name)))
         item.setSizeHint(QSize(_ITEM_W, _ITEM_H))
         return item
 
@@ -589,6 +642,7 @@ class VideoGrid(QWidget):
         finally:
             self._list.setUpdatesEnabled(True)
             self._list.update()
+        self._apply_filter()
 
     def _on_load_progress(self, current: int, total: int) -> None:
         if self._progress_bar.isVisible():
@@ -610,14 +664,45 @@ class VideoGrid(QWidget):
         if self._sort_mode == _SORT_DATE:
             self._apply_sort()
 
-        n = self._list.count()
-        self._lbl_count.setText(f"{n} video{'s' if n != 1 else ''}")
         self._progress_bar.setVisible(False)
+        self._apply_filter()   # sets count label to visible items
 
         if self._pending_folder:
             pending = self._pending_folder
             self._pending_folder = None
             self._start_load(pending)
+
+    # ── Filter ────────────────────────────────────────────────────────────────
+
+    def _apply_filter(self) -> None:
+        """Show/hide items based on the 'Solo sin fecha' checkbox.
+
+        "Sin fecha" = date_str is empty OR is_invalid (e.g. 2000-01-01).
+        Items still loading (date_str="") stay visible until real data arrives.
+        """
+        sin_fecha_only = self._chk_sin_fecha.isChecked()
+        visible = 0
+        for i in range(self._list.count()):
+            item = self._list.item(i)
+            if sin_fecha_only:
+                date_str = item.data(_ROLE_DATE) or ""
+                is_inv   = bool(item.data(_ROLE_INVALID))
+                show     = not date_str or is_inv
+            else:
+                show = True
+            item.setHidden(not show)
+            if show:
+                visible += 1
+        n_total = self._list.count()
+        if sin_fecha_only:
+            self._lbl_count.setText(f"{visible} / {n_total} video{'s' if n_total != 1 else ''}")
+        else:
+            self._lbl_count.setText(f"{n_total} video{'s' if n_total != 1 else ''}")
+
+    def _on_restore_backup(self) -> None:
+        """Emit restore_backup_requested so VideoPanel can handle the restore dialog."""
+        if self._current_folder:
+            self.restore_backup_requested.emit(self._current_folder)
 
     # ── Selection ──────────────────────────────────────────────────────────────
 
@@ -981,6 +1066,9 @@ class VideoPanel(QWidget):
         # Videos deleted from grid → clear detail if needed
         self._grid.videos_deleted.connect(self._on_videos_deleted)
 
+        # Restore video backup from grid's "Restaurar EXIF" button
+        self._grid.restore_backup_requested.connect(self._on_restore_video_backup)
+
         # Forward new-folder events to MainWindow so it can reveal the folder
         # in the shared folder tree (MainWindow connects this in _wire_signals).
         self._grid.folder_created.connect(self.folder_created)
@@ -1029,6 +1117,42 @@ class VideoPanel(QWidget):
         if self._current_video and self._current_video in moved:
             self._current_video = None
             self._detail.clear()
+
+    def _on_restore_video_backup(self, folder_path: Path) -> None:
+        """Restore video metadata from .video_backup.json for folder_path."""
+        if not has_video_backup(folder_path):
+            mb_info(
+                self, "Sin backup",
+                f"No existe backup de video en:\n{folder_path}"
+            )
+            return
+
+        reply = mb_question(
+            self, "Restaurar backup",
+            f"¿Restaurar metadatos originales de todos los videos en:\n{folder_path.name}?",
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        result = restore_video_backup(folder_path)
+        self._log.log(
+            str(folder_path), "", "restore_video_backup",
+            "", f"ok={result['ok']} errores={result['failed']}"
+        )
+
+        if result["errors"]:
+            mb_warning(
+                self, "Restauración con errores",
+                f"Restaurados: {result['ok']}\nErrores: {result['failed']}\n\n"
+                + "\n".join(result["errors"][:10])
+            )
+        else:
+            mb_info(self, "Backup restaurado",
+                    f"Se restauraron {result['ok']} video(s).")
+
+        self._grid.load_folder(folder_path)
+        if self._current_video and self._current_video.parent == folder_path:
+            self._detail.load_video(self._current_video)
 
     def _open_editor_folder_or_single(self, target: Path) -> None:
         """Called by grid's 'Editar carpeta' button — target is a folder."""

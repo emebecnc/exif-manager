@@ -58,9 +58,15 @@ class LogManager(QObject):
             app_data_dir = Path(data)
         app_data_dir.mkdir(parents=True, exist_ok=True)
         self._log_file = app_data_dir / "log.csv"
-        self._load_from_disk()
+        self._logs_loaded = False  # deferred — loaded on first access
 
     # ── Public API ────────────────────────────────────────────────────────
+
+    def ensure_loaded(self) -> None:
+        """Load log history from disk on first call; subsequent calls are no-ops."""
+        if not self._logs_loaded:
+            self._logs_loaded = True
+            self._load_from_disk()
 
     def log(
         self,
@@ -84,9 +90,11 @@ class LogManager(QObject):
 
     @property
     def entries(self) -> List[LogEntry]:
+        self.ensure_loaded()
         return list(self._entries)
 
     def export_txt(self, dest_path: Path) -> None:
+        self.ensure_loaded()
         with open(dest_path, "w", encoding="utf-8") as f:
             for e in self._entries:
                 f.write(
@@ -96,6 +104,7 @@ class LogManager(QObject):
                 )
 
     def export_csv(self, dest_path: Path) -> None:
+        self.ensure_loaded()
         with open(dest_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(_CSV_HEADERS)

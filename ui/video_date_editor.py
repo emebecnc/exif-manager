@@ -264,14 +264,27 @@ class VideoDateEditorDialog(QDialog):
         date_row = QHBoxLayout(self._grp_date)
         date_row.setSpacing(12)
 
-        # Hidden checkboxes — off-layout but kept alive so _update_state() can
-        # set/read isChecked() to enable/disable spinboxes via toggled signals.
-        self._chk_year = QCheckBox()
+        # Checkboxes inline with spinboxes — allow selecting which date components
+        # to modify (e.g. change only the year, keep month/day from each video's metadata).
+        # _update_state() and _ApplyWorker all read isChecked() on these.
+        self._chk_year = QCheckBox("Año:")
         self._chk_year.setChecked(True)
-        self._chk_month = QCheckBox()
+        self._chk_year.setToolTip(
+            "Marcado: reemplaza el año de cada video con el valor del spinbox.\n"
+            "Desmarcado: conserva el año original de cada video."
+        )
+        self._chk_month = QCheckBox("Mes:")
         self._chk_month.setChecked(True)
-        self._chk_day = QCheckBox()
+        self._chk_month.setToolTip(
+            "Marcado: reemplaza el mes.\n"
+            "Desmarcado: conserva el mes original de cada video."
+        )
+        self._chk_day = QCheckBox("Día:")
         self._chk_day.setChecked(True)
+        self._chk_day.setToolTip(
+            "Marcado: reemplaza el día.\n"
+            "Desmarcado: conserva el día original de cada video."
+        )
 
         self._spin_year = QSpinBox()
         self._spin_year.setRange(1970, 2099)
@@ -288,11 +301,11 @@ class VideoDateEditorDialog(QDialog):
         self._spin_day.setValue(prefill_dt.day if prefill_dt else now.day)
         self._spin_day.setFixedWidth(55)
 
-        date_row.addWidget(QLabel("Año:"))
+        date_row.addWidget(self._chk_year)
         date_row.addWidget(self._spin_year)
-        date_row.addWidget(QLabel("Mes:"))
+        date_row.addWidget(self._chk_month)
         date_row.addWidget(self._spin_month)
-        date_row.addWidget(QLabel("Día:"))
+        date_row.addWidget(self._chk_day)
         date_row.addWidget(self._spin_day)
         date_row.addStretch()
         layout.addWidget(self._grp_date)
@@ -408,12 +421,15 @@ class VideoDateEditorDialog(QDialog):
         self._chk_year.toggled.connect(lambda _: self._spin_year.setEnabled(
             self._radio_change.isChecked() and self._chk_year.isChecked()
         ))
+        self._chk_year.toggled.connect(lambda _: self._populate_table())
         self._chk_month.toggled.connect(lambda _: self._spin_month.setEnabled(
             self._radio_change.isChecked() and self._chk_month.isChecked()
         ))
+        self._chk_month.toggled.connect(lambda _: self._populate_table())
         self._chk_day.toggled.connect(lambda _: self._spin_day.setEnabled(
             self._radio_change.isChecked() and self._chk_day.isChecked()
         ))
+        self._chk_day.toggled.connect(lambda _: self._populate_table())
         self._update_state()
 
     def _update_state(self) -> None:
