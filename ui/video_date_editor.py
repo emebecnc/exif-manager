@@ -247,15 +247,16 @@ class VideoDateEditorDialog(QDialog):
 
         # ── Action radio ────────────────────────────────────────────────────
         grp_mode = QGroupBox("Acción")
-        ml = QVBoxLayout(grp_mode)
+        ml = QHBoxLayout(grp_mode)
         self._radio_keep   = QRadioButton("Conservar fecha de metadata")
         self._radio_change = QRadioButton("Cambiar fecha")
-        self._radio_change.setChecked(True)
+        self._radio_keep.setChecked(True)
         self._bg_mode = QButtonGroup(self)
         self._bg_mode.addButton(self._radio_keep,   _MODE_KEEP)
         self._bg_mode.addButton(self._radio_change, _MODE_CHANGE)
         ml.addWidget(self._radio_keep)
         ml.addWidget(self._radio_change)
+        ml.addStretch()
         layout.addWidget(grp_mode)
 
         # ── Date group ──────────────────────────────────────────────────────
@@ -263,29 +264,35 @@ class VideoDateEditorDialog(QDialog):
         date_row = QHBoxLayout(self._grp_date)
         date_row.setSpacing(12)
 
-        self._chk_year = QCheckBox("Año:")
+        # Hidden checkboxes — off-layout but kept alive so _update_state() can
+        # set/read isChecked() to enable/disable spinboxes via toggled signals.
+        self._chk_year = QCheckBox()
         self._chk_year.setChecked(True)
+        self._chk_month = QCheckBox()
+        self._chk_month.setChecked(True)
+        self._chk_day = QCheckBox()
+        self._chk_day.setChecked(True)
+
         self._spin_year = QSpinBox()
         self._spin_year.setRange(1970, 2099)
         self._spin_year.setValue(prefill_dt.year if prefill_dt else now.year)
         self._spin_year.setFixedWidth(70)
-        date_row.addWidget(self._chk_year)
-        date_row.addWidget(self._spin_year)
 
-        self._chk_month = QCheckBox("Mes:")
         self._spin_month = QSpinBox()
         self._spin_month.setRange(1, 12)
         self._spin_month.setValue(prefill_dt.month if prefill_dt else now.month)
         self._spin_month.setFixedWidth(55)
-        date_row.addWidget(self._chk_month)
-        date_row.addWidget(self._spin_month)
 
-        self._chk_day = QCheckBox("Día:")
         self._spin_day = QSpinBox()
         self._spin_day.setRange(1, 31)
         self._spin_day.setValue(prefill_dt.day if prefill_dt else now.day)
         self._spin_day.setFixedWidth(55)
-        date_row.addWidget(self._chk_day)
+
+        date_row.addWidget(QLabel("Año:"))
+        date_row.addWidget(self._spin_year)
+        date_row.addWidget(QLabel("Mes:"))
+        date_row.addWidget(self._spin_month)
+        date_row.addWidget(QLabel("Día:"))
         date_row.addWidget(self._spin_day)
         date_row.addStretch()
         layout.addWidget(self._grp_date)
@@ -320,10 +327,26 @@ class VideoDateEditorDialog(QDialog):
         time_row.addStretch()
         layout.addWidget(grp_time)
 
-        # ── Rename group ────────────────────────────────────────────────────
+        # ── Leer fecha del nombre — standalone row below Hora ────────────────
+        _fn_row = QHBoxLayout()
+        btn_fn = QPushButton("📋 Leer fecha del nombre de archivo")
+        btn_fn.setToolTip(
+            "Pre-rellena los controles con la fecha detectada en el nombre del archivo."
+        )
+        btn_fn.clicked.connect(self._prefill_from_filename)
+        apply_button_style(btn_fn)
+        _fn_row.addWidget(btn_fn)
+        _fn_row.addStretch()
+        layout.addLayout(_fn_row)
+
+        # ── Renombrar archivos section (consolidated QGroupBox) ────────────
         grp_rename = QGroupBox("Renombrar archivos")
         rl = QVBoxLayout(grp_rename)
+        rl.setSpacing(4)
+        rl.setContentsMargins(8, 6, 8, 6)
+
         self._chk_rename      = QCheckBox("Renombrar archivos con la fecha")
+        self._chk_rename.setChecked(True)
         self._radio_date_only = QRadioButton("Solo fecha  (2007-09-29-02h47m07s.mp4)")
         self._radio_date_plus = QRadioButton("Fecha + nombre original  (…_nombre.mp4)")
         self._radio_keep_name = QRadioButton("Conservar nombre original")
@@ -335,20 +358,17 @@ class VideoDateEditorDialog(QDialog):
         for w in (self._chk_rename, self._radio_date_only,
                   self._radio_date_plus, self._radio_keep_name):
             rl.addWidget(w)
+
         layout.addWidget(grp_rename)
 
-        # ── Filename-date prefill ───────────────────────────────────────────
-        btn_fn = QPushButton("📋 Leer fecha del nombre de archivo")
-        btn_fn.setToolTip(
-            "Pre-rellena los controles con la fecha detectada en el nombre del archivo."
-        )
-        btn_fn.clicked.connect(self._prefill_from_filename)
-        apply_button_style(btn_fn)
-        layout.addWidget(btn_fn)
+        # ── Vista previa de cambios — BELOW Renombrar section ────────────────
+        btn_preview = QPushButton("Vista previa de cambios")
+        btn_preview.setToolTip("Recalcula los valores de la tabla para verificar los cambios.")
+        btn_preview.clicked.connect(self._populate_table)
+        apply_button_style(btn_preview)
+        layout.addWidget(btn_preview)
 
         # ── Preview table ───────────────────────────────────────────────────
-        grp_prev = QGroupBox("Vista previa")
-        pl = QVBoxLayout(grp_prev)
         self._table = QTableWidget(0, 5)
         self._table.setHorizontalHeaderLabels(
             ["Archivo", "Duración", "Fecha actual", "Fecha nueva", "Nombre nuevo"]
@@ -363,14 +383,7 @@ class VideoDateEditorDialog(QDialog):
         for col in (1, 2, 3):
             hh.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
         hh.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
-        pl.addWidget(self._table)
-
-        btn_preview = QPushButton("Actualizar vista previa")
-        btn_preview.setToolTip("Recalcula los valores de la tabla para verificar los cambios.")
-        btn_preview.clicked.connect(self._populate_table)
-        apply_button_style(btn_preview)
-        pl.addWidget(btn_preview)
-        layout.addWidget(grp_prev)
+        layout.addWidget(self._table)
 
         layout.addStretch()
         scroll.setWidget(inner)

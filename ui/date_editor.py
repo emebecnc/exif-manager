@@ -4,7 +4,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from PyQt6.QtCore import Qt, QObject, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QObject, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout,
@@ -383,6 +383,15 @@ class DateEditorDialog(QDialog):
         self._prefill_date()
         if prefill_from_filename:
             self._try_apply_filename_date(show_warning=False)
+        # Auto-populate the preview table on open (mirrors video editor behaviour —
+        # the table is always visible and pre-filled so the user sees the current
+        # dates immediately without having to click "Vista previa de cambios").
+        # QTimer.singleShot(0) fires on the first event-loop tick after exec()
+        # returns, guaranteeing the parent dialog is fully visible before any
+        # progress dialog appears for large folders.
+        _init_paths = self._get_target_paths()
+        if _init_paths:
+            QTimer.singleShot(0, self._on_preview)
 
     # ── UI ─────────────────────────────────────────────────────────────────
 
@@ -429,57 +438,46 @@ class DateEditorDialog(QDialog):
         layout.addWidget(exif_mode_grp)
 
         # ── Date fields (single horizontal row) ────────────────────────────
-        self._date_grp = QGroupBox("Fecha  (☑ = modificar este componente)")
+        self._date_grp = QGroupBox("Fecha nueva")
         date_row = QHBoxLayout(self._date_grp)
         date_row.setSpacing(12)
 
-        self._chk_year = QCheckBox("Año:")
+        # Hidden checkboxes (off-layout) — kept alive so _apply_exif_mode_state()
+        # can enable/disable spinboxes via toggled signals, and so _ApplyWorker /
+        # _PreviewWorker can query isChecked() at runtime (always True in Cambiar mode).
+        self._chk_year = QCheckBox()
         self._chk_year.setChecked(True)
-        self._chk_year.setToolTip(
-            "Marcado: reemplaza el año de todas las fotos con el valor de la derecha.\n"
-            "Desmarcado: conserva el año original de cada foto."
-        )
+        self._chk_month = QCheckBox()
+        self._chk_month.setChecked(True)
+        self._chk_day = QCheckBox()
+        self._chk_day.setChecked(True)
+
         self._spin_year = QSpinBox()
         self._spin_year.setRange(1900, 2099)
         self._spin_year.setValue(datetime.now().year)
         self._spin_year.setFixedWidth(70)
         self._spin_year.setToolTip("Nuevo año (1900–2099).")
         self._chk_year.toggled.connect(self._spin_year.setEnabled)
-        self._chk_year.toggled.connect(self._on_date_component_toggled)
-        date_row.addWidget(self._chk_year)
-        date_row.addWidget(self._spin_year)
 
-        self._chk_month = QCheckBox("Mes:")
-        self._chk_month.setChecked(True)
-        self._chk_month.setToolTip(
-            "Marcado: reemplaza el mes de todas las fotos con el valor de la derecha.\n"
-            "Desmarcado: conserva el mes original de cada foto."
-        )
         self._spin_month = QSpinBox()
         self._spin_month.setRange(1, 12)
         self._spin_month.setValue(datetime.now().month)
         self._spin_month.setFixedWidth(55)
         self._spin_month.setToolTip("Nuevo mes (1–12).")
         self._chk_month.toggled.connect(self._spin_month.setEnabled)
-        self._chk_month.toggled.connect(self._on_date_component_toggled)
-        date_row.addWidget(self._chk_month)
-        date_row.addWidget(self._spin_month)
 
-        self._chk_day = QCheckBox("Día:")
-        self._chk_day.setChecked(True)
-        self._chk_day.setToolTip(
-            "Marcado: reemplaza el día de todas las fotos con el valor de la derecha.\n"
-            "Desmarcado: conserva el día original de cada foto.\n"
-            "Si el día resultante excede el último día del mes se recorta automáticamente."
-        )
         self._spin_day = QSpinBox()
         self._spin_day.setRange(1, 31)
         self._spin_day.setValue(datetime.now().day)
         self._spin_day.setFixedWidth(55)
         self._spin_day.setToolTip("Nuevo día (1–31). Se recorta al último día válido del mes si es necesario.")
         self._chk_day.toggled.connect(self._spin_day.setEnabled)
-        self._chk_day.toggled.connect(self._on_date_component_toggled)
-        date_row.addWidget(self._chk_day)
+
+        date_row.addWidget(QLabel("Año:"))
+        date_row.addWidget(self._spin_year)
+        date_row.addWidget(QLabel("Mes:"))
+        date_row.addWidget(self._spin_month)
+        date_row.addWidget(QLabel("Día:"))
         date_row.addWidget(self._spin_day)
         date_row.addStretch()
 
@@ -537,87 +535,7 @@ class DateEditorDialog(QDialog):
 
         layout.addWidget(self._time_grp)
 
-        # ── Rename checkbox ────────────────────────────────────────────────
-        self._chk_rename = QCheckBox("Renombrar archivos con la fecha  (ej. 2011-12-24-15h40m46s.jpg)")
-        self._chk_rename.setChecked(False)
-        self._chk_rename.setToolTip(
-            "Renombra cada archivo con su nueva fecha en formato\n"
-            "2011-12-24-15h40m46s.jpg después de escribir el EXIF.\n"
-            "Si ya existe un archivo con ese nombre, agrega _1, _2, etc."
-        )
-        self._chk_rename.toggled.connect(self._on_rename_toggled)
-        layout.addWidget(self._chk_rename)
-
-        # ── Rename format options (indented, only visible when rename is on) ─
-        self._rename_format_widget = QGroupBox()
-        self._rename_format_widget.setFlat(True)
-        self._rename_format_widget.setStyleSheet(
-            "QGroupBox { border: none; margin: 0; padding: 0; }"
-        )
-        fmt_layout = QVBoxLayout(self._rename_format_widget)
-        fmt_layout.setContentsMargins(20, 2, 0, 2)
-        fmt_layout.setSpacing(3)
-
-        self._radio_rename_date_only = QRadioButton(
-            "Solo fecha  →  2011-12-24-15h40m46s.jpg"
-        )
-        self._radio_rename_date_plus = QRadioButton(
-            "Fecha + nombre original  →  2011-12-24-15h40m46s_IMG_2045.jpg"
-        )
-        self._radio_rename_keep_name = QRadioButton(
-            "Conservar nombre original  (solo cambia EXIF, sin renombrar)"
-        )
-
-        self._radio_rename_date_only.setChecked(True)
-        self._radio_rename_date_only.setToolTip(
-            "Renombra el archivo solo con la fecha:\n"
-            "2011-12-24-15h40m46s.jpg\n"
-            "Si ya existe un archivo con ese nombre, agrega _1, _2, etc."
-        )
-        self._radio_rename_date_plus.setToolTip(
-            "Combina la fecha con el nombre original del archivo:\n"
-            "2011-12-24-15h40m46s_nombre_original.jpg\n"
-            "Ejemplo: 2011-12-24-15h40m46s_IMG_2045.jpg"
-        )
-        self._radio_rename_keep_name.setToolTip(
-            "No renombra el archivo aunque el checkbox esté marcado.\n"
-            "Útil para corregir la fecha EXIF sin cambiar el nombre del archivo."
-        )
-
-        self._rename_fmt_group = QButtonGroup(self)
-        self._rename_fmt_group.addButton(self._radio_rename_date_only, _RENAME_DATE_ONLY)
-        self._rename_fmt_group.addButton(self._radio_rename_date_plus, _RENAME_DATE_PLUS)
-        self._rename_fmt_group.addButton(self._radio_rename_keep_name, _RENAME_KEEP_NAME)
-
-        fmt_layout.addWidget(self._radio_rename_date_only)
-        fmt_layout.addWidget(self._radio_rename_date_plus)
-        fmt_layout.addWidget(self._radio_rename_keep_name)
-
-        self._rename_format_widget.setVisible(False)
-        layout.addWidget(self._rename_format_widget)
-
-        # ── Filename date button (always enabled) ──────────────────────────
-        fn_row = QHBoxLayout()
-        self._btn_read_filename = QPushButton("📋 Leer fecha del nombre")
-        self._btn_read_filename.setToolTip(
-            "Intenta extraer la fecha del nombre del archivo\n"
-            "y pre-rellena los controles de fecha con el resultado.\n"
-            "Patrones reconocidos: 2011-12-24-15h40m46s, 20111224_154046,\n"
-            "2011-12-24_15-40-46, 2011-12-24 15.40.46, 2011-12-24, 20111224."
-        )
-        self._btn_read_filename.clicked.connect(
-            lambda: self._try_apply_filename_date(show_warning=True)
-        )
-        apply_button_style(self._btn_read_filename)
-        fn_row.addWidget(self._btn_read_filename)
-        self._lbl_filename_date = QLabel("")
-        self._lbl_filename_date.setStyleSheet("color: #60c060; font-style: italic;")
-        self._lbl_filename_date.setVisible(False)
-        fn_row.addWidget(self._lbl_filename_date)
-        fn_row.addStretch()
-        layout.addLayout(fn_row)
-
-        # ── EXIF fields to update ──────────────────────────────────────────
+        # ── EXIF fields to update (positioned before preview + rename) ────────
         _field_tooltips = {
             "DateTimeOriginal": (
                 "Campo EXIF principal que usan Immich, Google Photos y la\n"
@@ -643,15 +561,95 @@ class DateEditorDialog(QDialog):
             fields_row.addWidget(chk)
             self._field_checks[fname] = chk
         fields_row.addStretch()
-        layout.addWidget(self._fields_grp)
+        # NOTE: _fields_grp is intentionally NOT added to layout — hidden from UI
+        # but kept alive because _field_checks is used at apply-time to select
+        # which EXIF fields to write (see _on_apply / _ApplyWorker).
 
         # ── Hint label (Conservar + no effective rename) ───────────────────
         self._lbl_hint = QLabel("Activá 'Renombrar archivos' para poder aplicar cambios.")
         self._lbl_hint.setStyleSheet("color: #e0a040; font-style: italic; padding: 2px 0;")
         self._lbl_hint.setVisible(True)   # Conservar is default
-        layout.addWidget(self._lbl_hint)
+        # NOTE: _lbl_hint is intentionally NOT added to layout — hidden from UI
+        # but kept alive because _update_apply_state() calls setText/setVisible on it.
 
-        # ── Preview button ─────────────────────────────────────────────────
+        # ── Leer fecha del nombre — standalone row below Hora ─────────────
+        # (video editor has this inside Renombrar groupbox; photo editor places it
+        # here so it is visible without scrolling and above Vista previa button)
+        _fn_row = QHBoxLayout()
+        self._btn_read_filename = QPushButton("📋 Leer fecha del nombre")
+        self._btn_read_filename.setToolTip(
+            "Intenta extraer la fecha del nombre del archivo\n"
+            "y pre-rellena los controles de fecha con el resultado.\n"
+            "Patrones reconocidos: 2011-12-24-15h40m46s, 20111224_154046,\n"
+            "2011-12-24_15-40-46, 2011-12-24 15.40.46, 2011-12-24, 20111224."
+        )
+        self._btn_read_filename.clicked.connect(
+            lambda: self._try_apply_filename_date(show_warning=True)
+        )
+        apply_button_style(self._btn_read_filename)
+        self._lbl_filename_date = QLabel("")
+        self._lbl_filename_date.setStyleSheet("color: #60c060; font-style: italic;")
+        self._lbl_filename_date.setVisible(False)
+        _fn_row.addWidget(self._btn_read_filename)
+        _fn_row.addWidget(self._lbl_filename_date)
+        _fn_row.addStretch()
+        layout.addLayout(_fn_row)
+
+        # ── Renombrar archivos section (consolidated QGroupBox) ────────────
+        grp_rename = QGroupBox("Renombrar archivos")
+        rl = QVBoxLayout(grp_rename)
+        rl.setSpacing(4)
+        rl.setContentsMargins(8, 6, 8, 6)
+
+        # Checkbox — master toggle for the rename section
+        self._chk_rename = QCheckBox("Renombrar archivos con la fecha")
+        self._chk_rename.setChecked(True)
+        self._chk_rename.setToolTip(
+            "Renombra cada archivo con su nueva fecha en formato\n"
+            "2011-12-24-15h40m46s.jpg después de escribir el EXIF.\n"
+            "Si ya existe un archivo con ese nombre, agrega _1, _2, etc."
+        )
+        self._chk_rename.toggled.connect(self._on_rename_toggled)
+        rl.addWidget(self._chk_rename)
+
+        # Format radio buttons — directly in the groupbox layout (enabled/disabled with checkbox)
+        self._radio_rename_date_only = QRadioButton(
+            "Solo fecha  →  2011-12-24-15h40m46s.jpg"
+        )
+        self._radio_rename_date_plus = QRadioButton(
+            "Fecha + nombre original  →  2011-12-24-15h40m46s_nombre.jpg"
+        )
+        self._radio_rename_keep_name = QRadioButton(
+            "Conservar nombre original"
+        )
+
+        self._radio_rename_date_only.setChecked(True)
+        self._radio_rename_date_only.setToolTip(
+            "Renombra el archivo solo con la fecha:\n"
+            "2011-12-24-15h40m46s.jpg\n"
+            "Si ya existe un archivo con ese nombre, agrega _1, _2, etc."
+        )
+        self._radio_rename_date_plus.setToolTip(
+            "Combina la fecha con el nombre original del archivo:\n"
+            "2011-12-24-15h40m46s_nombre_original.jpg"
+        )
+        self._radio_rename_keep_name.setToolTip(
+            "No renombra el archivo aunque el checkbox esté marcado.\n"
+            "Útil para corregir la fecha EXIF sin cambiar el nombre del archivo."
+        )
+
+        self._rename_fmt_group = QButtonGroup(self)
+        self._rename_fmt_group.addButton(self._radio_rename_date_only, _RENAME_DATE_ONLY)
+        self._rename_fmt_group.addButton(self._radio_rename_date_plus, _RENAME_DATE_PLUS)
+        self._rename_fmt_group.addButton(self._radio_rename_keep_name, _RENAME_KEEP_NAME)
+
+        rl.addWidget(self._radio_rename_date_only)
+        rl.addWidget(self._radio_rename_date_plus)
+        rl.addWidget(self._radio_rename_keep_name)
+
+        layout.addWidget(grp_rename)
+
+        # ── Vista previa de cambios — BELOW Renombrar section ───────────────
         self._btn_preview = QPushButton("Vista previa de cambios")
         self._btn_preview.setToolTip(
             "Muestra cómo quedarán las fechas antes de aplicar los cambios.\n"
@@ -677,7 +675,6 @@ class DateEditorDialog(QDialog):
         # _COL_RENAME is always visible — shows calculated name or "conservar nombre"
         self._table.setMinimumHeight(250)
         self._table.setMaximumHeight(400)
-        self._table.setVisible(False)
         layout.addWidget(self._table)
 
         # ── Apply / Cancel ─────────────────────────────────────────────────
@@ -842,10 +839,15 @@ class DateEditorDialog(QDialog):
             self._spin_second.setEnabled(custom)
 
     def _on_rename_toggled(self, checked: bool) -> None:
-        self._rename_format_widget.setVisible(checked)
+        # Enable/disable the format radios to match the checkbox state
+        # (mirrors video editor behaviour — radios stay visible, just gray when off)
+        for w in (self._radio_rename_date_only,
+                  self._radio_rename_date_plus,
+                  self._radio_rename_keep_name):
+            w.setEnabled(checked)
         # _COL_RENAME stays visible; content changes on next preview run.
         self._update_apply_state()
-        # Re-run preview if it was already visible
+        # Re-run preview so the Nombre nuevo column updates immediately
         if self._table.isVisible():
             self._on_preview()
 

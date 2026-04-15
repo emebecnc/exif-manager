@@ -69,7 +69,7 @@ class VideoDuplicateScanWorker(QObject):
                 return
 
             total = len(all_files)
-            print(f"[VideoScan] {total} video files found")
+            print(f"[DUP VIDEO SCAN START] Scanning {total} video files in {self.root_path}", flush=True)
 
             md5_map: dict[str, List[Path]] = {}
             skipped = 0
@@ -125,11 +125,12 @@ class VideoDuplicateScanWorker(QObject):
             groups = [g for g in md5_map.values() if len(g) > 1]
             groups.sort(key=lambda g: (-len(g), str(g[0])))
             print(
-                f"[VideoScan] done — {total} files, {skipped} skipped, "
-                f"{len(groups)} duplicate groups"
+                f"[DUP VIDEO GROUPS] Found {len(groups)} duplicate groups from {len(md5_map)} unique hashes "
+                f"({total} files, {skipped} skipped)",
+                flush=True,
             )
-            for idx, paths in enumerate(groups):
-                print(f"  group {idx + 1}: {len(paths)} files — {[p.name for p in paths]}")
+            for idx, grp in enumerate(groups):
+                print(f"  group {idx + 1}: {len(grp)} files — {[p.name for p in grp]}", flush=True)
 
             # ── Compute timestamp diffs per group (for ⏱️ UI annotation) ──
             # Uses video container creation_time when available; falls back to mtime.
@@ -140,6 +141,7 @@ class VideoDuplicateScanWorker(QObject):
                 diff  = (max(valid) - min(valid)) if len(valid) >= 2 else 0.0
                 self.group_ts_diffs.append(diff)
 
+            print(f"[DUP VIDEO SCAN END] Total groups emitted: {len(groups)}", flush=True)
             self.finished.emit(groups)
 
         except Exception as e:

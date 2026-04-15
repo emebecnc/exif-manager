@@ -1,6 +1,6 @@
 # EXIF Manager — CLAUDE.md
 
-**Last updated:** 2026-04-14 (session 63)
+**Last updated:** 2026-04-15 (session 69 final)
 **Repo:** github.com/emebecnc/exif-manager
 **Local:** D:\homelab\exif_manager\
 
@@ -50,7 +50,7 @@ Signal: FolderTree folder_changed(Path) → all tabs' on_folder_changed() slots
 - Date editing (same as photos)
 - Backup (.video_backup.json) + history
 - Duplicates by MD5 + trash folder
-- Supported: MP4, MOV, M4V, MKV, AVI, WMV
+- Supported: MP4, MOV, M4V, MKV, AVI, WMV, MPG, MPEG, TS, M2TS, MTS
 - .3GP: skip gracefully
 
 ### ⚠️ Optimizations
@@ -90,6 +90,96 @@ Config: main.py, build.spec, requirements.txt, run_exif_manager.bat
 ---
 
 ## BUGS FIXED (Latest)
+
+✅ Both date editors layout unified (2026-04-15, session 69 final)
+- video_date_editor.py changes:
+  * Acción: QVBoxLayout → QHBoxLayout + ml.addStretch() — radios now side-by-side
+  * Fecha: _chk_year/_chk_month/_chk_day removed from layout; QLabel("Año:") etc. used instead
+    Hidden checkboxes kept alive for _update_state() enable/disable logic (toggled signals still work)
+  * "Leer fecha del nombre de archivo" button moved OUT of Renombrar groupbox → standalone _fn_row at position 4
+  * "Vista previa de cambios" button moved AFTER Renombrar groupbox (was before it)
+- date_editor.py: already correct from session 69 — no changes needed
+- FINAL IDENTICAL structure (both editors):
+  1. Acción (horizontal HBox)
+  2. Fecha nueva (labels + spinboxes, no visible checkboxes)
+  3. Hora
+  4. Leer fecha del nombre button (standalone row)
+  5. Renombrar archivos groupbox (checkbox + 3 radios, NO button inside)
+  6. Vista previa de cambios button
+  7. Preview table
+✅ Photo editor layout finalized (2026-04-15, session 69)
+- Fecha section: removed checkboxes from layout; replaced with QLabel("Año:") etc.
+  Hidden _chk_year/_chk_month/_chk_day kept alive — toggled signals still drive spinbox enabled/disabled state
+  Only _chk_year.toggled → _spin_year.setEnabled connected (NOT _on_date_component_toggled, which is now dead)
+  Title changed: "Fecha (☑ = modificar este componente)" → "Fecha nueva"
+- Acción section: radios are HORIZONTAL (QHBoxLayout) — "Conservar fecha EXIF original" | "Cambiar fecha EXIF"
+- Button positions (final, session 69):
+  Position 4: "📋 Leer fecha del nombre" button (standalone HBox row, below Hora)
+  Position 5: "Renombrar archivos" GROUPBOX (checkbox + 3 radios, no button inside)
+  Position 6: "Vista previa de cambios" button (BELOW Renombrar groupbox)
+  Position 7: Preview table
+- Renombrar groupbox restructured:
+  Removed _rename_format_widget (flat QGroupBox wrapper) — radios now directly in rl VBox
+  _on_rename_toggled: setVisible(checked) → setEnabled(checked) on each radio individually
+  Radio labels: "Solo fecha → 2011-12-24-15h40m46s.jpg" / "Fecha + nombre original → …_nombre.jpg" / "Conservar nombre original"
+  No button inside groupbox (Leer fecha moved to standalone position 4)
+- Preview table: 4 cols (Archivo | Fecha actual | Fecha nueva | Nombre nuevo)
+- _fields_grp and _lbl_hint kept alive off-layout for backend compatibility
+- FINAL layout order: Acción → Fecha nueva → Hora → Leer fecha btn → Renombrar → Vista previa btn → Preview table
+✅ Photo editor — fully matched to video editor layout (2026-04-15, session 68 final)
+- _rename_format_widget.setVisible(False) → True: 3 rename-format radios now always visible on open
+- Removed self._table.setVisible(False): table always visible (no longer hidden until preview clicked)
+- Added QTimer.singleShot(0, self._on_preview) at end of __init__: table auto-populated on open like video editor
+- _fields_grp NOT added to layout (hidden, kept alive for _field_checks backend use)
+- _lbl_hint NOT added to layout (hidden, kept alive for _update_apply_state() setText/setVisible calls)
+- Added QTimer to PyQt6.QtCore import
+- Final order identical to video editor: Acción → Fecha → Hora → Vista previa btn → Renombrar section (checkbox + 3 radios + Leer fecha btn) → Preview table
+✅ Video format support expanded (2026-04-15, session 68)
+- ALLOWED_EXTS in scan_video_folder() expanded: added .mpg, .mpeg, .ts, .m2ts, .mts
+- Console logs confirmed .mpg files being skipped before fix
+- MODULE-LEVEL VIDEO_EXTENSIONS also updated to match (for consistency with other code paths)
+✅ Date editor layout unified (2026-04-14, session 67)
+- Photos + Videos now have IDENTICAL element order per spec
+- New order: Acción → Fecha → Hora → Campos EXIF → Vista previa btn → Renombrar section → Preview table
+- "Vista previa de cambios" button moved ABOVE Renombrar section (was after it)
+- "Leer fecha del nombre" button moved INSIDE Renombrar groupbox (was standalone)
+- Renombrar section consolidated into QGroupBox("Renombrar archivos") in both editors
+- Video editor: removed grp_prev wrapper — table is now standalone below Renombrar
+✅ Video detection fixed — ALLOWED_EXTS inline set (2026-04-14, session 67)
+- Changed to local inline ALLOWED_EXTS set (bypasses any module-level shadowing)
+- Added [VIDEO INIT] print at module load time to confirm set type/contents
+- Added [SCAN START] print at scan entry with full ALLOWED_EXTS
+- Cleaner logging: [VIDEO ADDED] / [VIDEO SKIP] / [VIDEO SCAN] per file
+✅ Duplicate detection audit (2026-04-14, session 67)
+- VideoDuplicateScanWorker: [DUP VIDEO SCAN START] / [DUP VIDEO GROUPS] / [DUP VIDEO SCAN END] logs
+- SimilarImageScanWorker: defensive check — warns if any video files appear in image scan list
+✅ Video detection fixed — suffix check (2026-04-14, session 66)
+- Root cause: f.suffix.lower() in VIDEO_EXTENSIONS check failing for mixed folders
+- Added detailed per-file debug: suffix, suffix_lower, splitext values, both in_VIDEO_EXTENSIONS checks
+- Prints VIDEO_EXTENSIONS at runtime so shadowing/redefinition is visible
+- Defensive dual-check: Path.suffix AND os.path.splitext — video added if EITHER matches
+- Videos now properly detected in mixed photo+video folders
+✅ Video date editor UI — mirrored to photo editor (2026-04-14, session 66)
+- Preview button text: "Actualizar vista previa" → "Vista previa de cambios" (matches photo editor)
+- Rename section, format options (Solo fecha / Fecha + nombre / Conservar nombre), preview table
+  with Nombre nuevo column — already present from session 64; confirmed full parity
+✅ Video detection in mixed folders fixed (2026-04-14, session 65)
+- Added detailed debug logging in scan_video_folder(): per-file is_file(), suffix, VIDEO_EXTENSIONS match
+- Prints final list of matched video names; [VIDEO DEBUG] skip lines reveal filtering failures
+- Fixed extension filtering for mixed photo+video folders
+- VIDEO_EXTENSIONS verified: .mp4, .mov, .avi, .mkv, .m4v, .wmv, .3gp (all lowercase)
+✅ Date editor defaults (2026-04-14)
+- Photos: "Conservar EXIF original" + "Renombrar archivos" checked by default
+- Videos: same defaults applied (Conservar + Renombrar both default-checked)
+- Matches desired default behaviour
+✅ Video detection in mixed folders (2026-04-14, session 64)
+- Fixed: videos not recognized when in same folder as photos
+- Root cause: scan_video_folder() used os.scandir+follow_symlinks=False — same Windows bug fixed for folder_tree.py in session 16
+- Fix: replaced with path.glob("*") + f.is_file() (no symlink flag)
+- Added debug logging: [VIDEO SCAN] Found N videos in {path}
+✅ Video date editor already had full feature-parity with photo editor (2026-04-14, session 64)
+- Audited: _chk_rename checkbox, _radio_date_only/plus/keep_name, preview table (5 cols), _ApplyWorker with rename — all present
+- No code changes needed for Task 2
 
 ✅ Tree duplication → single tree
 ✅ Video counting → V(X) displays

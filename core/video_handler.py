@@ -10,7 +10,11 @@ from typing import Iterator, List, Optional
 
 # ── Extension registry ────────────────────────────────────────────────────────
 
-VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".3gp", ".m4v", ".wmv"}
+VIDEO_EXTENSIONS = {
+    ".mp4", ".mov", ".avi", ".mkv", ".3gp", ".m4v", ".wmv",
+    ".mpg", ".mpeg", ".ts", ".m2ts", ".mts",
+}
+print(f"[VIDEO INIT] VIDEO_EXTENSIONS={VIDEO_EXTENSIONS} | type={type(VIDEO_EXTENSIONS)}", flush=True)
 
 # Formats that reliably support container-level metadata rewrite via
 # `ffmpeg -codec copy`.  .3gp triggers "Operation not permitted" errors on
@@ -244,15 +248,32 @@ def compute_md5(path: Path, chunk_size: int = 65536) -> str:
 
 def scan_video_folder(path: Path) -> List[Path]:
     """Return sorted list of video files in path (non-recursive)."""
-    results: List[Path] = []
+    # Use a local inline set to guarantee no shadowing of the module-level constant.
+    # Common video formats: containers (mp4/mov/mkv/avi), MPEG transport streams
+    # (ts/m2ts/mts), MPEG program streams (mpg/mpeg), and mobile formats (3gp/m4v/wmv).
+    ALLOWED_EXTS = {
+        ".mp4", ".mov", ".avi", ".mkv", ".3gp", ".m4v", ".wmv",
+        ".mpg", ".mpeg", ".ts", ".m2ts", ".mts",
+    }
+    video_files: List[Path] = []
+    print(f"[SCAN START] folder={path}  ALLOWED_EXTS={ALLOWED_EXTS}", flush=True)
     try:
-        for entry in os.scandir(path):
-            if entry.is_file(follow_symlinks=False):
-                if Path(entry.name).suffix.lower() in VIDEO_EXTENSIONS:
-                    results.append(Path(entry.path))
-    except (OSError, PermissionError):
-        pass
-    return sorted(results, key=lambda p: p.name.lower())
+        all_files = list(path.glob("*"))
+        print(f"[SCAN START] total entries={len(all_files)}", flush=True)
+        for f in all_files:
+            if not f.is_file():
+                continue
+            suffix_lower = f.suffix.lower()
+            if suffix_lower in ALLOWED_EXTS:
+                video_files.append(f)
+                print(f"[VIDEO ADDED] {f.name}", flush=True)
+            else:
+                print(f"[VIDEO SKIP] {f.name}  suffix={suffix_lower!r}  not in ALLOWED_EXTS", flush=True)
+    except (OSError, PermissionError) as e:
+        print(f"[VIDEO SCAN] exception: {e}", flush=True)
+    video_files = sorted(video_files, key=lambda p: p.name.lower())
+    print(f"[VIDEO SCAN] Found {len(video_files)} videos in {path}: {[v.name for v in video_files]}", flush=True)
+    return video_files
 
 
 def iter_videos_recursive(root_path: Path) -> Iterator[Path]:

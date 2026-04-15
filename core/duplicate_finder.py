@@ -381,7 +381,17 @@ class SimilarImageScanWorker(QObject):
                 return
 
             total = len(all_files)
-            print(f"[SimilarScan] {total} image files found")
+            print(f"[SimilarScan] {total} image files found", flush=True)
+
+            # Defensive: SimilarImageScanWorker should NEVER receive video files.
+            _video_exts = {".mp4", ".mov", ".avi", ".mkv", ".3gp", ".m4v", ".wmv"}
+            _video_files = [f for f in all_files if f.suffix.lower() in _video_exts]
+            if _video_files:
+                print(
+                    f"[WARNING] SimilarImageScanWorker received {len(_video_files)} videos — "
+                    f"should be 0: {[v.name for v in _video_files[:5]]}",
+                    flush=True,
+                )
 
             if total == 0:
                 self.finished.emit([])
