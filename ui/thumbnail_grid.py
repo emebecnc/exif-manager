@@ -1,5 +1,6 @@
 """Center panel: thumbnail grid with two-phase background loading and disk cache."""
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -86,9 +87,15 @@ class ThumbnailCache:
         self._cache.clear()
 
 
-def _thumb_cache_key(path_str: str, mtime: float) -> str:
-    """MD5 key for a thumbnail cache entry: encodes path + modification time."""
-    data = f"{path_str}|{mtime:.6f}".encode("utf-8")
+def _thumb_cache_key(path_str: str, file_size: int) -> str:
+    """MD5 key for a thumbnail cache entry: encodes path + file size.
+
+    File size is used instead of mtime because NAS drives often report
+    unreliable or reset modification times across remounts, causing a cache
+    miss on every open even when the file has not changed.  File size is
+    stable across remounts and sufficient to detect genuine file changes.
+    """
+    data = f"{path_str}|{file_size}".encode("utf-8")
     return hashlib.md5(data).hexdigest()
 
 
@@ -123,13 +130,16 @@ class _ThumbnailWorker(QObject):
             self.finished.emit()
             return
 
-        # ── Phase 1: batch EXIF reads (parallel, I/O-bound) ───────────────
+        # ── Phase 1: EXIF dates (disk-cache-aware) ────────────────────────
+        # On first open: reads EXIF from every original file (slow on NAS).
+        # On subsequent opens: loads a single _exif_cache.json — near-instant.
+        # Only re-reads files whose size has changed since the cache was written.
         if self._cancelled:
             self.finished.emit()
             return
-        exif_dates = read_exif_dates_batch(self._paths)
+        exif_dates = self._load_exif_dates_cached()
 
-        # ── Phase 2: thumbnail loading (cache-aware, batched) ─────────────
+        # ── Phase 2: thumbnail loading (disk-cache-aware, batched) ────────
         # Items are accumulated in batches of 20 before being sent to the main
         # thread.  This dramatically reduces the number of cross-thread signal
         # deliveries for large folders (5000 items → 250 signals instead of 5000).
@@ -155,16 +165,88 @@ class _ThumbnailWorker(QObject):
 
         self.finished.emit()
 
+    # ── EXIF date disk cache ───────────────────────────────────────────────
+
+    _EXIF_CACHE_FILE = "_exif_cache.json"
+
+    def _load_exif_dates_cached(self) -> Dict[Path, str]:
+        """Return EXIF date strings for all paths, using a disk cache.
+
+        Cache format (stored in ``_thumbcache/_exif_cache.json``):
+            { "filename.jpg": {"size": 123456, "date": "2020:01:01 12:00:00"}, … }
+
+        A cache entry is valid when the file's current size matches the stored
+        size (same logic as the thumbnail cache key).  Changed or new files are
+        read via ``read_exif_dates_batch`` and the cache is updated on disk.
+        """
+        cached   = self._read_exif_cache()       # {filename → {size, date}}
+        to_read: List[Path] = []
+        results: Dict[Path, str] = {}
+
+        for path in self._paths:
+            try:
+                size = path.stat().st_size
+            except OSError:
+                size = -1
+            fname = path.name
+            entry = cached.get(fname)
+            if entry and entry.get("size") == size:
+                # Cache hit — no disk EXIF read needed
+                results[path] = entry.get("date", "")
+            else:
+                # Cache miss or file changed
+                to_read.append(path)
+
+        if to_read:
+            fresh = read_exif_dates_batch(to_read)
+            for path, date_str in fresh.items():
+                results[path] = date_str
+                try:
+                    size = path.stat().st_size
+                except OSError:
+                    size = -1
+                cached[path.name] = {"size": size, "date": date_str}
+            self._write_exif_cache(cached)
+
+        return results
+
+    def _read_exif_cache(self) -> dict:
+        """Load _exif_cache.json; return empty dict on any error."""
+        if self._cache_dir is None:
+            return {}
+        cache_path = self._cache_dir / self._EXIF_CACHE_FILE
+        try:
+            data = json.loads(cache_path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _write_exif_cache(self, data: dict) -> None:
+        """Persist EXIF cache dict to disk; silently ignores I/O errors."""
+        if self._cache_dir is None:
+            return
+        try:
+            self._cache_dir.mkdir(exist_ok=True)
+            cache_path = self._cache_dir / self._EXIF_CACHE_FILE
+            cache_path.write_text(
+                json.dumps(data, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+    # ── Thumbnail disk cache ───────────────────────────────────────────────
+
     def _get_thumb(self, path: Path) -> Optional[bytes]:
         """Return thumbnail bytes; hit disk cache when available."""
         try:
-            mtime = path.stat().st_mtime
+            file_size = path.stat().st_size
         except OSError:
             return load_thumbnail(path, _THUMB_SIZE)
 
         cache_file: Optional[Path] = None
         if self._cache_dir is not None:
-            key        = _thumb_cache_key(str(path), mtime)
+            key        = _thumb_cache_key(str(path), file_size)
             cache_file = self._cache_dir / f"{key}.jpg"
             if cache_file.exists():
                 try:
@@ -616,7 +698,11 @@ class ThumbnailGrid(QWidget):
         self._thread.started.connect(self._worker.run)
         self._worker.thumbnails_batch_ready.connect(self._on_thumbnails_batch_ready)
         self._worker.progress.connect(self._on_load_progress)
-        self._worker.finished.connect(self._on_worker_finished)
+        # Capture this specific worker/thread pair in the closure so that a
+        # new load starting before the queued finished-signal fires cannot
+        # accidentally kill the new load (cross-thread queued-signal race).
+        _w, _t = self._worker, self._thread
+        self._worker.finished.connect(lambda: self._on_worker_finished_for(_w, _t))
         self._thread.start()
 
     def _make_skeleton_item(self, path: Path) -> QListWidgetItem:
@@ -674,29 +760,56 @@ class ThumbnailGrid(QWidget):
         self._apply_filter()
 
     def _on_load_progress(self, current: int, total: int) -> None:
-        """Update progress bar and count label during Phase 2 loading."""
+        """Update the progress bar during Phase 2 loading.
+
+        The count label is NOT overwritten here — it already shows the correct
+        "N fotos" text set in _start_load, and keeping it stable avoids the
+        misleading "Cargando… X/Y" text appearing even when all thumbnails are
+        loaded instantly from the disk cache.
+        """
         if self._progress_bar.isVisible():
             self._progress_bar.setValue(current)
-        self._lbl_count.setText(f"Cargando… {current}/{total}")
 
-    def _on_worker_finished(self) -> None:
-        # Grab refs before clearing, so deleteLater fires after we release them
-        worker = self._worker
-        thread = self._thread
-        self._worker = None
-        self._thread = None
+    def _on_worker_finished_for(self, my_worker, my_thread) -> None:
+        """Slot called when a specific worker/thread pair finishes.
 
-        # Stop the thread, then schedule cleanup once it has fully stopped
-        if thread is not None:
-            thread.quit()
-            thread.wait()          # block briefly (thread already finished its run())
-            if worker is not None:
-                worker.deleteLater()
-            thread.deleteLater()
+        Using a closure-captured pair (rather than reading self._worker /
+        self._thread at call time) prevents the cross-thread queued-signal
+        race where a new load starts between the worker emitting finished and
+        this slot firing on the main thread — which would otherwise cause
+        this slot to quit() the NEW thread instead of the old one.
+        """
+        # Only clear the instance vars if they still point to OUR objects.
+        # If a new load has already started they will point to new objects;
+        # leave them alone so the new load is not disrupted.
+        if self._worker is my_worker:
+            self._worker = None
+        if self._thread is my_thread:
+            self._thread = None
+
+        # Clean up the finished thread (safe even if the slot fires late).
+        if my_thread is not None:
+            my_thread.quit()
+            my_thread.wait()       # brief — run() already returned
+            if my_worker is not None:
+                my_worker.deleteLater()
+            my_thread.deleteLater()
+
+        # Only update UI / trigger pending loads when OUR thread was the
+        # active one (i.e. no new load has superseded us).
+        if self._worker is not None or self._thread is not None:
+            # A newer load is already running — skip UI finalisation here;
+            # _on_worker_finished_for will be called again for that load.
+            return
 
         # All EXIF dates are now cached in item data → re-sort by EXIF date if needed
         if self._sort_mode == _SORT_DATE:
             self._apply_sort()
+
+        # Group problem items at the top: red (invalid EXIF) → orange (non-standard
+        # name) → normal.  Applied once after load so problem photos are always
+        # immediately visible without scrolling.
+        self._group_problem_items()
 
         # Finalise UI: apply filter (sets count label to visible items)
         self._progress_bar.setVisible(False)
@@ -707,6 +820,50 @@ class ThumbnailGrid(QWidget):
             pending = self._pending_folder
             self._pending_folder = None
             self._start_load(pending)
+
+    def _group_problem_items(self) -> None:
+        """Reorder list items so problem photos are always at the top.
+
+        Groups (in order):
+          1. RED   — invalid / missing EXIF date  (_ROLE_INVALID is True)
+          2. ORANGE — non-standard filename         (_ROLE_STD_NAME is False)
+          3. NORMAL — both date valid and name OK
+
+        Within each group the current sort order is preserved.
+        No-op when there are no red or orange items.
+        """
+        n = self._list.count()
+        if n == 0:
+            return
+
+        red_items: list = []
+        orange_items: list = []
+        normal_items: list = []
+
+        for i in range(n):
+            item = self._list.item(i)
+            is_inv = bool(item.data(_ROLE_INVALID))
+            is_std = item.data(_ROLE_STD_NAME)   # True=standard, False=non-standard
+            if is_inv:
+                red_items.append(item)
+            elif is_std is False:
+                orange_items.append(item)
+            else:
+                normal_items.append(item)
+
+        if not red_items and not orange_items:
+            return  # nothing to reorder — avoid a pointless full rebuild
+
+        sorted_items = red_items + orange_items + normal_items
+
+        self._list.setUpdatesEnabled(False)
+        # Remove from end to avoid O(n²) index shifting
+        for i in range(n - 1, -1, -1):
+            self._list.takeItem(i)
+        for item in sorted_items:
+            self._list.addItem(item)
+        self._list.setUpdatesEnabled(True)
+        self._list.update()
 
     def _on_item_clicked(self, item: QListWidgetItem) -> None:
         path_str = item.data(_ROLE_PATH)

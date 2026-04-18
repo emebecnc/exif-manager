@@ -1,5 +1,6 @@
 """EXIF reading, writing, and metadata extraction."""
 import io
+import os
 import re
 import struct
 from datetime import datetime
@@ -42,16 +43,27 @@ _ORIENTATION_LABELS = {
 _INVALID_YEARS = {2000, 2005}
 
 # Exif IFD tags whose EXIF type is UNDEFINED (must be bytes).
-# piexif sometimes loads them as int on malformed files; dump() then crashes.
+# piexif sometimes loads them as int *or* as tuple on malformed/exotic files;
+# dump() then crashes with "got wrong type".  We remove them whenever the
+# value is not already bytes — regardless of whether it arrived as int, tuple,
+# list, or anything else.
 # Using raw integers because not all of these exist as named attributes on
 # piexif.ExifIFD across all installed versions.
 _EXIF_UNDEFINED_TAGS = frozenset({
-    36864,  # ExifVersion          0x9000  b"0230" etc.
-    40960,  # FlashPixVersion      0xA000  b"0100"
-    37121,  # ComponentsConfiguration 0x9101
-    41729,  # SceneType            0xA301
-    41728,  # FileSource           0xA300
-    37500,  # MakerNote            0x927C
+    36864,  # ExifVersion             0x9000  b"0230" etc.
+    40960,  # FlashPixVersion         0xA000  b"0100"
+    37121,  # ComponentsConfiguration 0x9101  often tuple (0,1,2,0) on cameras
+    41729,  # SceneType               0xA301
+    41728,  # FileSource              0xA300
+    37500,  # MakerNote               0x927C
+    37510,  # UserComment             0x9286  bytes with charset header
+})
+
+# Exif IFD pointer / sub-IFD tags — piexif stores the pointed-to IFD
+# internally and must never see these as plain values in the Exif dict.
+# Remove them unconditionally before dump().
+_EXIF_POINTER_TAGS = frozenset({
+    40965,  # InteroperabilityIFD     0xA005
 })
 
 # Exif IFD tags whose EXIF type is legitimately SHORT (int).
@@ -173,6 +185,46 @@ def get_best_date_str(fields: dict) -> str:
     )
 
 
+def _sync_file_timestamps(
+    path: Path,
+    dt: datetime,
+    *,
+    sync_mtime: bool = True,
+    sync_creation: bool = True,
+) -> None:
+    """Update filesystem timestamps to match *dt*.
+
+    sync_mtime=True  → os.utime() sets mtime + atime (cross-platform).
+    sync_creation=True → win32file.SetFileTime() sets creation time (Windows only).
+    Silently no-ops on any error — never raises so callers are unaffected.
+    """
+    ts = dt.timestamp()
+    if sync_mtime:
+        try:
+            os.utime(str(path), (ts, ts))
+        except OSError:
+            pass
+    if sync_creation:
+        # Windows-only: update creation time via pywin32
+        try:
+            import win32file       # type: ignore[import]
+            import pywintypes      # type: ignore[import]
+            handle = win32file.CreateFile(
+                str(path),
+                win32file.GENERIC_WRITE,
+                win32file.FILE_SHARE_READ | win32file.FILE_SHARE_WRITE,
+                None,
+                win32file.OPEN_EXISTING,
+                0,
+                None,
+            )
+            win_time = pywintypes.Time(int(ts))
+            win32file.SetFileTime(handle, win_time, win_time, win_time)
+            win32file.CloseHandle(handle)
+        except Exception:
+            pass  # pywin32 not installed, or non-Windows — skip creation-time update
+
+
 def write_exif_date(
     path: Path,
     year: int,
@@ -182,8 +234,15 @@ def write_exif_date(
     hour: Optional[int] = None,
     minute: Optional[int] = None,
     second: Optional[int] = None,
+    *,
+    sync_mtime: bool = True,
+    sync_creation: bool = True,
 ) -> None:
     """Write a new date to the specified EXIF timestamp fields.
+
+    sync_mtime / sync_creation control whether filesystem timestamps are also
+    updated after the EXIF write (see _sync_file_timestamps).  Both default to
+    True so existing call sites that don't pass these args keep the old behaviour.
 
     When hour/minute/second are None, the existing HH:MM:SS is read from the
     file's EXIF and preserved.  When all three are provided, that exact time
@@ -220,29 +279,40 @@ def write_exif_date(
     new_str = format_exif_dt(new_dt)
     new_fields = {f: new_str for f in fields}
     write_exif_timestamps(path, new_fields)
+    # Sync filesystem timestamps (caller-controlled via sync_mtime / sync_creation)
+    _sync_file_timestamps(path, new_dt, sync_mtime=sync_mtime, sync_creation=sync_creation)
 
 
 def _clean_exif_for_dump(exif_dict: dict) -> dict:
     """Remove or fix any Exif IFD tag that would cause piexif.dump() to fail.
 
     piexif loads UNDEFINED-type tags (bytes in the EXIF spec) as plain int on
-    some files.  When dump() encounters them it raises TypeError.  The safest
-    fix is outright deletion — these are metadata conveniences and their absence
-    never prevents the image from being opened or dated correctly.
+    some files, and as a tuple on others (e.g. ComponentsConfiguration 37121
+    arrives as (0, 1, 2, 0) on many camera JPEGs).  dump() raises TypeError for
+    both wrong-type forms.  The safest fix is outright deletion — these tags are
+    metadata conveniences and their absence never prevents the image from being
+    opened or dated correctly.
 
-    Two passes over the Exif IFD:
-      1. Tags explicitly known to be UNDEFINED type → remove if int.
-      2. Any remaining int value whose tag is NOT in the known-SHORT allowlist
-         → remove (almost certainly a misloaded UNDEFINED or RATIONAL tag).
+    Three passes over the Exif IFD:
+      0. Pointer / sub-IFD tags → always remove (piexif manages them internally).
+      1. Tags explicitly known to be UNDEFINED type → remove unless already bytes.
+      2. Any remaining int value NOT in the known-SHORT allowlist → remove
+         (almost certainly a misloaded UNDEFINED or RATIONAL tag).
     """
     exif_ifd = exif_dict.get("Exif")
     if not isinstance(exif_ifd, dict):
         return exif_dict
 
-    # Pass 1 — strip known UNDEFINED tags that arrived as int (incl. MakerNote)
+    # Pass 0 — unconditionally remove sub-IFD pointer tags
+    for tag in _EXIF_POINTER_TAGS:
+        exif_ifd.pop(tag, None)
+
+    # Pass 1 — strip known UNDEFINED tags whenever value is NOT bytes.
+    # Covers both int (common) and tuple (e.g. ComponentsConfiguration) forms.
     for tag in _EXIF_UNDEFINED_TAGS:
-        if isinstance(exif_ifd.get(tag), int):
-            exif_ifd.pop(tag, None)
+        val = exif_ifd.get(tag)
+        if val is not None and not isinstance(val, bytes):
+            exif_ifd.pop(tag)
 
     # Pass 2 — catch-all: remove any remaining int not in the SHORT allowlist
     bad = [
@@ -294,6 +364,7 @@ def make_dated_filename(
     suffix: str,
     used: Optional[set] = None,
     original_stem: Optional[str] = None,
+    exclude: Optional[str] = None,
 ) -> str:
     """Return a collision-free filename like 2011-12-24-15h40m46s.jpg.
 
@@ -301,6 +372,11 @@ def make_dated_filename(
     2011-12-24-15h40m46s_IMG_2045.jpg (date + original stem, no extension).
     Checks both files already on disk AND the `used` set so that batch
     operations assigning the same timestamp to multiple files get unique names.
+
+    exclude: the current on-disk filename of the file being renamed.  When the
+    candidate equals this name the disk-existence check is skipped so that a
+    file whose new name equals its current name does not receive a spurious
+    _1 suffix.
     """
     base = dt.strftime("%Y-%m-%d-%Hh%Mm%Ss")
     if original_stem:
@@ -309,13 +385,15 @@ def make_dated_filename(
     used = used if used is not None else set()
 
     candidate = f"{base}{ext}"
-    if not (folder / candidate).exists() and candidate not in used:
+    on_disk = candidate != exclude and (folder / candidate).exists()
+    if not on_disk and candidate not in used:
         return candidate
 
     i = 1
     while True:
         candidate = f"{base}_{i}{ext}"
-        if not (folder / candidate).exists() and candidate not in used:
+        on_disk = candidate != exclude and (folder / candidate).exists()
+        if not on_disk and candidate not in used:
             return candidate
         i += 1
 
@@ -324,38 +402,61 @@ def parse_date_from_filename(stem: str) -> Optional[datetime]:
     """Try to extract a datetime from a filename stem using common patterns.
 
     Patterns tried in order (most specific first):
-      2011-12-24-15h40m46s
+      2011-12-24-15h40m46s  /  2011-12-24-15h40m46   (trailing 's' optional)
+      2014-06-17 17hs.59.mins.30s  /  …mins  /  …mins-anything  (hs/mins format)
       2011-12-24 15.40.46  or  2011-12-24_15.40.46
       2011-12-24_15-40-46  or  2011-12-24 15-40-46
       20111224_154046
+      2011-12-24-15h40m   (h/m with no seconds digits)
       2011-12-24
       20111224
 
     Date-only patterns default to 00:00:00.
+    Optional regex capture groups (e.g. seconds) that did not participate in
+    the match arrive as None; they are treated as 0.
     Returns None when no pattern matches or the extracted values are invalid.
     """
+    def _gi(groups: tuple, idx: int) -> int:
+        """Return groups[idx] as int, or 0 if the index is out of range or None."""
+        if idx >= len(groups):
+            return 0
+        val = groups[idx]
+        return int(val) if val is not None else 0
+
+    # Ordered most-specific first.  groups[0..2] are always year/month/day;
+    # groups[3..5] are hour/minute/second (may be absent or None).
     _PATTERNS = [
-        # 2011-12-24-15h40m46s
-        (r"(\d{4})-(\d{2})-(\d{2})-(\d{2})h(\d{2})m(\d{2})s", True),
+        # 2011-12-24-15h40m46s  /  2011-12-24-15h40m46  (trailing 's' optional)
+        r"(\d{4})-(\d{2})-(\d{2})-(\d{2})h(\d{2})m(\d{2})s?",
+        # 2014-06-17 17hs.59.mins  /  17hs.59.mins-1  /  17hs.59.mins.30s
+        # "hs.mins" camera format.  Uses \s+ (not [ ]) so any whitespace works.
+        # Dots around the minute value are optional to handle hs.MM.mins and
+        # hsMM.mins variants.  Optional trailing \.SS[s] captures seconds when
+        # present; when absent (or when followed by a non-dot suffix like -1)
+        # the capture group is None and _gi returns 0.
+        r"(\d{4})-(\d{2})-(\d{2})\s+(\d{2})hs\.?(\d{2})\.?mins(?:\.(\d{2})s?)?",
         # 2011-12-24 15.40.46  /  2011-12-24_15.40.46
-        (r"(\d{4})-(\d{2})-(\d{2})[ _](\d{2})\.(\d{2})\.(\d{2})", True),
+        r"(\d{4})-(\d{2})-(\d{2})[ _](\d{2})\.(\d{2})\.(\d{2})",
         # 2011-12-24_15-40-46  /  2011-12-24 15-40-46
-        (r"(\d{4})-(\d{2})-(\d{2})[ _](\d{2})-(\d{2})-(\d{2})", True),
+        r"(\d{4})-(\d{2})-(\d{2})[ _](\d{2})-(\d{2})-(\d{2})",
         # 20111224_154046
-        (r"(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})", True),
+        r"(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})",
+        # 2011-12-24-15h40m  (h/m present but no seconds digits follow 'm')
+        r"(\d{4})-(\d{2})-(\d{2})-(\d{2})h(\d{2})m",
         # 2011-12-24
-        (r"(\d{4})-(\d{2})-(\d{2})", False),
+        r"(\d{4})-(\d{2})-(\d{2})",
         # 20111224
-        (r"(\d{4})(\d{2})(\d{2})", False),
+        r"(\d{4})(\d{2})(\d{2})",
     ]
-    for pattern, has_time in _PATTERNS:
+    for pattern in _PATTERNS:
         m = re.search(pattern, stem)
         if m:
             g = m.groups()
             try:
-                y, mo, d = int(g[0]), int(g[1]), int(g[2])
-                h, mi, s = (int(g[3]), int(g[4]), int(g[5])) if has_time else (0, 0, 0)
-                return datetime(y, mo, d, h, mi, s)
+                return datetime(
+                    int(g[0]), int(g[1]), int(g[2]),
+                    _gi(g, 3), _gi(g, 4), _gi(g, 5),
+                )
             except ValueError:
                 continue
     return None

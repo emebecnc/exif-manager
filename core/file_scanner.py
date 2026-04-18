@@ -22,7 +22,7 @@ def scan_folder(path: Path) -> list:
     results = []
     try:
         for entry in os.scandir(path):
-            if entry.is_file(follow_symlinks=False):
+            if entry.is_file():  # follow_symlinks=True (default) — required for NAS/UNC paths
                 suffix = Path(entry.name).suffix.lower()
                 if suffix in WRITABLE_EXTENSIONS:
                     results.append(Path(entry.path))
@@ -36,7 +36,7 @@ def scan_folder_all_images(path: Path) -> list:
     results = []
     try:
         for entry in os.scandir(path):
-            if entry.is_file(follow_symlinks=False):
+            if entry.is_file():  # follow_symlinks=True (default) — required for NAS/UNC paths
                 suffix = Path(entry.name).suffix.lower()
                 if suffix in IMAGE_EXTENSIONS:
                     results.append(Path(entry.path))
@@ -50,7 +50,7 @@ def count_images(path: Path) -> int:
     count = 0
     try:
         for entry in os.scandir(path):
-            if entry.is_file(follow_symlinks=False):
+            if entry.is_file():  # follow_symlinks=True (default) — required for NAS/UNC paths
                 if Path(entry.name).suffix.lower() in WRITABLE_EXTENSIONS:
                     count += 1
     except (OSError, PermissionError):

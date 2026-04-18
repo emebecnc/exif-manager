@@ -1,6 +1,6 @@
 # EXIF Manager — CLAUDE.md
 
-**Last updated:** 2026-04-15 (session 71)
+**Last updated:** 2026-04-18 (session 84 — fix hs.mins datetime format extraction returning 00:00:00)
 **Repo:** github.com/emebecnc/exif-manager
 **Local:** D:\homelab\exif_manager\
 
@@ -52,6 +52,424 @@ Signal: FolderTree folder_changed(Path) → all tabs' on_folder_changed() slots
 - Duplicates by MD5 + trash folder
 - Supported: MP4, MOV, M4V, MKV, AVI, WMV, MPG, MPEG, TS, M2TS, MTS
 - .3GP: skip gracefully
+
+### ✅ Fix hs.mins datetime format extraction returning 00:00:00 (session 84)
+
+Problem: filenames like `2014-02-08 22hs.13.mins.JPG` were returning `2014-02-08 00:00:00`
+instead of `2014-02-08 22:13:00`.
+
+Root cause: the `hs.mins` pattern added in session 83 used `[ ]` (literal space in a
+character class) instead of `\s+`. While both match a plain ASCII space, `\s+` is more
+permissive and also handles edge cases such as a filename whose whitespace character
+differs from a standard 0x20 space (e.g. an NBSP or other Unicode space copied from a
+camera's original name). Falling back to the date-only pattern `(\d{4})-(\d{2})-(\d{2})`
+(pattern 7) then returned `00:00:00`.
+
+Also made the dots around the minute value optional (`hs\.?` and `\.?mins`) to handle
+all four dot-separator variants:
+- `22hs.13.mins` (both dots — canonical form) ✓
+- `22hs.13mins`  (no dot before mins) ✓
+- `22hs13.mins`  (no dot after hs) ✓
+- `22hs13mins`   (no dots at all) ✓
+
+Old pattern: `r"(\d{4})-(\d{2})-(\d{2})[ ](\d{2})hs\.(\d{2})\.mins(?:\.(\d{2})s?)?"`
+New pattern: `r"(\d{4})-(\d{2})-(\d{2})\s+(\d{2})hs\.?(\d{2})\.?mins(?:\.(\d{2})s?)?"`
+
+Test cases now verified:
+- `2014-02-08 22hs.13.mins.JPG` → `2014:02:08 22:13:00` ✓
+- `2014-04-25 14hs.40.mins-2.JPG` → `2014:04:25 14:40:00` ✓  (trailing `-2` ignored)
+- `2014-07-03 02hs.34.mins-1.jpg` → `2014:07:03 02:34:00` ✓  (trailing `-1` ignored)
+- `2014-11-13 16hs.35.mins.jpg` → `2014:11:13 16:35:00` ✓
+
+### ✅ Comprehensive datetime format support in filename extraction (session 83)
+
+Previously `parse_date_from_filename()` failed to extract time from two common camera
+naming variants and from an unusual `hs.mins` format:
+
+| Filename | Before | After |
+|---|---|---|
+| `2014-01-04-18h01m32.jpg` | `None` (no match) | `2014:01:04 18:01:32` ✓ |
+| `2014-01-13-11h40m11.jpg` | `None` (no match) | `2014:01:13 11:40:11` ✓ |
+| `2014-06-17 17hs.59.mins-1.jpg` | `None` (no match) | `2014:06:17 17:59:00` ✓ |
+| `2014-06-17 17hs.59.mins.jpg` | `None` (no match) | `2014:06:17 17:59:00` ✓ |
+| `2014-01-01-11h17m14s.jpg` | `2014:01:01 11:17:14` ✓ | unchanged ✓ |
+
+**Root causes and fixes in `core/exif_handler.py` `parse_date_from_filename()`**:
+
+1. **Missing trailing `s`** — the primary `h/m/s` pattern required a literal `s` at the end:
+   `r"...(\d{2})m(\d{2})s"` → made `s` optional: `r"...(\d{2})m(\d{2})s?"`
+   This alone fixes `18h01m32` and `11h40m11`.
+
+2. **`hs.mins` format** — new pattern added at position 2 (before the dot/dash-separated ones):
+   `r"(\d{4})-(\d{2})-(\d{2})[ ](\d{2})hs\.(\d{2})\.mins(?:\.(\d{2})s?)?"`
+   - Matches `2014-06-17 17hs.59.mins` with optional `.SS[s]` suffix
+   - Optional seconds group is a non-capturing outer group with one inner capture;
+     when absent (trailing garbage like `-1` or end-of-stem), the capture is `None`
+   - `None` seconds → treated as 0 by new `_gi()` helper
+
+3. **No-seconds variant** — new pattern at position 6 for `2011-12-24-15h40m` (when there
+   are literally no digit characters after `m`).  Pattern 1 requires `(\d{2})` after `m`
+   so it won't match this; the new fallback does.
+
+4. **`_gi()` helper** (new inner function) replaces the old `has_time` boolean flag:
+   ```python
+   def _gi(groups: tuple, idx: int) -> int:
+       if idx >= len(groups): return 0
+       val = groups[idx]
+       return int(val) if val is not None else 0
+   ```
+   Handles both absent groups (short tuples) and optional-capture `None` values in one place.
+   The `datetime()` constructor call is now simply:
+   ```python
+   return datetime(int(g[0]), int(g[1]), int(g[2]), _gi(g,3), _gi(g,4), _gi(g,5))
+   ```
+
+Since `parse_date_from_filename` is a single shared function imported by `date_editor.py`,
+`video_date_editor.py`, and `duplicate_finder.py`, the fix applies automatically to both
+photos and videos without any caller changes.
+
+### ✅ Fix piexif dump errors for tuple-valued UNDEFINED tags (session 82)
+
+Error: `"dump" got wrong type of exif value. 37121 in Exif IFD. Got a <class 'tuple'>.`
+
+Root cause: `_clean_exif_for_dump()` in `core/exif_handler.py` already existed and was
+already called by `write_exif_timestamps()` — but its Pass 1 condition only stripped
+known UNDEFINED tags when the value was an `int`:
+```python
+if isinstance(exif_ifd.get(tag), int):   # ← missed tuple case
+```
+On many camera JPEGs, tag 37121 (`ComponentsConfiguration`) arrives from `piexif.load()`
+as a **tuple** `(0, 1, 2, 0)` rather than bytes.  The int guard passes it through untouched,
+and `piexif.dump()` raises `TypeError: got wrong type`.
+
+Fixes in `core/exif_handler.py`:
+
+1. **Extended `_EXIF_UNDEFINED_TAGS`** — added `37510` (UserComment), same UNDEFINED type,
+   same risk if piexif loads it as non-bytes.
+
+2. **Added `_EXIF_POINTER_TAGS`** — new frozenset for sub-IFD pointer tags:
+   `40965` (InteroperabilityIFD). These must be stripped unconditionally because piexif
+   manages the pointed-to IFD internally; any residual int/bytes value in the Exif dict
+   confuses dump().
+
+3. **`_clean_exif_for_dump()` now has three passes**:
+   - **Pass 0** (new): unconditionally remove all `_EXIF_POINTER_TAGS` from Exif IFD.
+   - **Pass 1** (fixed): remove `_EXIF_UNDEFINED_TAGS` whenever value is **not bytes**
+     (was: `isinstance(v, int)`; now: `val is not None and not isinstance(val, bytes)`).
+     Catches int, tuple, list, or any other wrong-type form in one condition.
+   - **Pass 2** (unchanged): catch-all — remove any remaining int not in `_EXIF_INT_OK_TAGS`.
+
+The removed tags are metadata conveniences (component layout, interoperability pointer,
+user comments, maker notes). Their absence never prevents the image from opening or the
+date from being read/written correctly.
+
+### ✅ Fix empty grid when clicking nested subfolders (session 81)
+
+Two independent root causes, both fixed:
+
+**Root cause 1 — cross-thread queued-signal race in `ui/thumbnail_grid.py`**
+
+PyQt6 cross-thread signal connections are automatically queued. When a background
+`_ThumbnailWorker` finishes, it emits `finished` on the worker thread; Qt queues
+that as an event for the main thread's event loop. Between the moment `run()`
+returns (`isRunning()` → False) and the moment `_on_worker_finished` fires on
+the main thread, a new folder click can call `load_folder` → `_start_load`, which
+replaces `self._worker` and `self._thread` with a new pair. The stale queued
+`_on_worker_finished` then reads the NEW objects, calls `thread.quit()` +
+`thread.wait()`, and kills the new load. Since `_pending_folder` is None, no
+recovery occurs and the grid stays empty.
+
+Fix:
+- In `_start_load` (line ~701): connect via a closure that captures the specific
+  pair being started:
+  ```python
+  _w, _t = self._worker, self._thread
+  self._worker.finished.connect(lambda: self._on_worker_finished_for(_w, _t))
+  ```
+- Renamed `_on_worker_finished` → `_on_worker_finished_for(self, my_worker, my_thread)`:
+  - Clears `self._worker`/`self._thread` only when they still point to OUR objects
+    (identity check: `if self._worker is my_worker: self._worker = None`)
+  - Always cleans up OUR thread (safe to call even if a new load is running)
+  - Skips UI finalisation (sort, group, filter, `_pending_folder`) when a newer
+    load is already running (`self._worker is not None or self._thread is not None`)
+
+**Root cause 2 — `follow_symlinks=False` returning False on NAS/UNC paths (`core/file_scanner.py`)**
+
+Same bug previously fixed in session 16 (folder tree counting) and session 64
+(video scanning). `entry.is_file(follow_symlinks=False)` can return False for
+regular files on Windows network shares (UNC paths). Photos in nested subfolders
+that happen to sit on a NAS therefore yielded zero results from `scan_folder()`.
+
+Fix: removed `follow_symlinks=False` from `entry.is_file()` in three functions:
+- `scan_folder()` — used by `_start_load()` to build the photo list
+- `scan_folder_all_images()` — display-only variant
+- `count_images()` — folder tree counter
+
+### ✅ Fix "Nombre nuevo" column blank in video editor keep mode (session 80)
+- Root cause: `_populate_table()` in `ui/video_date_editor.py` set `rename_text = ""`
+  unconditionally in the `keep` branch, even when "Renombrar archivos" was checked.
+  Since "Conservar fecha de metadata" is the **default** mode and "Renombrar archivos"
+  is checked by default, the "Nombre nuevo" column was blank every time the dialog opened.
+- `_ApplyWorker.run()` already handled keep-mode renaming correctly (calls `_resolve_dt`
+  which returns `existing` in keep mode, then computes the new filename from that date).
+  The preview simply wasn't mirroring that logic.
+- Fix: added `make_dated_filename` call in the `keep` branch of `_populate_table()`:
+  ```python
+  if renaming and rename_fmt != _RENAME_KEEP_NAME and current_dt is not None:
+      stem = path.stem if rename_fmt == _RENAME_DATE_PLUS else None
+      rename_text = make_dated_filename(
+          current_dt, path.parent, path.suffix, used, stem,
+          exclude=path.name,
+      )
+      used.add(rename_text)
+  else:
+      rename_text = "— (sin cambio)" if renaming else ""
+  ```
+- Edge cases handled:
+  * `current_dt is None` (video has no metadata date) → `"— (sin cambio)"` or `""`
+  * Rename format = "Conservar nombre original" → `"— (sin cambio)"` (no rename)
+  * Rename format = "Fecha + nombre original" → includes original stem in filename
+  * Collision detection via `used` set and `exclude=path.name` — consistent with all
+    other branches (session 79 fix)
+
+### ✅ Fix spurious _1 suffix in make_dated_filename (session 79)
+- Root cause: `(folder / candidate).exists()` returns `True` when the candidate matches the
+  file's own current on-disk name (the file hasn't been renamed yet at check time).
+  Result: a file like `2013-01-01-17h44m21s.jpg` whose new name would be
+  `2013-01-01-17h44m21s.jpg` was incorrectly renamed to `2013-01-01-17h44m21s_1.jpg`.
+- Fix: added `exclude: Optional[str] = None` parameter to `make_dated_filename` in both
+  `core/exif_handler.py` and `core/video_handler.py`.
+  The disk-existence check is now `on_disk = candidate != exclude and (folder / candidate).exists()`.
+  When `candidate == exclude` the file is treated as not-on-disk (it's the same file being renamed).
+- All callers updated to pass `exclude=path.name`:
+  * `ui/date_editor.py` — 5 call sites (2 in `_PreviewWorker.run`, 1 in `_ApplyWorker.run`, 2 in `_on_preview` sync path)
+  * `ui/video_date_editor.py` — 4 call sites (1 in `_ApplyWorker.run`, 3 in `_populate_table`)
+  * `ui/photo_detail.py` — 3 call sites (2 preview display, 1 actual rename)
+- `video_grid.py` imports `make_dated_filename` but never calls it — no change needed.
+- The `used` set collision logic is unchanged; two different files that map to the same
+  new name still correctly get `_1`, `_2`, … suffixes.
+
+### ✅ "Usar fecha del nombre" per-file mode added to video date editor (session 78)
+- Mirrors the session 77 fix from `date_editor.py` into `ui/video_date_editor.py`.
+- Root cause of the video-editor bug: `_prefill_from_filename()` read only `self._paths[0].stem`
+  and filled shared spinboxes with that single date → all N videos in a batch received the
+  SAME date (from the first video's filename) instead of each their own.
+- All modes that now work per-file in both editors:
+  | Mode | Photos (date_editor.py) | Videos (video_date_editor.py) |
+  |---|---|---|
+  | Usar fecha creación | ✅ session 75 | ✅ session 75 |
+  | Usar fecha del nombre | ✅ session 77 | ✅ session 78 |
+- Changes to `ui/video_date_editor.py`:
+  * `_MODE_USE_FNAME = 3` constant added.
+  * `_radio_fname = QRadioButton("Usar fecha del nombre")` added to Acción groupbox (with tooltip listing all patterns).
+  * Registered in `_bg_mode` at id `_MODE_USE_FNAME`; wired `toggled → _on_mode_radio_toggled`.
+  * `_prefill_fname_date()`: new method — reads first file's name date, fills spinboxes for read-only display.
+  * `_update_state()`: `per_file = use_ctime or use_fname`; both modes disable date/time groups; fname branch calls `_prefill_fname_date()`.
+  * `_populate_table()`: fname branch reads `parse_date_from_filename(path.stem)` per-file; shows "Sin fecha en nombre" for files with no match.
+  * `_on_apply()`: detects `use_fname`, passes `use_fname=use_fname` to `_ApplyWorker`.
+  * `_ApplyWorker`: `use_fname: bool = False` param; `_resolve_dt` fname branch calls `parse_date_from_filename(path.stem)`; error message "sin fecha reconocible en el nombre" for no-match files.
+  * `_prefill_from_filename()` rewritten: now calls `self._radio_fname.setChecked(True)` (triggers `_update_state → _prefill_fname_date`) instead of filling spinboxes from first file and switching to Cambiar mode.
+
+### ✅ "Usar fecha del nombre" per-file mode in photo date editor (session 77)
+- New `_MODE_USE_FNAME = 3` constant in `ui/date_editor.py`.
+- New `"Usar fecha del nombre"` radio button in the Acción groupbox (4th option after Conservar / Cambiar / Usar fecha creación).
+- Button "Leer fecha del nombre" now switches into this per-file mode instead of filling shared spinboxes:
+  * Checks first file's name for a recognizable date pattern (early-exit with warning if not found).
+  * Sets `_radio_mode_fname.setChecked(True)` → triggers `_apply_exif_mode_state` → calls `_prefill_fname_date()` to show first file's date in the (disabled) spinboxes as a read-only display.
+  * Updates the hint label to "Fecha del nombre de cada archivo (por archivo)".
+- `_prefill_fname_date()`: new method — reads `parse_date_from_filename(first_path.stem)`, fills spinboxes.
+- `_apply_exif_mode_state()`: handles `use_fname` alongside `use_ctime` — both are "per-file" modes; spinboxes and time groups disabled for both.
+- `_update_apply_state()`: `no_component` check skips both `use_ctime` and `use_fname`.
+- `_resolve_new_dt(path)`: fname branch `parse_date_from_filename(path.stem)` added before the ctime branch.
+- `_PreviewWorker`: new `use_fname: bool = False` param; `_resolve_dt` fname branch at top. `run()` shows "Sin fecha en nombre" in the preview table when no pattern matches.
+- `_ApplyWorker`: new `use_fname: bool = False` param; `_resolve_dt` fname branch at top. `run()` reports "sin fecha reconocible en el nombre" per-file on failure.
+- `_on_preview()` and `_on_apply()`: detect `use_fname`, skip `_validate_date()`, pass `use_fname` to workers; log string is "fecha-nombre".
+- Files with no recognizable date in their name are counted as errors and skipped gracefully — other files in the batch still succeed.
+- This mode mirrors `_MODE_USE_CTIME` in structure: both bypass spinboxes and read each file independently at preview/apply time.
+
+### ✅ Full datetime extraction from filename — audit (session 76)
+- Task: fix `parse_date_from_filename()` to extract hour/minute/second from filenames
+  like `2014-01-08-03h24m23s.jpg` (reported returning `00:00:00`).
+- Audit result: **already correct** — no code changes needed.
+- `core/exif_handler.py` `parse_date_from_filename()`:
+  * First pattern is `r"(\d{4})-(\d{2})-(\d{2})-(\d{2})h(\d{2})m(\d{2})s"` with `has_time=True`.
+  * `re.search` on `"2014-01-08-03h24m23s"` correctly matches all 6 groups → returns
+    `datetime(2014, 1, 8, 3, 24, 23)`. No date-only pattern is ever tried.
+- `ui/date_editor.py` `_try_apply_filename_date()`:
+  * Correctly reads `dt.hour/minute/second`; switches to "Personalizada" time radio and
+    sets time spinboxes when `dt.hour or dt.minute or dt.second` is truthy.
+- `ui/video_date_editor.py` `_prefill_from_filename()`:
+  * Unconditionally sets `self._radio_custom_time.setChecked(True)` and all time spinboxes,
+    so hour/minute/second are always applied.
+- Root cause of perceived bug: user noted "probably" — the assumption was incorrect.
+  The full-datetime pattern was already present (added in an earlier session alongside the
+  `YYYY-MM-DD-HHhMMmSSs` orange-border standard-name regex in session 71).
+
+### ✅ "Usar fecha creación" radio option in both date editors (session 75)
+- Third radio button added to "Acción" groupbox in both `ui/date_editor.py` (photos) and
+  `ui/video_date_editor.py` (videos), alongside the existing "Conservar" and "Cambiar" options.
+- When selected:
+  * Date/time spinboxes are disabled (no manual editing) — `_grp_date` and time group disabled.
+  * Spinboxes are pre-populated with the creation date of the first file in the selection.
+  * Preview table shows per-file creation dates (each file's own `st_ctime`).
+  * Apply worker reads `st_ctime` per-file at write time (falls back to `st_mtime` if ctime < 1980-01-01).
+- Works in single, folder, and selection (batch) modes.
+- Module-level `_get_file_creation_dt(path)` helper shared by worker, dialog prefill, and preview table.
+- Constant `_MODE_USE_CTIME = 2` added to both files.
+- `_ApplyWorker._resolve_dt(existing, path=None)`: added `path` parameter; ctime branch at top.
+- `_ApplyWorker.run()`: passes `path` to `_resolve_dt(existing, path)`.
+- Signal connections: `_radio_ctime.toggled → _on_mode_radio_toggled` (stops any running thread first).
+
+### ✅ EXIF date disk cache — near-instant second open on NAS (session 74)
+- Root cause of "Cargando…" on every open: Phase 1 (`read_exif_dates_batch`) re-read
+  EXIF headers from all N original full-size photos each time a folder was opened —
+  even when nothing had changed.  On NAS with 2500 photos this took several seconds.
+  Phase 2 (thumbnail loading) already had a disk cache but EXIF dates did not.
+- Also: `_on_load_progress` overwrote the count label with "Cargando… X/Y" on every
+  progress tick, so "2500 fotos" disappeared even on fast cache-hit loads.
+- Fix (`ui/thumbnail_grid.py`):
+  * Added `import json`.
+  * `_ThumbnailWorker.run()`: Phase 1 now calls `_load_exif_dates_cached()` instead
+    of `read_exif_dates_batch()` directly.
+  * `_load_exif_dates_cached()`: loads `_thumbcache/_exif_cache.json` (one file read),
+    matches entries by `filename → {size, date}` — same file-size stability logic as
+    the thumbnail cache key.  Only calls `read_exif_dates_batch()` for files not found
+    in cache or whose size changed.  Writes updated cache back to disk after any miss.
+  * `_read_exif_cache()` / `_write_exif_cache()`: helpers; silently ignore all I/O
+    errors so a corrupt or missing cache file is treated as empty.
+  * `_EXIF_CACHE_FILE = "_exif_cache.json"` class constant.
+  * `_on_load_progress()`: removed `self._lbl_count.setText(f"Cargando… {current}/{total}")`.
+    Count label now stays as "N fotos" throughout loading; progress bar handles visual
+    feedback alone.
+- Behaviour after fix:
+  * First open: EXIF read from all N files → cache written → thumbnails generated → normal delay.
+  * Second open (same folder, no file changes): Phase 1 = 1 JSON read (instant).
+    Phase 2 = N thumbnail reads from `_thumbcache/*.jpg` (fast, no Pillow).
+    Count label shows "N fotos" the whole time; progress bar fills silently.
+  * File changed (different size): that entry is a cache miss → re-read + cache updated.
+  * Cache file corrupt/missing: gracefully falls back to full EXIF read.
+
+### ✅ Deferred video scan — no scan_video_folder() on Photos tab (session 73)
+- Root cause: every folder click emitted `MainWindow.folder_changed` → all tabs received it →
+  `VideoPanel.on_folder_changed()` → `VideoGrid._start_load()` → `scan_video_folder()` scanned
+  every file looking for video extensions, printing `[VIDEO SKIP]` for each .jpg.
+  On a NAS folder with 2500 JPGs and 0 videos: 5–10 seconds of wasted scanning.
+- Fix (`ui/main_window.py`):
+  * Added `self._pending_video_folder: Optional[Path] = None` to `__init__`.
+  * `_on_folder_changed_videos()` rewritten: if Videos tab is active → call `VideoPanel`
+    immediately (unchanged behaviour). Otherwise → store `_pending_video_folder = path` and
+    return (no scan).
+  * `_on_center_tab_changed(index=1)`: after existing setup, checks
+    `if self._pending_video_folder is not None` → calls `VideoPanel.on_folder_changed(folder)`,
+    clears `_pending_video_folder`.
+- Behaviour after fix:
+  * Open folder with 2500 photos → loads instantly (zero video scanning).
+  * Click Videos tab → scans videos once (normal delay, same as before).
+  * Click Photos tab → instant (photo grid already loaded; no re-scan).
+  * Click Videos tab again → instant (VideoPanel._current_folder == folder → guard returns).
+  * Change folder → cycle repeats; deferred until Videos tab clicked.
+- VideoPanel's existing `folder == self._current_folder` guard prevents double-loads when
+  the user is already on Videos and changes folders (unchanged code path).
+
+### ✅ Group problem images at top of photo grid (session 72)
+- After the thumbnail worker finishes loading a folder, `_group_problem_items()` reorders
+  the list so problem photos are always immediately visible at the top without scrolling.
+- Order: RED (invalid/missing EXIF date) → ORANGE (non-standard filename) → NORMAL.
+- Within each group the existing sort order (by date or name) is preserved.
+- Implemented as a no-op when no red or orange items exist (avoids unnecessary rebuild).
+- `ui/thumbnail_grid.py`:
+  * Added `_group_problem_items()` — reads `_ROLE_INVALID` and `_ROLE_STD_NAME` from each item,
+    splits into three lists, rebuilds the `QListWidget` from end-to-start (O(1) per removal).
+  * `_on_worker_finished()`: calls `_group_problem_items()` after `_apply_sort()`.
+  * Both `_ROLE_INVALID` and `_ROLE_STD_NAME` are set at skeleton time so the data is
+    always available when `_on_worker_finished` runs.
+
+### ✅ Fix thumbnail cache misses on NAS (session 72)
+- NAS drives often report unreliable or reset mtime across remounts, causing a cache miss
+  on every folder open even when files have not changed — regenerating 2542 thumbnails
+  each time instead of loading from `_thumbcache/`.
+- Changed cache key from `md5(path + mtime)` to `md5(path + file_size)`:
+  * File size is stable across NAS remounts and sufficient to detect genuine file changes.
+  * A modified file almost always changes size; a same-size swap is an acceptable edge-case
+    (just generates a stale thumbnail instead of a crash).
+- `ui/thumbnail_grid.py`:
+  * `_thumb_cache_key(path_str, file_size: int)`: renamed parameter, updated format string
+    (integer, no decimal).
+  * `_ThumbnailWorker._get_thumb()`: reads `st_size` instead of `st_mtime`; passes it to
+    `_thumb_cache_key()`.
+  * mtime is still used for the `_ROLE_DATE` seed in `_start_load()` — unrelated to cache.
+
+### ✅ Defer preview generation to explicit button click — photos + videos (session 72)
+- Both date editors open with an empty preview table; preview only generates when the user
+  clicks "Vista previa de cambios". This makes the dialog instant to open on large folders.
+- **`ui/date_editor.py`**:
+  * Removed `QTimer.singleShot(0, self._on_preview)` from `__init__()` — table starts empty.
+  * Removed `QTimer` from imports (no longer needed).
+  * `_on_exif_mode_changed()`: removed `if self._table.isVisible(): self._on_preview()`.
+  * `_on_date_component_toggled()`: removed `if self._table.isVisible(): self._on_preview()`.
+  * `_on_rename_toggled()`: removed `if self._table.isVisible(): self._on_preview()`.
+  * `_on_rename_fmt_changed()`: removed `if self._table.isVisible(): self._on_preview()`.
+  * `_preview_populated` flag still tracked correctly for Apply button state.
+- **`ui/video_date_editor.py`**:
+  * Removed `self._populate_table()` from `__init__()` — table starts empty.
+  * Removed `_chk_year/month/day.toggled → lambda _: self._populate_table()` connections.
+  * `_prefill_from_filename()`: removed `self._populate_table()` at end — no auto-refresh.
+  * Spinbox enable/disable connections for year/month/day are unchanged.
+
+### ✅ "Fecha nueva" column always visible in photo preview table (session 72)
+- `ui/date_editor.py`: removed `setColumnHidden(_COL_NEW, True)` from `_build_ui()` and
+  `_apply_exif_mode_state()` — the column was previously hidden in Conservar mode (the default),
+  making the table appear to have only 3 columns (Archivo | Fecha actual | Nombre nuevo).
+- Column is now always visible (4 cols: Archivo | Fecha actual | Fecha nueva | Nombre nuevo).
+- In Conservar mode it shows the original date in gray (no change), matching the video editor behaviour.
+- `_populate_preview_table()`: added gray-coloring when `new_str == current` (mirrors `video_date_editor.py`).
+- Video editor already had Fecha nueva always visible — no changes needed there.
+
+### ✅ Field selection checkboxes for photos + videos (session 72)
+- Both date editors now show a "Campos a actualizar" groupbox between "Renombrar archivos" and "Vista previa de cambios".
+- All checkboxes checked by default; user can uncheck to skip specific fields.
+- **Photos** (`ui/date_editor.py`) — 5 checkboxes:
+  * DateTimeOriginal, DateTimeDigitized, DateTime → control which EXIF tags are written
+  * Timestamp → controls `os.utime()` (filesystem mtime/atime)
+  * Fecha creación → controls `win32file.SetFileTime()` (Windows creation date)
+  * `_field_checks` dict extended with the 2 new keys; `_on_apply()` splits them out before building `fields` list.
+  * `_ApplyWorker` gains `sync_mtime: bool` and `sync_creation: bool` params, forwarded to `write_exif_date()`.
+- **Videos** (`ui/video_date_editor.py`) — 5 checkboxes:
+  * CreationTime / ModifyTime / FileModificationDate → any checked → ffmpeg container write happens
+  * Timestamp / FileModificationDate → controls `os.utime()`
+  * Fecha creación → controls `win32file.SetFileTime()`
+  * `_ApplyWorker` gains `write_metadata`, `sync_mtime`, `sync_creation` params.
+  * When `write_metadata=False`, the worker skips ffmpeg but still syncs filesystem timestamps if their boxes are checked.
+- **Core** (`core/exif_handler.py`, `core/video_handler.py`):
+  * `_sync_file_timestamps(path, dt, *, sync_mtime, sync_creation)` — now accepts kwargs; each operation is conditional.
+  * `write_exif_date(...)` — gains `sync_mtime` and `sync_creation` kwargs, forwarded to `_sync_file_timestamps`.
+  * `write_video_date(...)` — gains `sync_mtime` and `sync_creation` kwargs; both os.utime and win32file blocks are conditional.
+
+### ✅ Fix file creation date not updating on Windows (session 72)
+- `core/exif_handler.py`:
+  * Added `import os` at top
+  * Added `_sync_file_timestamps(path, dt)` helper — calls `os.utime()` for mtime/atime,
+    then `win32file.SetFileTime()` for Windows creation time (pywin32, gracefully skipped if unavailable)
+  * `write_exif_date()`: calls `_sync_file_timestamps(path, new_dt)` after `write_exif_timestamps()`
+- `core/video_handler.py`:
+  * `write_video_date()`: added pywin32 block after existing `os.utime()` call —
+    same `win32file.SetFileTime()` pattern, wrapped in `try/except` so non-Windows degrades silently
+
+### ✅ Fix QThread crash on radio button switch in date editors (session 72)
+- `ui/date_editor.py`:
+  * Added `_force_stop_preview_thread()` — sets `stop_requested=True`, calls `quit()+wait(2000)`,
+    disconnects the `finished→_cleanup_preview_thread` signal, then `deleteLater()` both objects.
+    Also closes any open `_preview_progress_dlg` and re-enables the dialog.
+  * `_on_exif_mode_changed()`: calls `_force_stop_preview_thread()` before `_apply_exif_mode_state()` —
+    prevents "QThread: Destroyed while still running" when the user flips Conservar↔Cambiar on large folders.
+  * `_on_preview()` async branch: also calls `_force_stop_preview_thread()` at the start of the
+    background-worker path so switching rename format / date components mid-preview is also safe.
+- `ui/video_date_editor.py`:
+  * Added `_stop_apply_thread()` — quit+wait(2000), deleteLater() on worker+thread, sets both to None.
+  * Added `_on_mode_radio_toggled()` — calls `_stop_apply_thread()` then `_update_state()`.
+  * Changed `self._radio_keep.toggled` connection from `_update_state` → `_on_mode_radio_toggled`
+    (defensive: apply thread normally can't run while radios are accessible due to WindowModal dialog,
+    but the guard prevents stale thread references in edge cases).
 
 ### ✅ Video grid toolbar unified with photo grid toolbar (session 71)
 - ui/video_grid.py — VideoGrid:

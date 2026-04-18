@@ -44,11 +44,13 @@ class _RenameFormatDialog(QDialog):
 
         # Pre-compute candidate names so the user can see the result
         name_date_only = make_dated_filename(
-            self._dt, self._path.parent, self._path.suffix
+            self._dt, self._path.parent, self._path.suffix,
+            exclude=self._path.name,
         )
         name_date_plus = make_dated_filename(
             self._dt, self._path.parent, self._path.suffix,
-            original_stem=self._path.stem
+            original_stem=self._path.stem,
+            exclude=self._path.name,
         )
 
         grp = QGroupBox("Formato del nombre nuevo")
@@ -437,7 +439,8 @@ class PhotoDetailPanel(QWidget):
 
         # Build the target filename based on the chosen format
         stem = path.stem if fmt == _RENAME_DATE_PLUS else None
-        new_name = make_dated_filename(dt, path.parent, path.suffix, original_stem=stem)
+        new_name = make_dated_filename(dt, path.parent, path.suffix,
+                                       original_stem=stem, exclude=path.name)
         new_path = path.parent / new_name
 
         # Reuse the already-read EXIF (no second disk access)

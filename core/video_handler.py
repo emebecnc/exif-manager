@@ -136,11 +136,20 @@ def is_invalid_date(dt: Optional[datetime]) -> bool:
 
 # ── Metadata writing ──────────────────────────────────────────────────────────
 
-def write_video_date(path: Path, new_dt: datetime) -> bool:
+def write_video_date(
+    path: Path,
+    new_dt: datetime,
+    *,
+    sync_mtime: bool = True,
+    sync_creation: bool = True,
+) -> bool:
     """Write a new creation_time to video container metadata using ffmpeg -codec copy.
 
     Operation is atomic: writes to a temp file then renames over the original.
-    Also updates the filesystem modification timestamp via os.utime.
+
+    sync_mtime=True    → os.utime() updates the file's mtime/atime after the write.
+    sync_creation=True → win32file.SetFileTime() updates the Windows creation date.
+    Both default to True so existing callers keep the previous behaviour.
 
     Returns:
         True  — metadata written successfully.
@@ -189,12 +198,32 @@ def write_video_date(path: Path, new_dt: datetime) -> bool:
             pass
         return False
 
-    # Best-effort filesystem timestamp sync
+    # Best-effort filesystem timestamp sync (caller-controlled)
     ts = new_dt.timestamp()
-    try:
-        os.utime(str(path), (ts, ts))
-    except OSError:
-        pass
+    if sync_mtime:
+        try:
+            os.utime(str(path), (ts, ts))
+        except OSError:
+            pass
+    if sync_creation:
+        # Windows-only: update creation time via pywin32
+        try:
+            import win32file   # type: ignore[import]
+            import pywintypes  # type: ignore[import]
+            handle = win32file.CreateFile(
+                str(path),
+                win32file.GENERIC_WRITE,
+                win32file.FILE_SHARE_READ | win32file.FILE_SHARE_WRITE,
+                None,
+                win32file.OPEN_EXISTING,
+                0,
+                None,
+            )
+            win_time = pywintypes.Time(int(ts))
+            win32file.SetFileTime(handle, win_time, win_time, win_time)
+            win32file.CloseHandle(handle)
+        except Exception:
+            pass  # pywin32 not available or non-Windows — skip creation-time update
 
     return True
 
@@ -300,8 +329,15 @@ def make_dated_filename(
     suffix: str,
     used: Optional[set] = None,
     original_stem: Optional[str] = None,
+    exclude: Optional[str] = None,
 ) -> str:
-    """Collision-free filename like 2007-09-29-02h47m07s.mp4."""
+    """Collision-free filename like 2007-09-29-02h47m07s.mp4.
+
+    exclude: the current on-disk filename of the file being renamed.  When the
+    candidate equals this name the disk-existence check is skipped so that a
+    file whose new name equals its current name does not receive a spurious
+    _1 suffix.
+    """
     base = dt.strftime("%Y-%m-%d-%Hh%Mm%Ss")
     if original_stem:
         base = f"{base}_{original_stem}"
@@ -309,12 +345,14 @@ def make_dated_filename(
     used = used if used is not None else set()
 
     candidate = f"{base}{ext}"
-    if not (folder / candidate).exists() and candidate not in used:
+    on_disk = candidate != exclude and (folder / candidate).exists()
+    if not on_disk and candidate not in used:
         return candidate
     i = 1
     while True:
         candidate = f"{base}_{i}{ext}"
-        if not (folder / candidate).exists() and candidate not in used:
+        on_disk = candidate != exclude and (folder / candidate).exists()
+        if not on_disk and candidate not in used:
             return candidate
         i += 1
 

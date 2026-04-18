@@ -36,6 +36,9 @@ class MainWindow(QMainWindow):
         self._current_folder: Optional[Path] = None
         self._current_photo: Optional[Path] = None
         self._undo_stack: deque = deque(maxlen=1)  # (path, original_fields)
+        # Deferred video scan: folder selected while Videos tab was not active.
+        # Loaded on first switch to Videos tab; None when already up-to-date.
+        self._pending_video_folder: Optional[Path] = None
 
         # Log manager
         data_path = QStandardPaths.writableLocation(
@@ -298,8 +301,20 @@ class MainWindow(QMainWindow):
         self._thumbnail_grid.on_folder_changed(path)
 
     def _on_folder_changed_videos(self, path: Path) -> None:
-        """Forward folder change to the videos tab."""
-        self._video_panel.on_folder_changed(path)
+        """Forward folder change to the videos tab.
+
+        If the Videos tab is currently visible, load immediately.
+        Otherwise, cache the folder and load it only when the user
+        actually switches to the Videos tab (avoids a full scan_video_folder()
+        call for every folder click while browsing Photos).
+        """
+        if self._center_tabs.currentIndex() == 1:  # Videos tab is active
+            self._pending_video_folder = None
+            self._video_panel.on_folder_changed(path)
+        else:
+            # Defer — the VideoPanel still holds stale data from the previous
+            # folder; it will be updated when the user opens the Videos tab.
+            self._pending_video_folder = path
 
     def _on_folder_changed_duplicates(self, path: Path) -> None:
         """Forward folder change to the duplicates tab."""
@@ -331,6 +346,12 @@ class MainWindow(QMainWindow):
                 # Clear photo detail — its image would otherwise appear "stuck"
                 # while the user is browsing the Videos tab.
                 self._photo_detail.clear()
+                # If we deferred the video scan while the user was on another tab,
+                # trigger it now (only runs if the folder actually changed).
+                if self._pending_video_folder is not None:
+                    folder = self._pending_video_folder
+                    self._pending_video_folder = None
+                    self._video_panel.on_folder_changed(folder)
 
     def _on_files_moved_videos(self, src_folder: Path, moved: list) -> None:
         """Forward shared-tree file-move events to the video panel."""

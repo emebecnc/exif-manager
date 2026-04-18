@@ -4,7 +4,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from PyQt6.QtCore import Qt, QObject, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QObject, QThread, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout,
@@ -27,8 +27,10 @@ from ui.styles import apply_button_style, apply_primary_button_style, mb_warning
 _FIELD_NAMES = ["DateTimeOriginal", "DateTimeDigitized", "DateTime"]
 
 # Outer "what to do" radio IDs
-_MODE_KEEP   = 0   # conservar fecha EXIF
-_MODE_CHANGE = 1   # cambiar fecha EXIF
+_MODE_KEEP      = 0   # conservar fecha EXIF
+_MODE_CHANGE    = 1   # cambiar fecha EXIF
+_MODE_USE_CTIME = 2   # use filesystem creation date (st_ctime / st_mtime fallback)
+_MODE_USE_FNAME = 3   # use date parsed from each file's own filename
 
 # Inner time radio IDs
 _OPT_PRESERVE = 0  # keep original time per file
@@ -49,6 +51,24 @@ _COL_RENAME  = 3
 _COLOR_NO_CHANGE = QColor(130, 130, 130)
 
 
+def _get_file_creation_dt(path: Path) -> Optional[datetime]:
+    """Return the filesystem creation datetime for *path*.
+
+    Uses ``st_ctime`` (creation time on Windows, metadata-change time on POSIX).
+    Falls back to ``st_mtime`` when ``st_ctime`` appears invalid — timestamps
+    before 1980-01-01 are treated as unreliable (common on FAT-formatted NAS
+    drives and some POSIX systems where ctime is not the creation date).
+    """
+    try:
+        st = path.stat()
+        ts = st.st_ctime
+        if ts < 315_532_800:   # 1980-01-01 00:00:00 UTC
+            ts = st.st_mtime
+        return datetime.fromtimestamp(ts)
+    except OSError:
+        return None
+
+
 class _PreviewWorker(QObject):
     """Background worker for preview generation (used for 50+ photo folders)."""
     progress = pyqtSignal(int, int)    # current, total
@@ -64,10 +84,14 @@ class _PreviewWorker(QObject):
         hour: int, minute: int, second: int,
         rename: bool,
         rename_fmt: int,
+        use_ctime: bool = False,
+        use_fname: bool = False,
     ):
         super().__init__()
         self._paths = paths
         self._keep_mode = keep_mode
+        self._use_ctime = use_ctime
+        self._use_fname = use_fname
         self._chk_year = chk_year
         self._chk_month = chk_month
         self._chk_day = chk_day
@@ -83,6 +107,13 @@ class _PreviewWorker(QObject):
         self.stop_requested = False
 
     def _resolve_dt(self, path: Path) -> Optional[datetime]:
+        # ── "Usar fecha del nombre" mode ──────────────────────────────────
+        if self._use_fname:
+            return parse_date_from_filename(path.stem)
+        # ── "Usar fecha creación" mode ────────────────────────────────────
+        if self._use_ctime:
+            return _get_file_creation_dt(path)
+
         if self._keep_mode:
             exif = read_exif(path)
             return parse_exif_dt(get_best_date_str(exif["fields"]))
@@ -127,7 +158,12 @@ class _PreviewWorker(QObject):
             current = get_best_date_str(exif["fields"]) or "Sin fecha"
             new_dt = self._resolve_dt(path)
             if new_dt is None:
-                new_str     = "Sin fecha EXIF" if self._keep_mode else "Fecha inválida"
+                if self._keep_mode:
+                    new_str = "Sin fecha EXIF"
+                elif self._use_fname:
+                    new_str = "Sin fecha en nombre"
+                else:
+                    new_str = "Fecha inválida"
                 rename_text = "— (conservar nombre)"
                 rename_gray = True
             else:
@@ -140,12 +176,14 @@ class _PreviewWorker(QObject):
                         rename_text = make_dated_filename(
                             new_dt, path.parent, path.suffix, used,
                             original_stem=path.stem,
+                            exclude=path.name,
                         )
                         used.add(rename_text)
                         rename_gray = False
                     else:
                         rename_text = make_dated_filename(
                             new_dt, path.parent, path.suffix, used,
+                            exclude=path.name,
                         )
                         used.add(rename_text)
                         rename_gray = False
@@ -175,10 +213,15 @@ class _ApplyWorker(QObject):
         rename: bool,
         rename_fmt: int,
         write_exif: bool = True,        # False → rename-only (Conservar mode)
+        sync_mtime: bool = True,        # update filesystem mtime/atime
+        sync_creation: bool = True,     # update Windows creation date (pywin32)
+        use_ctime: bool = False,        # True → read st_ctime per-file (ignores spinbox values)
+        use_fname: bool = False,        # True → parse date from each file's own filename
     ):
         super().__init__()
         self._paths          = paths
         self._keep_mode      = keep_mode
+        self._use_ctime      = use_ctime
         self._chk_year       = chk_year
         self._chk_month      = chk_month
         self._chk_day        = chk_day
@@ -193,6 +236,9 @@ class _ApplyWorker(QObject):
         self._rename         = rename
         self._rename_fmt     = rename_fmt
         self._write_exif     = write_exif
+        self._sync_mtime     = sync_mtime
+        self._sync_creation  = sync_creation
+        self._use_fname      = use_fname
         self._cancelled      = False
         self.stop_requested  = False
 
@@ -200,8 +246,24 @@ class _ApplyWorker(QObject):
         self._cancelled = True
         self.stop_requested = True
 
-    def _resolve_dt(self, existing_fields: dict) -> Optional[datetime]:
-        """Compute the target datetime using already-read EXIF fields (no extra disk I/O)."""
+    def _resolve_dt(self, existing_fields: dict,
+                    path: Optional[Path] = None) -> Optional[datetime]:
+        """Compute the target datetime for one file.
+
+        ``existing_fields``  — EXIF fields already read by the caller (no extra I/O).
+        ``path``             — needed only in *use_ctime* mode to read st_ctime.
+        """
+        # ── "Usar fecha del nombre" mode — parse from filename ───────────────
+        if self._use_fname:
+            if path is None:
+                return None
+            return parse_date_from_filename(path.stem)
+        # ── "Usar fecha creación" mode — ignore EXIF, read from filesystem ──
+        if self._use_ctime:
+            if path is None:
+                return None
+            return _get_file_creation_dt(path)
+
         if self._keep_mode:
             return parse_exif_dt(get_best_date_str(existing_fields))
 
@@ -257,7 +319,7 @@ class _ApplyWorker(QObject):
                 step += 2 if has_two_phases else 1
                 continue
 
-            new_dt           = self._resolve_dt(original_fields)
+            new_dt           = self._resolve_dt(original_fields, path)
             new_name_for_log = None
 
             # ── Phase 1: write EXIF (or rename-only pseudo-phase) ──────────
@@ -267,7 +329,10 @@ class _ApplyWorker(QObject):
                 self.progress.emit(step, total_steps, path.name, "Escribiendo EXIF")
                 if new_dt is None:
                     failed += 1
-                    errors.append(f"{path.name}: sin fecha válida para escribir")
+                    if self._use_fname:
+                        errors.append(f"{path.name}: sin fecha reconocible en el nombre")
+                    else:
+                        errors.append(f"{path.name}: sin fecha válida para escribir")
                     exif_ok = False
                     if has_two_phases:
                         step += 1   # consume the rename step slot for this file
@@ -278,6 +343,8 @@ class _ApplyWorker(QObject):
                             new_dt.year, new_dt.month, new_dt.day,
                             self._fields,
                             new_dt.hour, new_dt.minute, new_dt.second,
+                            sync_mtime=self._sync_mtime,
+                            sync_creation=self._sync_creation,
                         )
                         ok += 1
                     except Exception as exc:
@@ -296,7 +363,8 @@ class _ApplyWorker(QObject):
             if exif_ok and will_rename and new_dt is not None:
                 stem     = path.stem if self._rename_fmt == _RENAME_DATE_PLUS else None
                 new_name = make_dated_filename(
-                    new_dt, path.parent, path.suffix, used_names, original_stem=stem
+                    new_dt, path.parent, path.suffix, used_names,
+                    original_stem=stem, exclude=path.name,
                 )
                 used_names.add(new_name)
                 new_name_for_log = new_name
@@ -383,15 +451,9 @@ class DateEditorDialog(QDialog):
         self._prefill_date()
         if prefill_from_filename:
             self._try_apply_filename_date(show_warning=False)
-        # Auto-populate the preview table on open (mirrors video editor behaviour —
-        # the table is always visible and pre-filled so the user sees the current
-        # dates immediately without having to click "Vista previa de cambios").
-        # QTimer.singleShot(0) fires on the first event-loop tick after exec()
-        # returns, guaranteeing the parent dialog is fully visible before any
-        # progress dialog appears for large folders.
-        _init_paths = self._get_target_paths()
-        if _init_paths:
-            QTimer.singleShot(0, self._on_preview)
+        # Preview is NOT auto-generated on open — the table stays empty until the
+        # user explicitly clicks "Vista previa de cambios".  This keeps the dialog
+        # instant to open even for large folders.
 
     # ── UI ─────────────────────────────────────────────────────────────────
 
@@ -417,6 +479,8 @@ class DateEditorDialog(QDialog):
 
         self._radio_mode_keep   = QRadioButton("Conservar fecha EXIF original")
         self._radio_mode_change = QRadioButton("Cambiar fecha EXIF")
+        self._radio_mode_ctime  = QRadioButton("Usar fecha creación")
+        self._radio_mode_fname  = QRadioButton("Usar fecha del nombre")
         self._radio_mode_keep.setChecked(True)
         self._radio_mode_keep.setToolTip(
             "No modifica la fecha EXIF de ningún archivo.\n"
@@ -425,15 +489,32 @@ class DateEditorDialog(QDialog):
         self._radio_mode_change.setToolTip(
             "Sobreescribe la fecha EXIF de los archivos con la nueva fecha indicada."
         )
+        self._radio_mode_ctime.setToolTip(
+            "Lee la fecha de creación del archivo en el sistema operativo\n"
+            "(st_ctime en Windows; cae en st_mtime si st_ctime es inválido)\n"
+            "y la escribe como fecha EXIF.  Cada archivo usa su propia fecha.\n"
+            "Útil para fotos sin fecha EXIF pero con fecha de archivo correcta."
+        )
+        self._radio_mode_fname.setToolTip(
+            "Extrae la fecha del nombre de cada archivo por separado\n"
+            "y la escribe como fecha EXIF.  Cada archivo usa su propia fecha.\n"
+            "Patrones reconocidos: 2011-12-24-15h40m46s, 20111224_154046,\n"
+            "2011-12-24_15-40-46, 2011-12-24 15.40.46, 2011-12-24, 20111224.\n"
+            "Archivos sin fecha reconocible en el nombre no se modifican."
+        )
 
         # Note: idToggled is connected AFTER all widgets are built (see end of _build_ui)
         # to avoid triggering _update_apply_state before _lbl_hint exists.
         self._exif_mode_group = QButtonGroup(self)
         self._exif_mode_group.addButton(self._radio_mode_keep,   _MODE_KEEP)
         self._exif_mode_group.addButton(self._radio_mode_change, _MODE_CHANGE)
+        self._exif_mode_group.addButton(self._radio_mode_ctime,  _MODE_USE_CTIME)
+        self._exif_mode_group.addButton(self._radio_mode_fname,  _MODE_USE_FNAME)
 
         exif_mode_row.addWidget(self._radio_mode_keep)
         exif_mode_row.addWidget(self._radio_mode_change)
+        exif_mode_row.addWidget(self._radio_mode_ctime)
+        exif_mode_row.addWidget(self._radio_mode_fname)
         exif_mode_row.addStretch()
         layout.addWidget(exif_mode_grp)
 
@@ -550,7 +631,9 @@ class DateEditorDialog(QDialog):
 
         layout.addWidget(self._time_grp)
 
-        # ── EXIF fields to update (positioned before preview + rename) ────────
+        # ── Fields to update — visible groupbox between Renombrar and Vista previa ──
+        # All 5 checkboxes checked by default.  The first 3 control which EXIF
+        # timestamp tags are written; the last 2 control filesystem timestamps.
         _field_tooltips = {
             "DateTimeOriginal": (
                 "Campo EXIF principal que usan Immich, Google Photos y la\n"
@@ -565,20 +648,26 @@ class DateEditorDialog(QDialog):
                 "Fecha de última modificación del archivo según EXIF.\n"
                 "Se actualiza automáticamente al editar la foto con muchos programas."
             ),
+            "Timestamp": (
+                "Actualiza la fecha de modificación del archivo en el sistema de archivos\n"
+                "(mtime / atime) para que coincida con la nueva fecha EXIF."
+            ),
+            "Fecha creación": (
+                "Actualiza la fecha de creación del archivo en Windows\n"
+                "(requiere pywin32).  No tiene efecto en macOS/Linux."
+            ),
         }
-        self._fields_grp = QGroupBox("Campos EXIF a actualizar")
+        self._fields_grp = QGroupBox("Campos a actualizar")
         fields_row = QHBoxLayout(self._fields_grp)
+        fields_row.setSpacing(12)
         self._field_checks = {}
-        for fname in _FIELD_NAMES:
+        for fname in (*_FIELD_NAMES, "Timestamp", "Fecha creación"):
             chk = QCheckBox(fname)
             chk.setChecked(True)
             chk.setToolTip(_field_tooltips.get(fname, ""))
             fields_row.addWidget(chk)
             self._field_checks[fname] = chk
         fields_row.addStretch()
-        # NOTE: _fields_grp is intentionally NOT added to layout — hidden from UI
-        # but kept alive because _field_checks is used at apply-time to select
-        # which EXIF fields to write (see _on_apply / _ApplyWorker).
 
         # ── Hint label (Conservar + no effective rename) ───────────────────
         self._lbl_hint = QLabel("Activá 'Renombrar archivos' para poder aplicar cambios.")
@@ -664,6 +753,9 @@ class DateEditorDialog(QDialog):
 
         layout.addWidget(grp_rename)
 
+        # ── Fields to update (between Renombrar and Vista previa) ─────────────
+        layout.addWidget(self._fields_grp)
+
         # ── Vista previa de cambios — BELOW Renombrar section ───────────────
         self._btn_preview = QPushButton("Vista previa de cambios")
         self._btn_preview.setToolTip(
@@ -674,7 +766,7 @@ class DateEditorDialog(QDialog):
         apply_button_style(self._btn_preview)
         layout.addWidget(self._btn_preview)
 
-        # ── Preview table (4 cols; _COL_NEW hidden in Conservar mode) ──────
+        # ── Preview table (4 cols; all always visible) ──────────────────────
         self._table = QTableWidget(0, 4)
         self._table.setHorizontalHeaderLabels(
             ["Archivo", "Fecha actual", "Fecha nueva", "Nombre nuevo"]
@@ -686,7 +778,6 @@ class DateEditorDialog(QDialog):
         hh.setSectionResizeMode(_COL_CURRENT, QHeaderView.ResizeMode.ResizeToContents)
         hh.setSectionResizeMode(_COL_NEW,     QHeaderView.ResizeMode.ResizeToContents)
         hh.setSectionResizeMode(_COL_RENAME,  QHeaderView.ResizeMode.ResizeToContents)
-        self._table.setColumnHidden(_COL_NEW,    True)   # hidden in Conservar mode (default)
         # _COL_RENAME is always visible — shows calculated name or "conservar nombre"
         self._table.setMinimumHeight(250)
         self._table.setMaximumHeight(400)
@@ -746,15 +837,22 @@ class DateEditorDialog(QDialog):
             self._spin_second.setValue(dt.second)
 
     def _try_apply_filename_date(self, show_warning: bool = True) -> None:
-        """Extract a date from the first file's name and apply it to the spinboxes.
+        """Switch to 'Usar fecha del nombre' per-file mode.
 
-        Switches to Cambiar mode automatically.  Shows a warning when
-        show_warning=True and no date pattern is found in the filename.
+        Each file's EXIF date is set from the date found in its own filename.
+        The spinboxes show the first file's extracted date as a read-only display.
+
+        Validates only the first file's name upfront (gives immediate feedback
+        without scanning every file).  Files whose names contain no recognizable
+        date are skipped gracefully at apply time (counted as errors).
         """
         first_path = self._get_first_path()
         if first_path is None:
             return
 
+        # Check first file as a quick sanity guard — the mode still works even
+        # if some other files don't match, but if the very first one already has
+        # no date the user has probably clicked the button on the wrong folder.
         dt = parse_date_from_filename(first_path.stem)
         if dt is None:
             if show_warning:
@@ -766,50 +864,90 @@ class DateEditorDialog(QDialog):
                 )
             return
 
-        # Switch to Cambiar mode so the controls are enabled
-        self._radio_mode_change.setChecked(True)
-
-        # Fill date spinboxes
-        self._spin_year.setValue(dt.year)
-        self._spin_month.setValue(dt.month)
-        self._spin_day.setValue(dt.day)
-
-        # Fill time if the pattern included one; otherwise leave at 00:00:00
-        if dt.hour or dt.minute or dt.second:
-            self._radio_custom.setChecked(True)   # triggers _on_time_option_changed → enables spinboxes
-            self._spin_hour.setValue(dt.hour)
-            self._spin_minute.setValue(dt.minute)
-            self._spin_second.setValue(dt.second)
+        # Switch to per-file filename mode.  The radio change triggers
+        # _on_exif_mode_changed → _apply_exif_mode_state → _prefill_fname_date
+        # which fills the (disabled) spinboxes with the first file's date.
+        self._radio_mode_fname.setChecked(True)
 
         self._lbl_filename_date.setText(
-            f"Fecha extraída: {dt.strftime('%Y-%m-%d %H:%M:%S')}"
+            "Fecha del nombre de cada archivo (por archivo)"
         )
         self._lbl_filename_date.setVisible(True)
-
-        # Preview needs to be regenerated
         self._preview_populated = False
         self._update_apply_state()
 
     # ── Slots ──────────────────────────────────────────────────────────────
 
+    def _force_stop_preview_thread(self) -> None:
+        """Actively stop any running preview background thread.
+
+        Called before starting a new preview or switching modes.  This is
+        distinct from _cleanup_preview_thread() (which is connected to
+        thread.finished as a post-stop callback) — here we *cause* the thread
+        to stop, then disconnect the finished signal so _cleanup_preview_thread
+        won't clobber the new thread references that will be assigned afterwards.
+        """
+        if self._preview_worker is not None:
+            self._preview_worker.stop_requested = True
+        if self._preview_thread is not None:
+            if self._preview_thread.isRunning():
+                self._preview_thread.quit()
+                self._preview_thread.wait(2000)
+            # Disconnect so _cleanup_preview_thread won't fire and zero-out
+            # self._preview_worker/_thread after we hand them to the new thread.
+            try:
+                self._preview_thread.finished.disconnect(self._cleanup_preview_thread)
+            except Exception:
+                pass
+            self._preview_thread.deleteLater()
+            self._preview_thread = None
+        if self._preview_worker is not None:
+            self._preview_worker.deleteLater()
+            self._preview_worker = None
+        if self._preview_progress_dlg is not None:
+            self._preview_progress_dlg.close()
+            self._preview_progress_dlg = None
+        self.setEnabled(True)
+
     def _on_exif_mode_changed(self, btn_id: int, checked: bool) -> None:
         if not checked:
             return
+        # Stop any running preview before changing mode — prevents
+        # "QThread: Destroyed while thread is still running" when the user
+        # switches Conservar ↔ Cambiar quickly on large folders.
+        self._force_stop_preview_thread()
         self._apply_exif_mode_state()
-        # Re-run preview if it was already showing so it refreshes columns
-        if self._table.isVisible():
-            self._on_preview()
+        # Preview is only generated on explicit button click — no auto-refresh here.
 
     def _apply_exif_mode_state(self) -> None:
-        """Enable/disable groups and columns to match current Conservar/Cambiar mode."""
-        keep = self._radio_mode_keep.isChecked()
-        self._date_grp.setEnabled(not keep)
+        """Enable/disable groups and columns to match current mode."""
+        keep      = self._radio_mode_keep.isChecked()
+        use_ctime = self._radio_mode_ctime.isChecked()
+        use_fname = self._radio_mode_fname.isChecked()
+        # In both per-file modes the date/time spinboxes are read-only displays
+        per_file  = use_ctime or use_fname
+
+        # Date group: editable only in manual Cambiar mode
+        self._date_grp.setEnabled(not keep and not per_file)
         if keep:
             # Conservar mode: uncheck all date-component checkboxes so the user
             # sees clearly that no date fields will be modified.
             self._chk_year.setChecked(False)
             self._chk_month.setChecked(False)
             self._chk_day.setChecked(False)
+        elif use_ctime:
+            # Ctime mode: show first file's creation date in spinboxes (read-only
+            # display — the group is disabled so the user cannot edit the values).
+            self._chk_year.setChecked(True)
+            self._chk_month.setChecked(True)
+            self._chk_day.setChecked(True)
+            self._prefill_creation_date()
+        elif use_fname:
+            # Fname mode: show first file's name date in spinboxes (read-only display).
+            self._chk_year.setChecked(True)
+            self._chk_month.setChecked(True)
+            self._chk_day.setChecked(True)
+            self._prefill_fname_date()
         else:
             # Cambiar mode: ensure at least year is checked so there's a visible
             # target date to edit.  Only auto-check if all three are off (i.e. the
@@ -821,17 +959,59 @@ class DateEditorDialog(QDialog):
             # Re-apply per-checkbox enabled state (setEnabled(True) on the group
             # re-enables ALL children indiscriminately).
             self._sync_date_spinbox_state()
-        self._time_grp.setEnabled(not keep)
-        if not keep:
+
+        # Time group: disabled in Conservar and per-file modes (date comes from
+        # the file, so there is nothing to configure manually).
+        self._time_grp.setEnabled(not keep and not per_file)
+        if not keep and not per_file:
             # Re-apply time spinbox enabled state after the group is re-enabled.
             is_custom = self._radio_custom.isChecked()
             self._spin_hour.setEnabled(is_custom)
             self._spin_minute.setEnabled(is_custom)
             self._spin_second.setEnabled(is_custom)
+
+        # Fields groupbox: active whenever we're writing something (not Conservar)
         self._fields_grp.setEnabled(not keep)
-        # _COL_NEW is only meaningful in Cambiar mode
-        self._table.setColumnHidden(_COL_NEW, keep)
         self._update_apply_state()
+
+    def _prefill_creation_date(self) -> None:
+        """Pre-fill date/time spinboxes with the first file's creation date.
+
+        Called when the user selects "Usar fecha creación" so the spinboxes
+        show an informative (read-only) preview of the date that will be applied.
+        """
+        first_path = self._get_first_path()
+        if first_path is None:
+            return
+        dt = _get_file_creation_dt(first_path)
+        if dt is None:
+            return
+        self._spin_year.setValue(dt.year)
+        self._spin_month.setValue(dt.month)
+        self._spin_day.setValue(dt.day)
+        self._spin_hour.setValue(dt.hour)
+        self._spin_minute.setValue(dt.minute)
+        self._spin_second.setValue(dt.second)
+
+    def _prefill_fname_date(self) -> None:
+        """Pre-fill date/time spinboxes with the first file's filename date.
+
+        Called when the user selects "Usar fecha del nombre" so the spinboxes
+        show an informative (read-only) preview of the date that will be applied
+        to the first file.  Other files may have different dates in their names.
+        """
+        first_path = self._get_first_path()
+        if first_path is None:
+            return
+        dt = parse_date_from_filename(first_path.stem)
+        if dt is None:
+            return
+        self._spin_year.setValue(dt.year)
+        self._spin_month.setValue(dt.month)
+        self._spin_day.setValue(dt.day)
+        self._spin_hour.setValue(dt.hour)
+        self._spin_minute.setValue(dt.minute)
+        self._spin_second.setValue(dt.second)
 
     def _sync_date_spinbox_state(self) -> None:
         """Sync each date spinbox's enabled state from its checkbox."""
@@ -843,8 +1023,6 @@ class DateEditorDialog(QDialog):
         """Called when any date-component checkbox (Año/Mes/Día) changes."""
         self._preview_populated = False
         self._update_apply_state()
-        if self._table.isVisible():
-            self._on_preview()
 
     def _on_time_option_changed(self, btn_id: int, checked: bool) -> None:
         if btn_id == _OPT_CUSTOM:
@@ -862,17 +1040,12 @@ class DateEditorDialog(QDialog):
             w.setEnabled(checked)
         # _COL_RENAME stays visible; content changes on next preview run.
         self._update_apply_state()
-        # Re-run preview so the Nombre nuevo column updates immediately
-        if self._table.isVisible():
-            self._on_preview()
 
     def _on_rename_fmt_changed(self, btn_id: int, checked: bool) -> None:
         if not checked:
             return
         self._preview_populated = False
         self._update_apply_state()
-        if self._table.isVisible():
-            self._on_preview()
 
     def _get_rename_fmt(self) -> int:
         """Return the currently selected rename format ID."""
@@ -885,9 +1058,16 @@ class DateEditorDialog(QDialog):
         rename_fmt = self._get_rename_fmt()
         will_rename = rename_on and rename_fmt != _RENAME_KEEP_NAME
 
-        # In Cambiar mode: at least one date component must be checked
+        use_ctime = self._radio_mode_ctime.isChecked()
+        use_fname = self._radio_mode_fname.isChecked()
+
+        # In Cambiar mode: at least one date component must be checked.
+        # In per-file modes (ctime, fname) all components are always used
+        # (the full date comes from the file), so the check is skipped.
         no_component = (
             not keep_mode
+            and not use_ctime
+            and not use_fname
             and not self._chk_year.isChecked()
             and not self._chk_month.isChecked()
             and not self._chk_day.isChecked()
@@ -926,7 +1106,10 @@ class DateEditorDialog(QDialog):
             self._table.insertRow(row)
             self._table.setItem(row, _COL_FILE,    QTableWidgetItem(fname))
             self._table.setItem(row, _COL_CURRENT, QTableWidgetItem(current))
-            self._table.setItem(row, _COL_NEW,     QTableWidgetItem(new_str))
+            new_item = QTableWidgetItem(new_str)
+            if new_str == current:          # gray when date won't change (Conservar mode)
+                new_item.setForeground(QBrush(_COLOR_NO_CHANGE))
+            self._table.setItem(row, _COL_NEW, new_item)
             rename_item = QTableWidgetItem(rename_text)
             if rename_gray:
                 rename_item.setForeground(QBrush(_COLOR_NO_CHANGE))
@@ -940,10 +1123,14 @@ class DateEditorDialog(QDialog):
 
     def _on_preview(self) -> None:
         keep_mode  = self._radio_mode_keep.isChecked()
+        use_ctime  = self._radio_mode_ctime.isChecked()
+        use_fname  = self._radio_mode_fname.isChecked()
         rename_fmt = self._get_rename_fmt()
 
-        # Validate date only when we intend to write it
-        if not keep_mode and not self._validate_date():
+        # Validate the manually-entered date only when in Cambiar mode.
+        # In per-file modes (ctime, fname) the date comes from each file — no
+        # spinbox values to validate.
+        if not keep_mode and not use_ctime and not use_fname and not self._validate_date():
             return
 
         paths = self._get_target_paths()
@@ -975,12 +1162,14 @@ class DateEditorDialog(QDialog):
                             rename_text = make_dated_filename(
                                 new_dt, path.parent, path.suffix, used,
                                 original_stem=path.stem,
+                                exclude=path.name,
                             )
                             used.add(rename_text)
                             rename_gray = False
                         else:
                             rename_text = make_dated_filename(
                                 new_dt, path.parent, path.suffix, used,
+                                exclude=path.name,
                             )
                             used.add(rename_text)
                             rename_gray = False
@@ -991,6 +1180,10 @@ class DateEditorDialog(QDialog):
             self._populate_preview_table(rows)
         else:
             # ── Background worker path (50+ photos) ────────────────────────
+            # Stop any previously running preview before starting a new one.
+            # This handles mode/format/component changes while a large-folder
+            # preview is already in progress.
+            self._force_stop_preview_thread()
             # Store progress dialog on self — prevents GC while thread is live
             self._preview_progress_dlg = QProgressDialog(self)
             self._preview_progress_dlg.setWindowTitle("Generando vista previa…")
@@ -1020,6 +1213,8 @@ class DateEditorDialog(QDialog):
                 self._spin_second.value(),
                 show_rename,
                 rename_fmt,
+                use_ctime=use_ctime,
+                use_fname=use_fname,
             )
             self._preview_thread = QThread()
             self._preview_worker.moveToThread(self._preview_thread)
@@ -1074,20 +1269,34 @@ class DateEditorDialog(QDialog):
             self._preview_thread = None
 
     def _on_apply(self) -> None:
-        keep_mode   = self._radio_mode_keep.isChecked()
-        rename_fmt  = self._get_rename_fmt()
+        keep_mode  = self._radio_mode_keep.isChecked()
+        use_ctime  = self._radio_mode_ctime.isChecked()
+        use_fname  = self._radio_mode_fname.isChecked()
+        rename_fmt = self._get_rename_fmt()
 
-        if not keep_mode and not self._validate_date():
+        # Skip manual-date validation in per-file modes — date comes from each file
+        if not keep_mode and not use_ctime and not use_fname and not self._validate_date():
             return
 
         paths = self._get_target_paths()
         if not paths:
             return
 
+        # Separate EXIF timestamp fields from filesystem timestamp flags.
+        # _field_checks contains 5 keys: the 3 EXIF field names + "Timestamp" +
+        # "Fecha creación".  Only the EXIF names are passed to write_exif_date;
+        # the filesystem flags are forwarded as bool kwargs.
+        _FS_FLAGS = {"Timestamp", "Fecha creación"}
+        sync_mtime     = self._field_checks["Timestamp"].isChecked()
+        sync_creation  = self._field_checks["Fecha creación"].isChecked()
+
         # In Cambiar mode: verify at least one EXIF field is selected
         fields: List[str] = []
         if not keep_mode:
-            fields = [f for f, chk in self._field_checks.items() if chk.isChecked()]
+            fields = [
+                f for f, chk in self._field_checks.items()
+                if chk.isChecked() and f not in _FS_FLAGS
+            ]
             if not fields:
                 mb_warning(self, "Sin campos", "Selecciona al menos un campo EXIF.")
                 return
@@ -1122,8 +1331,12 @@ class DateEditorDialog(QDialog):
         # ── Capture apply context (zero disk I/O — only UI values read here) ──
         rename = self._chk_rename.isChecked()
 
-        # Build a human-readable log summary from UI spinboxes (no EXIF reads needed)
-        if not keep_mode:
+        # Build a human-readable log summary (no EXIF reads needed)
+        if use_ctime:
+            log_date_str = "fecha-creacion"
+        elif use_fname:
+            log_date_str = "fecha-nombre"
+        elif not keep_mode:
             y_str = str(self._spin_year.value())        if self._chk_year.isChecked()  else "*"
             m_str = f"{self._spin_month.value():02d}"   if self._chk_month.isChecked() else "*"
             d_str = f"{self._spin_day.value():02d}"     if self._chk_day.isChecked()   else "*"
@@ -1178,6 +1391,10 @@ class DateEditorDialog(QDialog):
             rename,
             rename_fmt,
             write_exif=not keep_mode,
+            sync_mtime=sync_mtime,
+            sync_creation=sync_creation,
+            use_ctime=use_ctime,
+            use_fname=use_fname,
         )
         self._apply_thread = QThread()
         self._apply_worker.moveToThread(self._apply_thread)
@@ -1282,6 +1499,13 @@ class DateEditorDialog(QDialog):
                          in February) it is clamped automatically via
                          calendar.monthrange().
         """
+        # ── "Usar fecha del nombre" mode ──────────────────────────────────────
+        if self._radio_mode_fname.isChecked():
+            return parse_date_from_filename(path.stem)
+        # ── "Usar fecha creación" mode ────────────────────────────────────────
+        if self._radio_mode_ctime.isChecked():
+            return _get_file_creation_dt(path)
+
         if self._radio_mode_keep.isChecked():
             exif = read_exif(path)
             return parse_exif_dt(get_best_date_str(exif["fields"]))

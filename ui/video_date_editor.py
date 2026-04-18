@@ -1,5 +1,6 @@
 """Date editing dialog for video files — mirrors date_editor.py patterns."""
 import calendar
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -27,8 +28,10 @@ from ui.styles import apply_button_style, apply_primary_button_style, mb_warning
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-_MODE_KEEP   = 0
-_MODE_CHANGE = 1
+_MODE_KEEP      = 0
+_MODE_CHANGE    = 1
+_MODE_USE_CTIME = 2   # use filesystem creation date per-file
+_MODE_USE_FNAME = 3   # use date parsed from each file's own filename
 
 _OPT_PRESERVE = 0
 _OPT_CUSTOM   = 1
@@ -44,6 +47,24 @@ _COL_NEW     = 3
 _COL_RENAME  = 4
 
 _COLOR_NO_CHANGE = QColor(130, 130, 130)
+
+
+def _get_file_creation_dt(path: Path) -> Optional[datetime]:
+    """Return filesystem creation datetime for *path*.
+
+    Uses ``st_ctime`` (Windows creation time).  Falls back to ``st_mtime``
+    when the value is before 1980-01-01 (timestamp < 315 532 800), which
+    indicates an unset or invalid creation timestamp.
+    Returns ``None`` on ``OSError``.
+    """
+    try:
+        st = path.stat()
+        ts = st.st_ctime
+        if ts < 315_532_800:   # before 1980-01-01 → ctime unreliable
+            ts = st.st_mtime
+        return datetime.fromtimestamp(ts)
+    except OSError:
+        return None
 
 
 # ── Background apply worker ───────────────────────────────────────────────────
@@ -64,6 +85,11 @@ class _ApplyWorker(QObject):
         rename: bool,
         rename_fmt: int,
         log_manager: LogManager,
+        write_metadata: bool = True,    # run ffmpeg container-metadata write
+        sync_mtime: bool = True,        # update filesystem mtime/atime via os.utime
+        sync_creation: bool = True,     # update Windows creation date via pywin32
+        use_ctime: bool = False,        # derive target datetime from filesystem creation date
+        use_fname: bool = False,        # derive target datetime from each file's own filename
     ):
         super().__init__()
         self._paths          = paths
@@ -81,10 +107,23 @@ class _ApplyWorker(QObject):
         self._rename         = rename
         self._rename_fmt     = rename_fmt
         self._log            = log_manager
+        self._write_metadata = write_metadata
+        self._sync_mtime     = sync_mtime
+        self._sync_creation  = sync_creation
+        self._use_ctime      = use_ctime
+        self._use_fname      = use_fname
         self.applied_renames: Dict[Path, Path] = {}
 
-    def _resolve_dt(self, existing: Optional[datetime]) -> Optional[datetime]:
+    def _resolve_dt(
+        self,
+        existing: Optional[datetime],
+        path: Optional[Path] = None,
+    ) -> Optional[datetime]:
         """Compute the target datetime for one file."""
+        if self._use_fname:
+            return parse_date_from_filename(path.stem) if path else None
+        if self._use_ctime:
+            return _get_file_creation_dt(path) if path else None
         if self._keep_mode:
             return existing
 
@@ -114,36 +153,69 @@ class _ApplyWorker(QObject):
             try:
                 meta     = get_video_metadata(path)
                 existing = get_best_date(meta)
-                new_dt   = self._resolve_dt(existing)
+                new_dt   = self._resolve_dt(existing, path)
 
                 if new_dt is None:
                     failed += 1
-                    errors.append(f"{path.name}: no se pudo determinar la fecha")
+                    if self._use_fname:
+                        errors.append(f"{path.name}: sin fecha reconocible en el nombre")
+                    else:
+                        errors.append(f"{path.name}: no se pudo determinar la fecha")
                     continue
 
                 old_str = existing.isoformat() if existing else ""
                 if not self._keep_mode:
-                    success = write_video_date(path, new_dt)
-                    if not success:
-                        # Format not supported (e.g. .3gp) or ffmpeg error —
-                        # skip this file gracefully rather than crashing.
-                        failed += 1
-                        errors.append(
-                            f"{path.name}: formato no soportado para "
-                            f"edición de fecha ({path.suffix})"
+                    if self._write_metadata:
+                        # Run ffmpeg container metadata write (+ conditional fs sync)
+                        success = write_video_date(
+                            path, new_dt,
+                            sync_mtime=self._sync_mtime,
+                            sync_creation=self._sync_creation,
                         )
-                        continue
-                    self._log.log(
-                        str(path.parent), path.name, "write_exif",
-                        old_str, new_dt.isoformat(),
-                    )
+                        if not success:
+                            # Format not supported (e.g. .3gp) or ffmpeg error —
+                            # skip this file gracefully rather than crashing.
+                            failed += 1
+                            errors.append(
+                                f"{path.name}: formato no soportado para "
+                                f"edición de fecha ({path.suffix})"
+                            )
+                            continue
+                        self._log.log(
+                            str(path.parent), path.name, "write_exif",
+                            old_str, new_dt.isoformat(),
+                        )
+                    else:
+                        # No container metadata write; still sync filesystem if requested
+                        ts = new_dt.timestamp()
+                        if self._sync_mtime:
+                            try:
+                                os.utime(str(path), (ts, ts))
+                            except OSError:
+                                pass
+                        if self._sync_creation:
+                            try:
+                                import win32file   # type: ignore[import]
+                                import pywintypes  # type: ignore[import]
+                                handle = win32file.CreateFile(
+                                    str(path),
+                                    win32file.GENERIC_WRITE,
+                                    win32file.FILE_SHARE_READ | win32file.FILE_SHARE_WRITE,
+                                    None, win32file.OPEN_EXISTING, 0, None,
+                                )
+                                win_time = pywintypes.Time(int(ts))
+                                win32file.SetFileTime(handle, win_time, win_time, win_time)
+                                win32file.CloseHandle(handle)
+                            except Exception:
+                                pass
 
                 # Optional rename
                 applied_new_name: Optional[str] = None
                 if self._rename and self._rename_fmt != _RENAME_KEEP_NAME:
                     stem = path.stem if self._rename_fmt == _RENAME_DATE_PLUS else None
                     applied_new_name = make_dated_filename(
-                        new_dt, path.parent, path.suffix, used, original_stem=stem
+                        new_dt, path.parent, path.suffix, used,
+                        original_stem=stem, exclude=path.name,
                     )
                     used.add(applied_new_name)
                     new_path = path.parent / applied_new_name
@@ -224,7 +296,9 @@ class VideoDateEditorDialog(QDialog):
         self.setMaximumHeight(int(screen.height() * 0.90))
 
         self._build_ui(prefill_from_filename)
-        self._populate_table()
+        # Preview is NOT auto-generated on open — the table stays empty until the
+        # user explicitly clicks "Vista previa de cambios".  This keeps the dialog
+        # instant to open even for large folders.
 
     # ── UI construction ───────────────────────────────────────────────────────
 
@@ -250,12 +324,29 @@ class VideoDateEditorDialog(QDialog):
         ml = QHBoxLayout(grp_mode)
         self._radio_keep   = QRadioButton("Conservar fecha de metadata")
         self._radio_change = QRadioButton("Cambiar fecha")
+        self._radio_ctime  = QRadioButton("Usar fecha creación")
+        self._radio_fname  = QRadioButton("Usar fecha del nombre")
+        self._radio_ctime.setToolTip(
+            "Lee la fecha de creación del archivo (st_ctime en Windows).\n"
+            "Desactiva la edición manual y usa esa fecha por archivo."
+        )
+        self._radio_fname.setToolTip(
+            "Extrae la fecha del nombre de cada archivo por separado\n"
+            "y la escribe como fecha de metadata.  Cada archivo usa su propia fecha.\n"
+            "Patrones reconocidos: 2011-12-24-15h40m46s, 20111224_154046,\n"
+            "2011-12-24_15-40-46, 2011-12-24 15.40.46, 2011-12-24, 20111224.\n"
+            "Archivos sin fecha reconocible en el nombre no se modifican."
+        )
         self._radio_keep.setChecked(True)
         self._bg_mode = QButtonGroup(self)
         self._bg_mode.addButton(self._radio_keep,   _MODE_KEEP)
         self._bg_mode.addButton(self._radio_change, _MODE_CHANGE)
+        self._bg_mode.addButton(self._radio_ctime,  _MODE_USE_CTIME)
+        self._bg_mode.addButton(self._radio_fname,  _MODE_USE_FNAME)
         ml.addWidget(self._radio_keep)
         ml.addWidget(self._radio_change)
+        ml.addWidget(self._radio_ctime)
+        ml.addWidget(self._radio_fname)
         ml.addStretch()
         layout.addWidget(grp_mode)
 
@@ -374,6 +465,50 @@ class VideoDateEditorDialog(QDialog):
 
         layout.addWidget(grp_rename)
 
+        # ── Fields to update — visible groupbox between Renombrar and Vista previa ──
+        # 5 checkboxes, all checked by default.
+        # CreationTime / ModifyTime / FileModificationDate → gate the ffmpeg write
+        # Timestamp → controls os.utime (filesystem mtime/atime)
+        # Fecha creación → controls win32file.SetFileTime (Windows creation date)
+        _vid_field_tooltips = {
+            "CreationTime": (
+                "Actualiza el campo 'creation_time' en los metadatos del contenedor\n"
+                "de video (MP4, MOV, MKV…) usando ffmpeg."
+            ),
+            "ModifyTime": (
+                "Incluye 'modification_time' en los metadatos del contenedor\n"
+                "junto con creation_time."
+            ),
+            "FileModificationDate": (
+                "Actualiza la fecha de modificación del archivo en el sistema\n"
+                "de archivos (mtime) para que coincida con la nueva fecha."
+            ),
+            "Timestamp": (
+                "Actualiza el timestamp de acceso del archivo (atime) junto con mtime.\n"
+                "Equivale a FileModificationDate en la mayoría de los casos."
+            ),
+            "Fecha creación": (
+                "Actualiza la fecha de creación del archivo en Windows\n"
+                "(requiere pywin32).  No tiene efecto en macOS/Linux."
+            ),
+        }
+        _vid_field_order = (
+            "CreationTime", "ModifyTime", "FileModificationDate",
+            "Timestamp", "Fecha creación",
+        )
+        self._fields_grp = QGroupBox("Campos a actualizar")
+        vf_row = QHBoxLayout(self._fields_grp)
+        vf_row.setSpacing(12)
+        self._field_checks: Dict[str, QCheckBox] = {}
+        for fname in _vid_field_order:
+            chk = QCheckBox(fname)
+            chk.setChecked(True)
+            chk.setToolTip(_vid_field_tooltips.get(fname, ""))
+            vf_row.addWidget(chk)
+            self._field_checks[fname] = chk
+        vf_row.addStretch()
+        layout.addWidget(self._fields_grp)
+
         # ── Vista previa de cambios — BELOW Renombrar section ────────────────
         btn_preview = QPushButton("Vista previa de cambios")
         btn_preview.setToolTip("Recalcula los valores de la tabla para verificar los cambios.")
@@ -415,36 +550,101 @@ class VideoDateEditorDialog(QDialog):
         outer.addWidget(self._btn_box)
 
         # Wire state
-        self._radio_keep.toggled.connect(self._update_state)
+        # _on_mode_radio_toggled stops any running apply thread before
+        # _update_state() modifies UI — prevents "QThread destroyed while running".
+        self._radio_keep.toggled.connect(self._on_mode_radio_toggled)
+        self._radio_ctime.toggled.connect(self._on_mode_radio_toggled)
+        self._radio_fname.toggled.connect(self._on_mode_radio_toggled)
         self._radio_custom_time.toggled.connect(self._update_state)
         self._chk_rename.toggled.connect(self._update_state)
         self._chk_year.toggled.connect(lambda _: self._spin_year.setEnabled(
             self._radio_change.isChecked() and self._chk_year.isChecked()
         ))
-        self._chk_year.toggled.connect(lambda _: self._populate_table())
         self._chk_month.toggled.connect(lambda _: self._spin_month.setEnabled(
             self._radio_change.isChecked() and self._chk_month.isChecked()
         ))
-        self._chk_month.toggled.connect(lambda _: self._populate_table())
         self._chk_day.toggled.connect(lambda _: self._spin_day.setEnabled(
             self._radio_change.isChecked() and self._chk_day.isChecked()
         ))
-        self._chk_day.toggled.connect(lambda _: self._populate_table())
         self._update_state()
 
+    def _stop_apply_thread(self) -> None:
+        """Stop any running apply thread (defensive: normally blocked by modal dialog)."""
+        if self._thread is not None and self._thread.isRunning():
+            self._thread.quit()
+            self._thread.wait(2000)
+        if self._worker is not None:
+            self._worker.deleteLater()
+            self._worker = None
+        if self._thread is not None:
+            self._thread.deleteLater()
+            self._thread = None
+
+    def _on_mode_radio_toggled(self) -> None:
+        """Stop any running apply thread, then refresh UI state for the new mode."""
+        self._stop_apply_thread()
+        self._update_state()
+
+    def _prefill_creation_date(self) -> None:
+        """Pre-populate date/time spinboxes from the first path's filesystem creation date."""
+        if not self._paths:
+            return
+        dt = _get_file_creation_dt(self._paths[0])
+        if dt is None:
+            return
+        self._spin_year.setValue(dt.year)
+        self._spin_month.setValue(dt.month)
+        self._spin_day.setValue(dt.day)
+        self._spin_hour.setValue(dt.hour)
+        self._spin_minute.setValue(dt.minute)
+        self._spin_second.setValue(dt.second)
+
+    def _prefill_fname_date(self) -> None:
+        """Pre-populate date/time spinboxes with the first path's filename date.
+
+        Shows a read-only display preview — the actual per-file dates are
+        resolved at populate-table / apply time so every file uses its own name.
+        """
+        if not self._paths:
+            return
+        dt = parse_date_from_filename(self._paths[0].stem)
+        if dt is None:
+            return
+        self._spin_year.setValue(dt.year)
+        self._spin_month.setValue(dt.month)
+        self._spin_day.setValue(dt.day)
+        self._spin_hour.setValue(dt.hour)
+        self._spin_minute.setValue(dt.minute)
+        self._spin_second.setValue(dt.second)
+
     def _update_state(self) -> None:
-        keep     = self._radio_keep.isChecked()
-        custom   = self._radio_custom_time.isChecked()
-        renaming = self._chk_rename.isChecked()
+        keep      = self._radio_keep.isChecked()
+        use_ctime = self._radio_ctime.isChecked()
+        use_fname = self._radio_fname.isChecked()
+        custom    = self._radio_custom_time.isChecked()
+        renaming  = self._chk_rename.isChecked()
+        # Both per-file modes lock the date/time groups (date comes from each file)
+        per_file  = use_ctime or use_fname
 
         # Conservar → disable the whole date group AND uncheck all checkboxes
         # so it's visually clear nothing will be written.
+        # Per-file modes → disable manual controls; pre-populate spinboxes from first file.
         # Cambiar → enable the group; auto-check all three if all were off.
-        self._grp_date.setEnabled(not keep)
+        self._grp_date.setEnabled(not keep and not per_file)
         if keep:
             self._chk_year.setChecked(False)
             self._chk_month.setChecked(False)
             self._chk_day.setChecked(False)
+        elif use_ctime:
+            self._chk_year.setChecked(True)
+            self._chk_month.setChecked(True)
+            self._chk_day.setChecked(True)
+            self._prefill_creation_date()
+        elif use_fname:
+            self._chk_year.setChecked(True)
+            self._chk_month.setChecked(True)
+            self._chk_day.setChecked(True)
+            self._prefill_fname_date()
         else:
             if not (self._chk_year.isChecked() or self._chk_month.isChecked()
                     or self._chk_day.isChecked()):
@@ -452,40 +652,47 @@ class VideoDateEditorDialog(QDialog):
                 self._chk_month.setChecked(True)
                 self._chk_day.setChecked(True)
 
-        self._spin_year.setEnabled(not keep and self._chk_year.isChecked())
-        self._spin_month.setEnabled(not keep and self._chk_month.isChecked())
-        self._spin_day.setEnabled(not keep and self._chk_day.isChecked())
+        self._spin_year.setEnabled(not keep and not per_file and self._chk_year.isChecked())
+        self._spin_month.setEnabled(not keep and not per_file and self._chk_month.isChecked())
+        self._spin_day.setEnabled(not keep and not per_file and self._chk_day.isChecked())
         for w in (self._radio_preserve_time, self._radio_custom_time):
-            w.setEnabled(not keep)
+            w.setEnabled(not keep and not per_file)
         for w in (self._spin_hour, self._spin_minute, self._spin_second):
-            w.setEnabled(not keep and custom)
+            w.setEnabled(not keep and not per_file and custom)
         for w in (self._radio_date_only, self._radio_date_plus, self._radio_keep_name):
             w.setEnabled(renaming)
 
     # ── Slots ─────────────────────────────────────────────────────────────────
 
     def _prefill_from_filename(self) -> None:
+        """Switch to 'Usar fecha del nombre' per-file mode.
+
+        Each file's metadata date is set from the date found in its own filename.
+        The spinboxes show the first file's extracted date as a read-only display.
+        Files whose names contain no recognizable date are skipped at apply time.
+        """
         if not self._paths:
             return
+        # Validate first file as a quick sanity guard.
         dt = parse_date_from_filename(self._paths[0].stem)
         if dt is None:
-            mb_warning(self, "Sin fecha",
-                       "No se detectó fecha en el nombre del archivo.")
+            mb_warning(self, "Sin fecha en el nombre",
+                       f"No se detectó fecha en el nombre del archivo:\n"
+                       f"{self._paths[0].name}\n\n"
+                       "Patrones soportados: 2011-12-24-15h40m46s, 20111224_154046,\n"
+                       "2011-12-24_15-40-46, 2011-12-24 15.40.46, 2011-12-24, 20111224.")
             return
-        self._radio_change.setChecked(True)
-        self._chk_year.setChecked(True);  self._spin_year.setValue(dt.year)
-        self._chk_month.setChecked(True); self._spin_month.setValue(dt.month)
-        self._chk_day.setChecked(True);   self._spin_day.setValue(dt.day)
-        self._radio_custom_time.setChecked(True)
-        self._spin_hour.setValue(dt.hour)
-        self._spin_minute.setValue(dt.minute)
-        self._spin_second.setValue(dt.second)
-        self._update_state()
-        self._populate_table()
+        # Switch to per-file filename mode.  The radio change triggers
+        # _on_mode_radio_toggled → _update_state → _prefill_fname_date,
+        # which fills the (disabled) spinboxes with the first file's date.
+        self._radio_fname.setChecked(True)
+        # Preview is only generated on explicit button click — no auto-refresh here.
 
     def _populate_table(self) -> None:
         self._table.setRowCount(0)
         keep         = self._radio_keep.isChecked()
+        use_ctime    = self._radio_ctime.isChecked()
+        use_fname    = self._radio_fname.isChecked()
         use_custom   = self._radio_custom_time.isChecked()
         renaming     = self._chk_rename.isChecked()
         rename_fmt   = self._bg_rename.checkedId()
@@ -502,7 +709,51 @@ class VideoDateEditorDialog(QDialog):
 
             if keep:
                 new_str = current_str
-                rename_text = ""
+                # Even in "Conservar fecha" mode renaming can still happen (the
+                # date metadata is left untouched but the filename is derived from
+                # the existing metadata date).  Mirror _ApplyWorker's logic so the
+                # "Nombre nuevo" column is never blank when renaming is active.
+                if renaming and rename_fmt != _RENAME_KEEP_NAME and current_dt is not None:
+                    stem = path.stem if rename_fmt == _RENAME_DATE_PLUS else None
+                    rename_text = make_dated_filename(
+                        current_dt, path.parent, path.suffix, used, stem,
+                        exclude=path.name,
+                    )
+                    used.add(rename_text)
+                else:
+                    rename_text = "— (sin cambio)" if renaming else ""
+            elif use_ctime:
+                ctime_dt = _get_file_creation_dt(path)
+                if ctime_dt is not None:
+                    new_str = ctime_dt.strftime("%Y:%m:%d %H:%M:%S")
+                    if renaming and rename_fmt != _RENAME_KEEP_NAME:
+                        stem = path.stem if rename_fmt == _RENAME_DATE_PLUS else None
+                        rename_text = make_dated_filename(
+                            ctime_dt, path.parent, path.suffix, used, stem,
+                            exclude=path.name,
+                        )
+                        used.add(rename_text)
+                    else:
+                        rename_text = "— (sin cambio)" if renaming else ""
+                else:
+                    new_str = "Sin fecha creación"
+                    rename_text = ""
+            elif use_fname:
+                fname_dt = parse_date_from_filename(path.stem)
+                if fname_dt is not None:
+                    new_str = fname_dt.strftime("%Y:%m:%d %H:%M:%S")
+                    if renaming and rename_fmt != _RENAME_KEEP_NAME:
+                        stem = path.stem if rename_fmt == _RENAME_DATE_PLUS else None
+                        rename_text = make_dated_filename(
+                            fname_dt, path.parent, path.suffix, used, stem,
+                            exclude=path.name,
+                        )
+                        used.add(rename_text)
+                    else:
+                        rename_text = "— (sin cambio)" if renaming else ""
+                else:
+                    new_str = "Sin fecha en nombre"
+                    rename_text = ""
             else:
                 existing = current_dt
                 year  = self._spin_year.value()  if self._chk_year.isChecked()  else (existing.year  if existing else now.year)
@@ -518,7 +769,8 @@ class VideoDateEditorDialog(QDialog):
                     if renaming and rename_fmt != _RENAME_KEEP_NAME:
                         stem = path.stem if rename_fmt == _RENAME_DATE_PLUS else None
                         rename_text = make_dated_filename(
-                            new_dt, path.parent, path.suffix, used, stem
+                            new_dt, path.parent, path.suffix, used, stem,
+                            exclude=path.name,
                         )
                         used.add(rename_text)
                     else:
@@ -543,9 +795,12 @@ class VideoDateEditorDialog(QDialog):
             self.accept()
             return
 
+        use_ctime = self._radio_ctime.isChecked()
+        use_fname = self._radio_fname.isChecked()
+
         # ── Pre-apply backup ───────────────────────────────────────────────────
         # Back up metadata for every file BEFORE any changes are written.
-        # Only needed in Cambiar mode (keep_mode = rename-only, no date changes).
+        # Only needed in Cambiar / per-file modes.
         if not self._radio_keep.isChecked():
             backup_failures: list[str] = []
             for path in self._paths:
@@ -576,6 +831,18 @@ class VideoDateEditorDialog(QDialog):
         progress.setMinimumDuration(0)
         progress.setValue(0)
 
+        # Extract field checkbox states.
+        # CreationTime / ModifyTime / FileModificationDate → gate the ffmpeg write.
+        # Timestamp / Fecha creación → filesystem timestamp sync flags.
+        fc = self._field_checks
+        write_metadata = (
+            fc["CreationTime"].isChecked()
+            or fc["ModifyTime"].isChecked()
+            or fc["FileModificationDate"].isChecked()
+        )
+        sync_mtime    = fc["Timestamp"].isChecked() or fc["FileModificationDate"].isChecked()
+        sync_creation = fc["Fecha creación"].isChecked()
+
         self._worker = _ApplyWorker(
             paths            = self._paths,
             keep_mode        = self._radio_keep.isChecked(),
@@ -592,6 +859,11 @@ class VideoDateEditorDialog(QDialog):
             rename           = self._chk_rename.isChecked(),
             rename_fmt       = self._bg_rename.checkedId(),
             log_manager      = self._log,
+            write_metadata   = write_metadata,
+            sync_mtime       = sync_mtime,
+            sync_creation    = sync_creation,
+            use_ctime        = use_ctime,
+            use_fname        = use_fname,
         )
         self._thread = QThread(self)
         self._worker.moveToThread(self._thread)
