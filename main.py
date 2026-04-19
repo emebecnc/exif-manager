@@ -27,16 +27,28 @@ def setup_ffmpeg() -> None:
     for exe_name in ('ffmpeg.exe', 'ffprobe.exe'):
         src = base_dir / exe_name
         dst = temp_dir / exe_name
-        if src.exists():
+        if not src.exists():
+            print(f"[setup_ffmpeg] Warning: {exe_name} not found in bundle ({base_dir})")
+            continue
+        # Only (re)copy when destination is missing — avoids re-copying on every
+        # launch and prevents "file in use" errors if a previous instance is still
+        # running and has the binary open.
+        if not dst.exists():
             try:
-                if dst.exists():
-                    dst.unlink()
                 shutil.copy2(src, dst)
+                print(f"[setup_ffmpeg] Copied {exe_name} → {dst}")
             except Exception as exc:
                 print(f"[setup_ffmpeg] Warning: could not copy {exe_name}: {exc}")
+        else:
+            print(f"[setup_ffmpeg] {exe_name} already in temp dir — skipping copy")
 
-    # Prepend so our copy wins over any system-installed version
-    os.environ['PATH'] = str(temp_dir) + os.pathsep + os.environ.get('PATH', '')
+    # Prepend so our copy wins over any system-installed version.
+    # Guard against duplicate entries if setup_ffmpeg() is somehow called twice.
+    temp_dir_str = str(temp_dir)
+    current_path = os.environ.get('PATH', '')
+    if temp_dir_str not in current_path.split(os.pathsep):
+        os.environ['PATH'] = temp_dir_str + os.pathsep + current_path
+    print(f"[setup_ffmpeg] ffmpeg resolved to: {shutil.which('ffmpeg')}")
 
 
 # ── Version diagnostics (crash audit) ─────────────────────────────────────────
@@ -55,6 +67,16 @@ from PyQt6.QtGui import QIcon, QPalette, QColor
 from PyQt6.QtCore import Qt
 
 
+def _no_window_kwargs() -> dict:
+    """Suppress console windows when running as a windowed .exe on Windows."""
+    if sys.platform != "win32":
+        return {}
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = subprocess.SW_HIDE
+    return {"startupinfo": si, "creationflags": subprocess.CREATE_NO_WINDOW}
+
+
 def _check_ffmpeg() -> bool:
     """Return True if the ffmpeg binary is reachable on PATH (or bundled)."""
     # Also accept a bundled ffmpeg.exe in the project directory
@@ -66,6 +88,7 @@ def _check_ffmpeg() -> bool:
             ["ffmpeg", "-version"],
             capture_output=True,
             timeout=5,
+            **_no_window_kwargs(),
         )
         return result.returncode == 0
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):

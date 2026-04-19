@@ -1,6 +1,6 @@
 # EXIF Manager — CLAUDE.md
 
-**Last updated:** 2026-04-19 (session 89 final — v1.0 release complete: MIT License (Manuel MB), portable .exe 105 MB, all cancel buttons working)
+**Last updated:** 2026-04-19 (session 89 final — fixed ffmpeg console window loop in .exe: added CREATE_NO_WINDOW + STARTF_USESHOWWINDOW to all subprocess calls; improved setup_ffmpeg() skip-if-exists)
 **Repo:** github.com/emebecnc/exif-manager
 **Local:** D:\homelab\exif_manager\
 

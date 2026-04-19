@@ -3,10 +3,33 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Iterator, List, Optional
+
+
+def _subprocess_no_window() -> dict:
+    """Return extra kwargs that suppress the console window on Windows.
+
+    When the app runs as a PyInstaller --noconsole (windowed) .exe, every
+    subprocess.run() call spawns a visible black CMD window unless suppressed.
+    capture_output=True only redirects stdout/stderr — it does NOT prevent the
+    window from being created.  CREATE_NO_WINDOW is the correct fix.
+
+    On non-Windows platforms the function returns an empty dict so callers are
+    portable without any conditional logic at each call site.
+    """
+    if sys.platform != "win32":
+        return {}
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = subprocess.SW_HIDE
+    return {
+        "startupinfo": startupinfo,
+        "creationflags": subprocess.CREATE_NO_WINDOW,
+    }
 
 # ── Extension registry ────────────────────────────────────────────────────────
 
@@ -180,7 +203,8 @@ def write_video_date(
             "-movflags", "use_metadata_tags",
             str(tmp_path),
         ]
-        proc = subprocess.run(cmd, capture_output=True, timeout=120)
+        proc = subprocess.run(cmd, capture_output=True, timeout=120,
+                              **_subprocess_no_window())
         if proc.returncode != 0:
             # ffmpeg printed an error — clean up and report failure
             try:
@@ -249,11 +273,12 @@ def get_video_thumbnail(path: Path, size: int = 150) -> Optional[bytes]:
             "-vcodec", "mjpeg",
             "-",
         ]
-        proc = subprocess.run(cmd, capture_output=True, timeout=30)
+        _nownd = _subprocess_no_window()
+        proc = subprocess.run(cmd, capture_output=True, timeout=30, **_nownd)
         if proc.returncode != 0 or not proc.stdout:
             # Retry at t=0 (very short clips)
             cmd[3] = "00:00:00"
-            proc = subprocess.run(cmd, capture_output=True, timeout=30)
+            proc = subprocess.run(cmd, capture_output=True, timeout=30, **_nownd)
         if proc.stdout:
             return bytes(proc.stdout)
         return None
@@ -454,7 +479,8 @@ def _read_ffprobe(path: Path, result: dict) -> bool:
             "-show_format", "-show_streams",
             str(path),
         ]
-        proc = subprocess.run(cmd, capture_output=True, timeout=15, text=True)
+        proc = subprocess.run(cmd, capture_output=True, timeout=15, text=True,
+                              **_subprocess_no_window())
         if proc.returncode != 0:
             return False
         data = json.loads(proc.stdout)
