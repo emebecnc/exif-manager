@@ -10,6 +10,10 @@ build/
 dist/
 *.spec.bak
 
+# Bundled ffmpeg binaries (large — not committed, copy from C:\FFmpeg\bin\ to project root before building)
+ffmpeg.exe
+ffprobe.exe
+
 # App generated folders / per-folder data files
 _thumbcache/
 _eliminados/

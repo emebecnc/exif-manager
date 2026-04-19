@@ -823,7 +823,7 @@ class VideoDateEditorDialog(QDialog):
                     return
 
         progress = QProgressDialog(
-            "Procesando videos…", "Cancelar", 0, len(self._paths), self
+            "Procesando videos…", "❌ Cancelar", 0, len(self._paths), self
         )
         progress.setWindowTitle("Editando fechas de video")
         progress.setMinimumWidth(420)

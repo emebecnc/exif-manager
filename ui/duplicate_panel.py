@@ -1118,12 +1118,9 @@ class DuplicatePanel(QWidget):
         self._scan_thread.finished.connect(self._cleanup_scan_thread)
 
         # ── Modal progress dialog (BEFORE thread.start() per CLAUDE.md) ───────
-        # None = no Cancel button → the UI's _btn_cancel handles cancellation.
-        # Without a Cancel button the QProgressDialog never emits canceled(), which
-        # eliminates the re-entrancy crash: setValue() can call processEvents()
-        # internally; if canceled() were connected it could null _scan_progress_dlg
-        # mid-execution of _on_scan_progress (after the is-not-None guard, before
-        # setLabelText), causing AttributeError on NoneType.
+        # _on_scan_progress() captures a local 'dlg' reference before calling
+        # setValue() so re-entrant processEvents() cannot cause AttributeError
+        # even when canceled() fires and nulls self._scan_progress_dlg mid-slot.
         if effective_type == "video":
             _scan_label = "Escaneando videos…"
             _scan_title = "Buscando duplicados de video"
@@ -1135,12 +1132,13 @@ class DuplicatePanel(QWidget):
             _scan_title = "Buscando duplicados exactos"
 
         self._scan_progress_dlg = QProgressDialog(
-            _scan_label, None, 0, 0, self
+            _scan_label, "❌ Cancelar", 0, 0, self
         )
         self._scan_progress_dlg.setWindowTitle(_scan_title)
         self._scan_progress_dlg.setModal(True)           # ApplicationModal
         self._scan_progress_dlg.setMinimumDuration(0)   # show immediately
         self._scan_progress_dlg.setValue(0)
+        self._scan_progress_dlg.canceled.connect(self._on_cancel_scan)
         self._scan_progress_dlg.show()
         QApplication.processEvents()
 
@@ -1312,7 +1310,7 @@ class DuplicatePanel(QWidget):
         #       while quit()+wait() runs in the cleanup below.
         if norm_groups:
             self._group_progress_dlg = QProgressDialog(
-                "Cargando grupos…", "Cancelar", 0, len(norm_groups), self
+                "Cargando grupos…", "❌ Cancelar", 0, len(norm_groups), self
             )
             self._group_progress_dlg.setWindowTitle("Procesando resultados")
             self._group_progress_dlg.setModal(False)
@@ -1447,7 +1445,7 @@ class DuplicatePanel(QWidget):
             return
         self._thumbs_loaded = 0
         self._thumb_progress_dlg = QProgressDialog(
-            f"Cargando miniaturas… 0/{n}", "Cancelar", 0, n, self
+            f"Cargando miniaturas… 0/{n}", "❌ Cancelar", 0, n, self
         )
         self._thumb_progress_dlg.setWindowTitle("Cargando miniaturas")
         self._thumb_progress_dlg.setModal(False)
@@ -2018,13 +2016,9 @@ class DuplicatePanel(QWidget):
 
         # Progress dialog with cancel button
         self._dedup_total = total_del
-        self._dedup_progress_dlg = QProgressDialog(self)
+        self._dedup_progress_dlg = QProgressDialog("Iniciando…", "❌ Cancelar", 0, total_del, self)
         self._dedup_progress_dlg.setWindowTitle("Deduplicando…")
-        self._dedup_progress_dlg.setLabelText("Iniciando…")
-        self._dedup_progress_dlg.setRange(0, total_del)
-        self._dedup_progress_dlg.setValue(0)
         self._dedup_progress_dlg.setWindowModality(Qt.WindowModality.WindowModal)
-        self._dedup_progress_dlg.setCancelButton(None)
         self._dedup_progress_dlg.setMinimumDuration(0)
         self._dedup_progress_dlg.canceled.connect(self._on_cancel_dedup)
         self._dedup_progress_dlg.show()

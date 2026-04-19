@@ -1,6 +1,6 @@
 # EXIF Manager — CLAUDE.md
 
-**Last updated:** 2026-04-19 (session 87 final — comprehensive README with screenshots, refresh button, datetime extraction fixes)
+**Last updated:** 2026-04-19 (session 88 — cancel buttons everywhere, portable .exe with bundled ffmpeg, README with download link)
 **Repo:** github.com/emebecnc/exif-manager
 **Local:** D:\homelab\exif_manager\
 

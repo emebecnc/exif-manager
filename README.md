@@ -4,6 +4,21 @@ Aplicación de escritorio Windows para gestionar y corregir fechas EXIF de colec
 
 ---
 
+## ⬇️ Descargar
+
+**[📥 ExifManager.exe — Descargar última versión](https://github.com/emebecnc/exif-manager/releases/download/v1.0/ExifManager.exe)**
+
+✅ **Portable** — Sin instalación, sin dependencias  
+✅ **Standalone** — Funciona en cualquier PC con Windows 10+  
+✅ **Incluye ffmpeg** — No necesitás instalar nada más
+
+**¿Cómo usar?**
+1. Descargar `ExifManager.exe`
+2. Doble click para ejecutar
+3. Listo — sin instalar Python, ffmpeg, ni nada
+
+---
+
 ## ¿Qué problema resuelve?
 
 Muchas fotos y videos de cámaras digitales tienen fechas incorrectas — ya sea porque la batería se agotó y se reseteó, porque la cámara nunca fue configurada, o porque los archivos fueron renombrados o copiados en algún momento. Esto hace que gestores de fotos como **Immich**, Google Photos o cualquier visor cronológico los ubiquen en el lugar equivocado.
@@ -226,26 +241,25 @@ Todos los diálogos de progreso tienen botón **"Cancelar"**:
 
 ---
 
-## 🚀 Instalación
+## 🚀 Uso
 
-### Requisitos previos
+### Opción 1: Descargar .exe (RECOMENDADO — sin instalación)
 
-- **Python 3.11+**
-- **[ffmpeg](https://ffmpeg.org/download.html)** en el PATH del sistema (o `ffmpeg.exe` y `ffprobe.exe` junto al ejecutable)
+Descargá [ExifManager.exe](https://github.com/emebecnc/exif-manager/releases/download/v1.0/ExifManager.exe) y ejecutalo. Listo — no requiere Python ni ffmpeg instalados.
 
-### Instalar dependencias
+### Opción 2: Ejecutar desde código fuente (para desarrolladores)
 
-```bash
-pip install PyQt6>=6.4.0 Pillow>=10.0.0 piexif>=1.1.3 pywin32>=306 platformdirs>=3.0.0 ffmpeg-python>=0.2.0 hachoir>=3.1.3 imagehash>=4.3.1
-```
+**Requisitos previos:**
+- Python 3.11+
+- [ffmpeg](https://ffmpeg.org/download.html) en el PATH (o `ffmpeg.exe` junto al script)
 
-O usando el archivo de dependencias:
+**Instalar dependencias:**
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### Ejecutar
+**Ejecutar:**
 
 ```bash
 python main.py
@@ -253,16 +267,15 @@ python main.py
 
 O doble click en `run.cmd`.
 
----
-
-## 📦 Compilar a .exe
+### Opción 3: Compilar tu propio .exe
 
 ```bash
+# Copiar ffmpeg.exe y ffprobe.exe a la raíz del proyecto, luego:
 pip install pyinstaller
-pyinstaller build.spec
+pyinstaller --clean build.spec
 ```
 
-Genera `dist/ExifManager/ExifManager.exe` — standalone, no requiere Python instalado.
+Genera `dist/ExifManager.exe` — portable, incluye ffmpeg, no requiere nada instalado.
 
 ---
 

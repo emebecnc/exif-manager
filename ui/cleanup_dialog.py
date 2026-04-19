@@ -656,13 +656,9 @@ class CleanupDialog(QDialog):
 
         # ── Progress dialog ───────────────────────────────────────────────
         self._delete_total = n
-        self._delete_progress_dlg = QProgressDialog(self)
+        self._delete_progress_dlg = QProgressDialog("Iniciando…", "❌ Cancelar", 0, n, self)
         self._delete_progress_dlg.setWindowTitle("Eliminando…")
-        self._delete_progress_dlg.setLabelText("Iniciando…")
-        self._delete_progress_dlg.setRange(0, n)
-        self._delete_progress_dlg.setValue(0)
         self._delete_progress_dlg.setWindowModality(Qt.WindowModality.WindowModal)
-        self._delete_progress_dlg.setCancelButton(None)
         self._delete_progress_dlg.setMinimumDuration(0)
         self._delete_progress_dlg.canceled.connect(self._on_cancel_delete)
         self._delete_progress_dlg.show()

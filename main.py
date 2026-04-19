@@ -1,8 +1,43 @@
 """EXIF Date Manager — entry point."""
 import subprocess
 import sys
+import os
+import shutil
 import traceback
 from pathlib import Path
+
+
+def setup_ffmpeg() -> None:
+    """Extract bundled ffmpeg to a temp directory when running as a frozen .exe.
+
+    PyInstaller bundles ffmpeg.exe / ffprobe.exe inside sys._MEIPASS.  They
+    cannot be executed from there directly on Windows (the temp archive is read-
+    only and the OS refuses to spawn executables from it on some AV configs).
+    Copying to %TEMP%\\exif_manager_ffmpeg\\ and prepending that directory to
+    PATH makes ffmpeg-python and subprocess.run(["ffmpeg", ...]) find the binaries
+    transparently — no other code change required.
+    """
+    if not getattr(sys, 'frozen', False):
+        return  # Running from source — ffmpeg must already be on PATH
+
+    base_dir = Path(sys._MEIPASS)  # type: ignore[attr-defined]
+    temp_dir = Path(os.getenv('TEMP', os.getenv('TMP', 'C:\\Temp'))) / 'exif_manager_ffmpeg'
+    temp_dir.mkdir(exist_ok=True, parents=True)
+
+    for exe_name in ('ffmpeg.exe', 'ffprobe.exe'):
+        src = base_dir / exe_name
+        dst = temp_dir / exe_name
+        if src.exists():
+            try:
+                if dst.exists():
+                    dst.unlink()
+                shutil.copy2(src, dst)
+            except Exception as exc:
+                print(f"[setup_ffmpeg] Warning: could not copy {exe_name}: {exc}")
+
+    # Prepend so our copy wins over any system-installed version
+    os.environ['PATH'] = str(temp_dir) + os.pathsep + os.environ.get('PATH', '')
+
 
 # ── Version diagnostics (crash audit) ─────────────────────────────────────────
 import PIL
@@ -96,6 +131,8 @@ def _global_exception_hook(exc_type, exc_value, exc_tb):
 
 
 def main():
+    setup_ffmpeg()  # must run before any QApplication or module imports that call ffmpeg
+
     app = QApplication(sys.argv)
     app.setOrganizationName("homelab")
     app.setApplicationName("ExifManager")

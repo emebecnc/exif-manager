@@ -1185,14 +1185,10 @@ class DateEditorDialog(QDialog):
             # preview is already in progress.
             self._force_stop_preview_thread()
             # Store progress dialog on self — prevents GC while thread is live
-            self._preview_progress_dlg = QProgressDialog(self)
+            self._preview_progress_dlg = QProgressDialog("Preparando…", "❌ Cancelar", 0, len(paths), self)
             self._preview_progress_dlg.setWindowTitle("Generando vista previa…")
-            self._preview_progress_dlg.setLabelText("Preparando…")
-            self._preview_progress_dlg.setRange(0, len(paths))
-            self._preview_progress_dlg.setValue(0)
             self._preview_progress_dlg.setWindowModality(Qt.WindowModality.WindowModal)
             self._preview_progress_dlg.setMinimumDuration(0)
-            self._preview_progress_dlg.setCancelButton(None)
             self._preview_progress_dlg.canceled.connect(self._on_cancel_preview)
             self._preview_progress_dlg.show()
             self.setEnabled(False)
@@ -1357,17 +1353,13 @@ class DateEditorDialog(QDialog):
 
         # ── Show progress dialog BEFORE thread starts ──────────────────────
         # With cancel button to allow cancellation even mid-apply
-        self._progress_dlg = QProgressDialog(self)
+        self._progress_dlg = QProgressDialog("Iniciando…", "❌ Cancelar", 0, self._apply_total_steps, self)
         self._progress_dlg.setWindowTitle("Aplicando cambios…")
-        self._progress_dlg.setLabelText("Iniciando…")
-        self._progress_dlg.setRange(0, self._apply_total_steps)
-        self._progress_dlg.setValue(0)
         self._progress_dlg.setWindowModality(Qt.WindowModality.WindowModal)
         self._progress_dlg.setMinimumDuration(0)   # always show immediately
         self._progress_dlg.setMinimumWidth(400)
         self._progress_dlg.setAutoReset(False)
         self._progress_dlg.setAutoClose(False)
-        self._progress_dlg.setCancelButton(None)
         self._progress_dlg.canceled.connect(self._on_cancel_apply)
         self._progress_dlg.show()
         QApplication.processEvents()   # force paint before thread starts
