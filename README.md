@@ -19,6 +19,22 @@ Aplicación de escritorio Windows para gestionar y corregir fechas EXIF de colec
 
 ---
 
+## ⚠️ Aviso: SmartScreen de Windows
+
+Al descargar **ExifManager.exe**, Windows puede mostrar una advertencia de SmartScreen diciendo que el archivo es "no reconocido" o "podría ser peligroso".
+
+Esto es **completamente normal** para software descargado de internet sin firma digital. No hay virus ni código malicioso.
+
+### Cómo ejecutar:
+
+1. Click en **"Más información"**
+2. Click en **"Ejecutar de todas formas"**
+3. Listo — la app se abrirá normalmente
+
+El código es **100% opensource** — podés revisar todo en [GitHub](https://github.com/emebecnc/exif-manager).
+
+---
+
 ## ¿Qué problema resuelve?
 
 Muchas fotos y videos de cámaras digitales tienen fechas incorrectas — ya sea porque la batería se agotó y se reseteó, porque la cámara nunca fue configurada, o porque los archivos fueron renombrados o copiados en algún momento. Esto hace que gestores de fotos como **Immich**, Google Photos o cualquier visor cronológico los ubiquen en el lugar equivocado.
