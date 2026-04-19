@@ -127,6 +127,7 @@ class _VideoThumbnailWorker(QObject):
         self._cancelled = True
 
     def run(self) -> None:
+        print(f"[WORKER] _VideoThumbnailWorker started, _cancelled={self._cancelled}, paths={len(self._paths)}", flush=True)
         total = len(self._paths)
         batch: list = []
         for i, path in enumerate(self._paths):

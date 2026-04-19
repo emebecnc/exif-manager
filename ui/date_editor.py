@@ -145,11 +145,14 @@ class _PreviewWorker(QObject):
             return None
 
     def run(self) -> None:
+        print(f"[PREVIEW WORKER] Started — paths={len(self._paths)}, stop_requested={self.stop_requested}", flush=True)
         rows = []
         used: set = set()
         total = len(self._paths)
         for i, path in enumerate(self._paths):
+            print(f"[PREVIEW WORKER] Item {i}/{total} ({path.name}), stop_requested={self.stop_requested}", flush=True)
             if self.stop_requested:
+                print(f"[PREVIEW WORKER] STOP DETECTED — exiting at item {i} ({path.name})", flush=True)
                 self.result.emit(rows)
                 return
             
@@ -192,6 +195,7 @@ class _PreviewWorker(QObject):
                     rename_text = "— (conservar nombre)"
                     rename_gray = True
             rows.append((path.name, current, new_str, rename_text, rename_gray))
+        print(f"[PREVIEW WORKER] Finished normally — {len(rows)} rows emitted", flush=True)
         self.result.emit(rows)
 
 
@@ -306,8 +310,11 @@ class _ApplyWorker(QObject):
         step           = 0
         used_names: set = set()
 
+        print(f"[WORKER] _ApplyWorker started, stop_requested={self.stop_requested}, paths={len(self._paths)}", flush=True)
         for path in self._paths:
+            print(f"[WORKER] _ApplyWorker iteration ({path.name}), stop_requested={self.stop_requested}", flush=True)
             if self._cancelled or self.stop_requested:
+                print(f"[WORKER] CANCEL DETECTED — stopping _ApplyWorker at {path.name}", flush=True)
                 break
 
             # Single EXIF read per file — supplies both date resolution and historial
@@ -1183,16 +1190,18 @@ class DateEditorDialog(QDialog):
             # Stop any previously running preview before starting a new one.
             # This handles mode/format/component changes while a large-folder
             # preview is already in progress.
+            print(f"[PREVIEW DEBUG] 1. Preview button clicked — {len(paths)} paths, entering async branch", flush=True)
             self._force_stop_preview_thread()
             # Store progress dialog on self — prevents GC while thread is live
             self._preview_progress_dlg = QProgressDialog("Preparando…", "❌ Cancelar", 0, len(paths), self)
             self._preview_progress_dlg.setWindowTitle("Generando vista previa…")
             self._preview_progress_dlg.setWindowModality(Qt.WindowModality.WindowModal)
             self._preview_progress_dlg.setMinimumDuration(0)
+            print(f"[PREVIEW DEBUG] 2. Progress dialog created", flush=True)
+
+            # CRITICAL: Connect canceled BEFORE showing
             self._preview_progress_dlg.canceled.connect(self._on_cancel_preview)
-            self._preview_progress_dlg.show()
-            self.setEnabled(False)
-            QApplication.processEvents()   # force paint before thread starts
+            print(f"[PREVIEW DEBUG] 3. canceled.connect(_on_cancel_preview) done", flush=True)
 
             use_custom = self._radio_custom.isChecked()
             self._preview_worker = _PreviewWorker(
@@ -1220,8 +1229,18 @@ class DateEditorDialog(QDialog):
             self._preview_worker.result.connect(self._on_preview_result)
             self._preview_worker.result.connect(self._preview_thread.quit)
             self._preview_thread.finished.connect(self._cleanup_preview_thread)
+            print(f"[PREVIEW DEBUG] 4. All signals connected", flush=True)
+
+            self._preview_progress_dlg.show()
+            self.setEnabled(False)
+            # Re-enable the progress dialog explicitly: setEnabled(False) on a parent
+            # propagates to all child widgets, which would disable the Cancel button.
+            self._preview_progress_dlg.setEnabled(True)
+            print(f"[PREVIEW DEBUG] 5. Dialog shown, setEnabled(False) called — dialog.isEnabled()={self._preview_progress_dlg.isEnabled()}", flush=True)
+            QApplication.processEvents()   # force paint before thread starts
 
             self._preview_thread.start()
+            print(f"[PREVIEW DEBUG] 6. Thread started", flush=True)
 
     # ── Preview worker slots ──────────────────────────────────────────────
 
@@ -1234,8 +1253,19 @@ class DateEditorDialog(QDialog):
 
     def _on_cancel_preview(self) -> None:
         """Cancel preview generation."""
+        print(f"[PREVIEW DEBUG] >>> CANCEL PREVIEW CLICKED <<<", flush=True)
+        print(f"[PREVIEW DEBUG] worker={self._preview_worker is not None}, thread={self._preview_thread is not None}", flush=True)
         if self._preview_worker is not None:
+            print(f"[PREVIEW DEBUG] Setting worker.stop_requested = True", flush=True)
             self._preview_worker.stop_requested = True
+            print(f"[PREVIEW DEBUG] Confirmed: stop_requested={self._preview_worker.stop_requested}", flush=True)
+        else:
+            print(f"[PREVIEW DEBUG] ERROR: _preview_worker is None!", flush=True)
+        if self._preview_thread is not None and self._preview_thread.isRunning():
+            print(f"[PREVIEW DEBUG] Calling thread.quit()", flush=True)
+            self._preview_thread.quit()
+        else:
+            print(f"[PREVIEW DEBUG] Thread not running (or None)", flush=True)
         if self._preview_progress_dlg:
             self._preview_progress_dlg.close()
             self._preview_progress_dlg = None
@@ -1364,8 +1394,11 @@ class DateEditorDialog(QDialog):
         self._progress_dlg.show()
         QApplication.processEvents()   # force paint before thread starts
 
-        # Disable dialog so the user cannot fire a second apply while running
+        # Disable dialog so the user cannot fire a second apply while running.
+        # Re-enable the progress dialog explicitly after: setEnabled(False) on a
+        # parent propagates to all child widgets and would disable the Cancel button.
         self.setEnabled(False)
+        self._progress_dlg.setEnabled(True)
         self._btn_apply.setEnabled(False)
 
         # ── Start worker thread — ALL EXIF reads happen here, not above ────
@@ -1412,8 +1445,12 @@ class DateEditorDialog(QDialog):
 
     def _on_cancel_apply(self) -> None:
         """Cancel apply operation."""
+        print(f"[DIALOG] _on_cancel_apply fired — worker={self._apply_worker is not None}", flush=True)
         if self._apply_worker is not None:
             self._apply_worker.stop_requested = True
+            print(f"[DIALOG] apply stop_requested is now: {self._apply_worker.stop_requested}", flush=True)
+        if self._apply_thread is not None and self._apply_thread.isRunning():
+            self._apply_thread.quit()
         if self._progress_dlg:
             self._progress_dlg.close()
             self._progress_dlg = None

@@ -209,13 +209,16 @@ class _DeduplicateWorker(QObject):
         self.stop_requested = False
 
     def run(self) -> None:
+        print(f"[WORKER] _DeduplicateWorker started, stop_requested={self.stop_requested}, items={len(self._items)}", flush=True)
         total         = len(self._items)
         deleted_count = 0
         bytes_freed   = 0
         errors: List[str] = []
 
         for i, (path_str, file_size) in enumerate(self._items):
+            print(f"[WORKER] _DeduplicateWorker iteration {i}/{total}, stop_requested={self.stop_requested}", flush=True)
             if self.stop_requested:
+                print(f"[WORKER] CANCEL DETECTED — stopping _DeduplicateWorker at item {i}", flush=True)
                 self.finished.emit(deleted_count, bytes_freed, errors)
                 return
             
@@ -1154,9 +1157,11 @@ class DuplicatePanel(QWidget):
         late ``finished`` or ``error`` signal is ignored by the early-return
         guards in ``_on_scan_finished`` / ``_on_scan_error``.
         """
+        print(f"[DIALOG] _on_cancel_scan fired — worker={self._scan_worker is not None}", flush=True)
         # Tell the worker to exit its run-loop at the next cancellation check
         if self._scan_worker is not None:
             self._scan_worker.cancel()
+            print(f"[DIALOG] scan _cancelled is now: {self._scan_worker._cancelled}", flush=True)
 
         # Reset scanning state immediately so the UI reflects the cancellation
         self._scanning = False
@@ -2048,8 +2053,12 @@ class DuplicatePanel(QWidget):
 
     def _on_cancel_dedup(self) -> None:
         """Cancel dedup operation."""
+        print(f"[DIALOG] _on_cancel_dedup fired — worker={self._dedup_worker is not None}", flush=True)
         if self._dedup_worker is not None:
             self._dedup_worker.stop_requested = True
+            print(f"[DIALOG] dedup stop_requested is now: {self._dedup_worker.stop_requested}", flush=True)
+        if self._dedup_thread is not None and self._dedup_thread.isRunning():
+            self._dedup_thread.quit()
         if self._dedup_progress_dlg:
             self._dedup_progress_dlg.close()
             self._dedup_progress_dlg = None

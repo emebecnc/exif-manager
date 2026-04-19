@@ -363,3 +363,27 @@ Para reportar bugs o sugerir features, abre un issue en GitHub.
 ---
 
 *Desarrollado con Claude Code (Anthropic) — Buenos Aires, Argentina*
+
+---
+
+## 📜 Licencia
+
+**MIT License** — Este proyecto es software libre y de código abierto.
+
+Eres libre de:
+- ✅ Usar comercialmente
+- ✅ Modificar el código
+- ✅ Distribuir
+- ✅ Uso privado
+
+Solo debes:
+- 📋 Mantener la atribución original (copyright notice)
+- 📋 Incluir la licencia MIT
+
+Ver archivo [LICENSE](LICENSE) para detalles completos.
+
+---
+
+*Desarrollado por **Manuel (MB)** — Buenos Aires, Argentina*
+
+*[GitHub](https://github.com/emebecnc/exif-manager) • Contribuciones bienvenidas*

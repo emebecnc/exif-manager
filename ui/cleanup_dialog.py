@@ -152,14 +152,20 @@ class _DeleteWorker(QObject):
     def __init__(self, items: List[Tuple[str, int]]) -> None:
         super().__init__()
         self._items = items   # [(abs_path_str, size_bytes), ...]
+        self.stop_requested = False
 
     def run(self) -> None:
+        print(f"[WORKER] _DeleteWorker started, stop_requested={self.stop_requested}, items={len(self._items)}", flush=True)
         total         = len(self._items)
         deleted_count = 0
         bytes_freed   = 0.0
         errors: List[str] = []
 
         for i, (path_str, size) in enumerate(self._items):
+            print(f"[WORKER] _DeleteWorker iteration {i}/{total}, stop_requested={self.stop_requested}", flush=True)
+            if self.stop_requested:
+                print(f"[WORKER] CANCEL DETECTED — stopping _DeleteWorker at item {i}", flush=True)
+                break
             path = Path(path_str)
             self.progress.emit(i, total, path.name)
 
@@ -687,8 +693,12 @@ class CleanupDialog(QDialog):
 
     def _on_cancel_delete(self) -> None:
         """Cancel delete operation."""
+        print(f"[DIALOG] _on_cancel_delete fired — worker={self._delete_worker is not None}", flush=True)
         if self._delete_worker is not None:
             self._delete_worker.stop_requested = True
+            print(f"[DIALOG] stop_requested is now: {self._delete_worker.stop_requested}", flush=True)
+        if self._delete_thread is not None and self._delete_thread.isRunning():
+            self._delete_thread.quit()
         if self._delete_progress_dlg:
             self._delete_progress_dlg.close()
             self._delete_progress_dlg = None

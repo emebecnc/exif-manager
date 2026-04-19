@@ -56,6 +56,7 @@ class VideoDuplicateScanWorker(QObject):
         self._cancelled = True
 
     def run(self) -> None:
+        print(f"[WORKER] VideoDuplicateScanWorker started, _cancelled={self._cancelled}", flush=True)
         try:
             print(f"[VideoScan] starting — root: {self.root_path}")
 
@@ -77,6 +78,7 @@ class VideoDuplicateScanWorker(QObject):
             # ── Per-file MD5 loop ──────────────────────────────────────────
             for i, path in enumerate(all_files):
                 if self._cancelled:
+                    print(f"[WORKER] CANCEL DETECTED — stopping VideoDuplicateScanWorker at file {i + 1}", flush=True)
                     partial = [g for g in md5_map.values() if len(g) > 1]
                     partial.sort(key=lambda g: (-len(g), str(g[0])))
                     self.finished.emit(partial)

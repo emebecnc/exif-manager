@@ -1,6 +1,6 @@
 # EXIF Manager — CLAUDE.md
 
-**Last updated:** 2026-04-19 (session 88 — cancel buttons everywhere, portable .exe with bundled ffmpeg, README with download link)
+**Last updated:** 2026-04-19 (session 89 final — v1.0 release complete: MIT License (Manuel MB), portable .exe 105 MB, all cancel buttons working)
 **Repo:** github.com/emebecnc/exif-manager
 **Local:** D:\homelab\exif_manager\
 

@@ -113,6 +113,7 @@ class _ApplyWorker(QObject):
         self._use_ctime      = use_ctime
         self._use_fname      = use_fname
         self.applied_renames: Dict[Path, Path] = {}
+        self.stop_requested  = False
 
     def _resolve_dt(
         self,
@@ -143,12 +144,17 @@ class _ApplyWorker(QObject):
             return None
 
     def run(self) -> None:
+        print(f"[WORKER] video _ApplyWorker started, stop_requested={self.stop_requested}, paths={len(self._paths)}", flush=True)
         ok = failed = 0
         errors: List[str] = []
         used: set = set()
         total = len(self._paths)
 
         for i, path in enumerate(self._paths):
+            print(f"[WORKER] video _ApplyWorker iteration {i}/{total} ({path.name}), stop_requested={self.stop_requested}", flush=True)
+            if self.stop_requested:
+                print(f"[WORKER] CANCEL DETECTED — stopping video _ApplyWorker at {path.name}", flush=True)
+                break
             self.progress.emit(i + 1, total, path.name)
             try:
                 meta     = get_video_metadata(path)
@@ -875,6 +881,19 @@ class VideoDateEditorDialog(QDialog):
             )
         )
         self._worker.finished.connect(self._on_apply_finished)
+        # Connect canceled BEFORE exec() so the flag is set while exec()'s
+        # internal event loop is running.  This stops the worker at the next
+        # iteration boundary (after the current file finishes), making the
+        # cancel responsive even when ffmpeg is running per-file.
+        def _on_video_cancel():
+            print(f"[DIALOG] video progress.canceled fired — worker={self._worker is not None}", flush=True)
+            if self._worker:
+                self._worker.stop_requested = True
+                print(f"[DIALOG] video stop_requested is now: {self._worker.stop_requested}", flush=True)
+            if self._thread is not None and self._thread.isRunning():
+                self._thread.quit()
+            progress.close()
+        progress.canceled.connect(_on_video_cancel)
         self._thread.start()
 
         progress.exec()

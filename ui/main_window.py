@@ -621,13 +621,28 @@ class MainWindow(QMainWindow):
         s = QSettings()
         geom = s.value("window/geometry")
         if geom:
-            self.restoreGeometry(geom)
+            if isinstance(geom, str):
+                geom = geom.encode()
+            try:
+                self.restoreGeometry(geom)
+            except Exception:
+                pass
         splitter_main = s.value("splitter/main")
         if splitter_main:
-            self._main_splitter.restoreState(splitter_main)
+            if isinstance(splitter_main, str):
+                splitter_main = splitter_main.encode()
+            try:
+                self._main_splitter.restoreState(splitter_main)
+            except Exception:
+                pass
         splitter_content = s.value("splitter/content")
         if splitter_content:
-            self._content_splitter.restoreState(splitter_content)
+            if isinstance(splitter_content, str):
+                splitter_content = splitter_content.encode()
+            try:
+                self._content_splitter.restoreState(splitter_content)
+            except Exception:
+                pass
         last_root = s.value("last_root", "")
         if last_root and Path(last_root).exists():
             self._current_root = Path(last_root)

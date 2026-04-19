@@ -126,6 +126,7 @@ class _ThumbnailWorker(QObject):
         self._cancelled = True
 
     def run(self) -> None:
+        print(f"[WORKER] _ThumbnailWorker started, _cancelled={self._cancelled}, paths={len(self._paths)}", flush=True)
         if not self._paths:
             self.finished.emit()
             return

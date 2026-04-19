@@ -117,6 +117,7 @@ class DuplicateScanWorker(QObject):
         self._cancelled = True
 
     def run(self) -> None:
+        print(f"[WORKER] DuplicateScanWorker started, _cancelled={self._cancelled}", flush=True)
         try:
             print(f"[PhotoScan] starting — root: {self.root_path}")
 
@@ -144,6 +145,7 @@ class DuplicateScanWorker(QObject):
                 sys.stdout.flush()
 
                 if self._cancelled:
+                    print(f"[WORKER] CANCEL DETECTED — stopping DuplicateScanWorker at file {file_num}", flush=True)
                     partial = [p for p in md5_map.values() if len(p) > 1]
                     partial.sort(key=lambda g: (-len(g), str(g[0])))
                     self.finished.emit(partial)
@@ -357,6 +359,7 @@ class SimilarImageScanWorker(QObject):
         self._cancelled = True
 
     def run(self) -> None:  # noqa: C901
+        print(f"[WORKER] SimilarImageScanWorker started, _cancelled={self._cancelled}", flush=True)
         if not IMAGEHASH_AVAILABLE:
             self.error.emit(
                 "La biblioteca 'imagehash' no está instalada.\n\n"
