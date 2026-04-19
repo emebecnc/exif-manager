@@ -403,7 +403,7 @@ def parse_date_from_filename(stem: str) -> Optional[datetime]:
 
     Patterns tried in order (most specific first):
       2011-12-24-15h40m46s  /  2011-12-24-15h40m46   (trailing 's' optional)
-      2014-06-17 17hs.59.mins.30s  /  …mins  /  …mins-anything  (hs/mins format)
+      2014-06-17 17hs.59.mins  /  17hs.59.mins-1  /  17hs.59.mins-5  (hs.mins format)
       2011-12-24 15.40.46  or  2011-12-24_15.40.46
       2011-12-24_15-40-46  or  2011-12-24 15-40-46
       20111224_154046
@@ -411,10 +411,10 @@ def parse_date_from_filename(stem: str) -> Optional[datetime]:
       2011-12-24
       20111224
 
-    Date-only patterns default to 00:00:00.
-    Optional regex capture groups (e.g. seconds) that did not participate in
-    the match arrive as None; they are treated as 0.
-    Returns None when no pattern matches or the extracted values are invalid.
+    Date-only and h/m-only patterns default seconds to 0.
+    The hs.mins format ALWAYS produces seconds=0 — no suffix digits are ever
+    captured (the pattern stops at the literal "mins" token).
+    Returns None when no pattern matches or the extracted values are out of range.
     """
     def _gi(groups: tuple, idx: int) -> int:
         """Return groups[idx] as int, or 0 if the index is out of range or None."""
@@ -423,18 +423,21 @@ def parse_date_from_filename(stem: str) -> Optional[datetime]:
         val = groups[idx]
         return int(val) if val is not None else 0
 
-    # Ordered most-specific first.  groups[0..2] are always year/month/day;
-    # groups[3..5] are hour/minute/second (may be absent or None).
+    # Ordered most-specific first.
+    # groups[0..2] = year/month/day  (always present)
+    # groups[3..5] = hour/minute/second  (absent → _gi returns 0)
+    #
+    # IMPORTANT: the hs.mins pattern has exactly 5 capture groups.
+    # _gi(g, 5) is safely 0 for it — seconds are NEVER extracted from the
+    # trailing suffix (e.g. "-1", "-5") because the pattern ends at "mins"
+    # and those characters are not matched by any capture group.
     _PATTERNS = [
         # 2011-12-24-15h40m46s  /  2011-12-24-15h40m46  (trailing 's' optional)
         r"(\d{4})-(\d{2})-(\d{2})-(\d{2})h(\d{2})m(\d{2})s?",
-        # 2014-06-17 17hs.59.mins  /  17hs.59.mins-1  /  17hs.59.mins.30s
-        # "hs.mins" camera format.  Uses \s+ (not [ ]) so any whitespace works.
-        # Dots around the minute value are optional to handle hs.MM.mins and
-        # hsMM.mins variants.  Optional trailing \.SS[s] captures seconds when
-        # present; when absent (or when followed by a non-dot suffix like -1)
-        # the capture group is None and _gi returns 0.
-        r"(\d{4})-(\d{2})-(\d{2})\s+(\d{2})hs\.?(\d{2})\.?mins(?:\.(\d{2})s?)?",
+        # 2014-06-17 17hs.59.mins  /  17hs.59.mins-1  /  17hs.59.mins-5
+        # Pattern terminates at the literal "mins" token; any suffix is ignored.
+        # Exactly 5 groups → seconds = 0 always (no 6th group to mis-capture).
+        r"(\d{4})-(\d{2})-(\d{2})\s+(\d{2})hs\.(\d{2})\.mins",
         # 2011-12-24 15.40.46  /  2011-12-24_15.40.46
         r"(\d{4})-(\d{2})-(\d{2})[ _](\d{2})\.(\d{2})\.(\d{2})",
         # 2011-12-24_15-40-46  /  2011-12-24 15-40-46
@@ -452,12 +455,17 @@ def parse_date_from_filename(stem: str) -> Optional[datetime]:
         m = re.search(pattern, stem)
         if m:
             g = m.groups()
+            y, mo, d = int(g[0]), int(g[1]), int(g[2])
+            h, mi, s = _gi(g, 3), _gi(g, 4), _gi(g, 5)
             try:
-                return datetime(
-                    int(g[0]), int(g[1]), int(g[2]),
-                    _gi(g, 3), _gi(g, 4), _gi(g, 5),
+                return datetime(y, mo, d, h, mi, s)
+            except ValueError as exc:
+                # Captured values are out of range (e.g. hour=60, month=13).
+                # Log for diagnostics and try the next pattern.
+                print(
+                    f"[PARSE SKIP] {stem!r}: pattern matched but values invalid "
+                    f"({y}-{mo:02d}-{d:02d} {h:02d}:{mi:02d}:{s:02d}) — {exc}"
                 )
-            except ValueError:
                 continue
     return None
 

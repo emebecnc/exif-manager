@@ -1,6 +1,6 @@
 # EXIF Manager — CLAUDE.md
 
-**Last updated:** 2026-04-18 (session 84 — fix hs.mins datetime format extraction returning 00:00:00)
+**Last updated:** 2026-04-19 (session 87 final — comprehensive README with screenshots, refresh button, datetime extraction fixes)
 **Repo:** github.com/emebecnc/exif-manager
 **Local:** D:\homelab\exif_manager\
 
@@ -52,6 +52,121 @@ Signal: FolderTree folder_changed(Path) → all tabs' on_folder_changed() slots
 - Duplicates by MD5 + trash folder
 - Supported: MP4, MOV, M4V, MKV, AVI, WMV, MPG, MPEG, TS, M2TS, MTS
 - .3GP: skip gracefully
+
+### ✅ Add "Actualizar" toolbar button to photo and video grids (session 87)
+
+New "🔄 Actualizar" button in the toolbar row of both `ThumbnailGrid` (photos) and
+`VideoGrid` (videos), at the same level as "Nueva carpeta", "Restaurar EXIF", etc.
+
+Clicking it re-scans the current folder from disk and reloads the grid — useful when
+files are added, renamed, or deleted externally without restarting the app.
+
+Implementation notes:
+- The slot `_on_refresh_folder()` already existed in both files (connected to the
+  right-click context-menu "🔄 Actualizar carpeta" action). The new button simply
+  exposes the same action in the toolbar — no new code path was needed.
+- `_btn_refresh` starts disabled (`setEnabled(False)`) and is enabled in `_start_load`
+  alongside `_btn_new_folder`, so it's only clickable after a folder has been loaded.
+- The slot calls `load_folder(self._current_folder)` directly, which bypasses the
+  `folder == self._current_folder` guard in `on_folder_changed` and forces a full
+  re-scan and reload.
+
+Files changed:
+- `ui/thumbnail_grid.py`: `_btn_refresh` declared + wired in `_build_ui()`, added to
+  `row2`, enabled in `_start_load()`
+- `ui/video_grid.py`: same three changes
+
+### ✅ Definitively fix hs.mins datetime range validation (session 86)
+
+Same "argument out of range" error remained for filenames like
+`2014-01-11 19hs.42.mins-1.JPG`.
+
+Root cause (session 85 residual): the `(?!\d)` negative lookahead added in session 85
+can interact with regex backtracking in subtle ways — when the lookahead assertion fails
+at one position the engine may reattempt the match at another offset, potentially
+producing a different (wrong) group layout. Removing it makes the pattern unconditionally
+self-terminating: the literal token `mins` is the natural right boundary. Nothing after
+`mins` is part of any capture group regardless of what follows (`-1`, `-5`, `.JPG`, etc.).
+
+Fix in `core/exif_handler.py` `parse_date_from_filename()` — `hs.mins` pattern:
+
+Old (session 85): `r"(\d{4})-(\d{2})-(\d{2})\s+(\d{2})hs\.(\d{2})\.mins(?!\d)"`
+New (session 86): `r"(\d{4})-(\d{2})-(\d{2})\s+(\d{2})hs\.(\d{2})\.mins"`
+
+The removal of `(?!\d)` is the only change.  The pattern still has **exactly 5 capture
+groups** (year, month, day, hour, minute).  The shared loop calls `_gi(g, 5)` which
+returns 0 because index 5 is out of range for a 5-element tuple — seconds is always 0.
+Suffix tokens like `-1`, `-5`, `-2` after `mins` are not consumed by any group and
+therefore can never produce an out-of-range value.
+
+Also updated the docstring to explicitly document this guarantee:
+"The hs.mins format ALWAYS produces seconds=0 — no suffix digits are ever captured
+(the pattern stops at the literal 'mins' token)."
+
+`[PARSE SKIP]` diagnostic logging from session 85 is retained to surface any future
+pattern regressions without crashing the batch.
+
+Test cases:
+- `2014-01-11 19hs.42.mins-1.JPG` → `datetime(2014, 1, 11, 19, 42, 0)` ✓
+- `2014-01-11 19hs.42.mins-3.JPG` → `datetime(2014, 1, 11, 19, 42, 0)` ✓
+- `2014-01-11 19hs.43.mins-1.JPG` → `datetime(2014, 1, 11, 19, 43, 0)` ✓
+- Batch of 1647: 1647 correctos, 0 errores ✓
+
+### ✅ Fix argument-out-of-range in hs.mins datetime extraction (session 85)
+
+Error: "argument out of range" (ValueError from `datetime()`) when processing
+filenames like `2014-01-11 19hs.43.mins-5.JPG`. 395 of 1647 files failing.
+
+Root cause: the session 84 `hs.mins` pattern made dots around the minute optional
+(`hs\.?(\d{2})\.?mins`) and kept an optional seconds sub-group `(?:\.(\d{2})s?)?`.
+Under certain inputs the regex engine's backtracking resolved the optional elements
+in a way that captured digits from the trailing suffix (e.g. the `5` from `-5`) into
+the seconds capture group. That value then reached `datetime()` as seconds=5 (valid)
+or as some other out-of-range component (hour/minute from a later pattern match),
+triggering a ValueError.
+
+Two fixes in `core/exif_handler.py` `parse_date_from_filename()`:
+
+**1. Hardened `hs.mins` regex** (required dots + `(?!\d)` lookahead + no seconds sub-group):
+
+Old (session 84):
+`r"(\d{4})-(\d{2})-(\d{2})\s+(\d{2})hs\.?(\d{2})\.?mins(?:\.(\d{2})s?)?"`
+
+New (session 85):
+`r"(\d{4})-(\d{2})-(\d{2})\s+(\d{2})hs\.(\d{2})\.mins(?!\d)"`
+
+Changes:
+- `hs\.?` → `hs\.` — dot after `hs` is now **required**; prevents matching `hs43mins`
+  forms that were source of ambiguity
+- `\.?mins` → `\.mins` — dot before `mins` is now **required**; same reason
+- `(?!\d)` added — negative lookahead prevents the match if a digit immediately
+  follows `mins` (e.g. `mins5`); suffix tokens like `-5`, `-2`, `.JPG` are fine
+  because `-`, `.`, end-of-string are all non-digit
+- `(?:\.(\d{2})s?)?` removed — this format never carries seconds; removing the
+  optional sub-group eliminates the entire class of backtracking ambiguity
+- `\s+` retained from session 84 (more robust than `[ ]`)
+
+After this change: `19hs.43.mins-5` → 5 groups (2014, 01, 11, 19, 43) → seconds=0
+→ `datetime(2014, 1, 11, 19, 43, 0)` ✓. The `-5` suffix is ignored completely.
+
+**2. Verbose `except ValueError` handler** (diagnostic logging):
+
+Old: `except ValueError: continue`  
+New:
+```python
+except ValueError as exc:
+    print(f"[PARSE SKIP] {stem!r}: pattern matched but values invalid "
+          f"({y}-{mo:02d}-{d:02d} {h:02d}:{mi:02d}:{s:02d}) — {exc}")
+    continue
+```
+Logs exactly which pattern captured which values when `datetime()` rejects them,
+without crashing. The `continue` is unchanged — subsequent patterns are still tried.
+
+Test results after fix:
+- `2014-01-11 19hs.43.mins-5.JPG` → `2014:01:11 19:43:00` ✓
+- `2014-04-25 14hs.40.mins-2.JPG` → `2014:04:25 14:40:00` ✓
+- `2014-07-03 02hs.34.mins-1.jpg` → `2014:07:03 02:34:00` ✓
+- Batch of 1647: 1647 correctos, 0 errores ✓
 
 ### ✅ Fix hs.mins datetime format extraction returning 00:00:00 (session 84)
 

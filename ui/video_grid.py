@@ -414,6 +414,15 @@ class VideoGrid(QWidget):
         self._btn_edit.clicked.connect(self._on_edit_folder)
         apply_button_style(self._btn_edit)
 
+        self._btn_refresh = QPushButton("🔄 Actualizar")
+        self._btn_refresh.setEnabled(False)
+        self._btn_refresh.setToolTip(
+            "Vuelve a escanear la carpeta actual y recarga el grid.\n"
+            "Útil si se agregaron o eliminaron videos desde el Explorador."
+        )
+        self._btn_refresh.clicked.connect(self._on_refresh_folder)
+        apply_button_style(self._btn_refresh)
+
         row2 = QHBoxLayout()
         row2.setContentsMargins(0, 0, 0, 0)
         row2.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
@@ -421,6 +430,7 @@ class VideoGrid(QWidget):
         row2.addWidget(self._btn_restore)
         row2.addWidget(self._btn_edit)
         row2.addWidget(self._btn_edit_selection)
+        row2.addWidget(self._btn_refresh)
         row2.addStretch()
 
         bottom.addLayout(row1)
@@ -445,6 +455,7 @@ class VideoGrid(QWidget):
             self._pending_folder = folder_path
             return
         self._start_load(folder_path)
+
 
     def refresh_item(self, video_path: Path) -> None:
         """Re-read metadata for a single item."""
@@ -538,6 +549,7 @@ class VideoGrid(QWidget):
         self._lbl_count.setText(f"{count} video{'s' if count != 1 else ''}")
         self.folder_loaded.emit(count)
         self._btn_new_folder.setEnabled(True)
+        self._btn_refresh.setEnabled(True)
         self._btn_edit.setEnabled(count > 0)
         self._btn_restore.setVisible(has_video_backup(folder_path))
 

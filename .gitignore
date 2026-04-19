@@ -1,19 +1,27 @@
 # Python
 __pycache__/
 *.py[cod]
+*.pyc
 *.pyo
+*.egg-info/
 
 # PyInstaller
 build/
 dist/
 *.spec.bak
 
-# App generated folders
+# App generated folders / per-folder data files
 _thumbcache/
 _eliminados/
 _duplicados_eliminados/
 *.exif_backup.json
+.exif_backup.json
+*.video_backup.json
+.video_backup.json
 _historial_original.txt
+
+# Test cache
+.pytest_cache/
 
 # Virtual environment
 venv/
