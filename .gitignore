@@ -37,3 +37,5 @@ Desktop.ini
 
 # Logs
 *.log
+# Build de la release (se reparte por GitHub Releases; > 100 MB)
+ExifManager.exe
